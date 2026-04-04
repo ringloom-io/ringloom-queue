@@ -1,4 +1,4 @@
-# libchronicle Architecture Overview
+# brz-queue Architecture Overview
 
 ## Table of Contents
 
@@ -12,35 +12,38 @@
 8. [Write Arbitration (Lock-Free CAS Protocol)](#write-arbitration-lock-free-cas-protocol)
 9. [Index Structure](#index-structure)
 10. [Roll Cycle Mechanism](#roll-cycle-mechanism)
-11. [Directory Listing / Metadata File](#directory-listing--metadata-file)
-12. [Wire Protocol (BinaryWire Serialization)](#wire-protocol-binarywire-serialization)
-13. [Data Structures](#data-structures)
-14. [Appender Lifecycle](#appender-lifecycle)
-15. [Tailer Lifecycle](#tailer-lifecycle)
-16. [Module Decomposition](#module-decomposition)
-17. [Concurrency and Memory Ordering](#concurrency-and-memory-ordering)
-18. [Error Handling](#error-handling)
-19. [Diagrams](#diagrams)
+11. [Shared Metadata File](#shared-metadata-file)
+12. [Data Structures](#data-structures)
+13. [Appender Lifecycle](#appender-lifecycle)
+14. [Tailer Lifecycle](#tailer-lifecycle)
+15. [Module Decomposition](#module-decomposition)
+16. [Concurrency and Memory Ordering](#concurrency-and-memory-ordering)
+17. [Error Handling](#error-handling)
+18. [Diagrams](#diagrams)
 
 ---
 
 ## Introduction
 
-This document provides a comprehensive architectural description of `libchronicle`, an open-source C implementation of the chronicle-queue shared-memory IPC protocol originally created by OpenHFT (Chronicle Software Ltd.) in Java. The goal is to serve as a definitive reference for understanding, maintaining, and reimplementing the library.
+This document provides a comprehensive architectural description of **brz-queue**, a clean-room, high-performance, lock-free, memory-mapped IPC queue implemented in Zig. The design targets the lowest possible latency with zero allocations on the hot path. brz-queue uses fixed-layout binary structures (no self-describing wire format), tiered CAS backoff, acquire/release memory ordering, flat inline indexes, and optional `io_uring` for reader wakeup. It is designed for single-writer, multi-reader workloads across multiple OS processes communicating through shared `mmap` regions.
 
 ## Project Summary
 
 | Property | Value |
 |---|---|
-| **Language** | C (gnu99) |
+| **Language** | Zig |
 | **License** | Apache 2.0 |
-| **Protocol Versions** | v5 |
+| **Format Version** | v1 (`brz`) |
 | **IPC Mechanism** | Memory-mapped files (`mmap` + `MAP_SHARED`) |
-| **Arbitration** | `lock cmpxchgl` (x86 CAS instruction) |
-| **Memory Ordering** | `mfence` for read barriers |
-| **Bindings** | Python (ctypes), kdb+ |
-| **Test Framework** | cmocka, libarchive (for test data) |
-| **Fuzzer** | AFL (American Fuzzy Lop) |
+| **Arbitration** | `cmpxchg` (atomic CAS via Zig builtins) |
+| **Memory Ordering** | Acquire/Release (not SeqCst) |
+| **File Extension** | `.brz` (data files), `metadata.brz` (shared metadata) |
+| **Backoff Strategy** | Tiered: spin → yield → exponential (capped 1 ms) |
+| **Index** | Flat inline array of `u64` offsets after file header |
+| **Wakeup** | `io_uring` + `eventfd` (falls back to polling) |
+| **Huge Pages** | Optional `MAP_HUGETLB` (2 MiB) support |
+| **Pre-allocation** | `fallocate(2)` on Linux |
+| **Test Framework** | Zig built-in test runner |
 
 ## High-Level Architecture
 
@@ -50,41 +53,35 @@ This document provides a comprehensive architectural description of `libchronicl
 │                                                                  │
 │   ┌─────────────┐    ┌──────────────┐    ┌────────────────┐     │
 │   │  Encoder     │    │   Decoder    │    │  Dispatch CB   │     │
-│   │ (sizeof+write│    │ (parse+free) │    │ (index, msg)   │     │
+│   │ (sizeof+write│    │ (parse)      │    │ (index, msg)   │     │
 │   └──────┬───────┘    └──────┬───────┘    └───────┬────────┘     │
 │          │                   │                    │              │
 ├──────────┼───────────────────┼────────────────────┼──────────────┤
 │          ▼                   ▼                    ▼              │
 │  ┌────────────────────────────────────────────────────────┐      │
-│  │                  libchronicle.h (Public API)           │      │
+│  │                   brz-queue Public API                  │      │
 │  │                                                        │      │
-│  │  chronicle_init()    chronicle_open()                  │      │
-│  │  chronicle_append()  chronicle_tailer()                │      │
-│  │  chronicle_peek()    chronicle_collect()               │      │
-│  │  chronicle_cleanup()                                   │      │
+│  │  Queue.init()       Queue.open()                       │      │
+│  │  Appender.append()  Tailer.poll()                      │      │
+│  │  Tailer.collect()   Queue.deinit()                     │      │
 │  └────────────────────┬───────────────────────────────────┘      │
 │                       │                                          │
 │  ┌────────────────────┼───────────────────────────────────┐      │
-│  │            libchronicle.c (Implementation)             │      │
+│  │              Core Implementation                       │      │
 │  │                    │                                   │      │
 │  │  ┌────────────┐  ┌┴───────────┐  ┌─────────────────┐  │      │
-│  │  │  Appender  │  │   Tailer   │  │ Directory List.  │  │      │
+│  │  │  Appender  │  │   Tailer   │  │  Metadata Mgr   │  │      │
 │  │  │  (writer)  │  │  (reader)  │  │ (cycle tracker)  │  │      │
 │  │  └─────┬──────┘  └─────┬──────┘  └────────┬────────┘  │      │
 │  │        │               │                   │           │      │
 │  │  ┌─────┴───────────────┴───────────────────┴────────┐  │      │
-│  │  │         mmap / CAS / mfence primitives           │  │      │
+│  │  │    mmap / CAS / acquire-release primitives       │  │      │
 │  │  └──────────────────────┬───────────────────────────┘  │      │
 │  └─────────────────────────┼──────────────────────────────┘      │
 │                            │                                     │
 │  ┌─────────────────────────┼──────────────────────────────┐      │
-│  │               wire.c / wire.h                          │      │
-│  │          BinaryWire serialization format               │      │
-│  └─────────────────────────┬──────────────────────────────┘      │
-│                            │                                     │
-│  ┌─────────────────────────┼──────────────────────────────┐      │
-│  │              buffer.c / buffer.h                       │      │
-│  │          Hex dump and debug formatting                 │      │
+│  │             io_uring notification layer                 │      │
+│  │     (eventfd writer→reader wakeup, optional)           │      │
 │  └─────────────────────────┬──────────────────────────────┘      │
 │                            │                                     │
 └────────────────────────────┼─────────────────────────────────────┘
@@ -94,14 +91,15 @@ This document provides a comprehensive architectural description of `libchronicl
 │                    Operating System / Kernel                      │
 │                                                                  │
 │   ┌──────────┐   ┌──────────┐   ┌────────────────────────┐      │
-│   │  mmap()  │   │  open()  │   │  fstat() / lseek()     │      │
-│   │MAP_SHARED│   │ O_RDWR   │   │  rename() / write()    │      │
+│   │  mmap()  │   │  open()  │   │  fallocate()           │      │
+│   │MAP_SHARED│   │ O_RDWR   │   │  madvise() / io_uring  │      │
+│   │MAP_POPULATE  │          │   │  MAP_HUGETLB           │      │
 │   └──────────┘   └──────────┘   └────────────────────────┘      │
 │                                                                  │
 │   ┌──────────────────────────────────────────────────────┐       │
 │   │              File System (queue directory)            │       │
 │   │                                                      │       │
-│   │  metadata.cq4t   20211118F.cq4   20211119F.cq4      │       │
+│   │  metadata.brz   20211118F.brz   20211119F.brz        │       │
 │   └──────────────────────────────────────────────────────┘       │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -109,19 +107,23 @@ This document provides a comprehensive architectural description of `libchronicl
 ## Core Concepts
 
 ### Queue
-A chronicle-queue is a **directory** on disk containing:
-- One metadata/directory-listing file (`.cq4t`)
-- Zero or more queue data files (`.cq4`)
 
-There is **no broker process**. The OS kernel provides persistence via `mmap` with `MAP_SHARED`, and x86 hardware provides atomic arbitration via `lock cmpxchgl`.
+A brz-queue is a **directory** on disk containing:
+- One shared metadata file (`metadata.brz`)
+- Zero or more queue data files (`.brz`)
+
+There is **no broker process**. The OS kernel provides persistence via `mmap` with `MAP_SHARED`, and hardware atomics provide lock-free write arbitration via CAS.
 
 ### Appender
-A writer process. Appends messages to the queue and receives a 64-bit **index** identifying the write position. Multiple appenders on the same machine are supported.
+
+A writer. Appends messages to the queue and receives a 64-bit **index** identifying the write position. The appender is **single-threaded** — it is NOT thread-safe. Only one thread within a process may use the appender at a time. Multiple processes can each have their own appender to the same queue directory; cross-process arbitration is handled by CAS on the shared mmap region.
 
 ### Tailer
-A reader/subscriber process. Reads messages sequentially starting from index 0 or a provided resume index. Multiple tailers are supported and can be added/removed at will.
+
+A reader/subscriber. Reads messages sequentially starting from index 0 or a provided resume index. Multiple tailers are supported across threads and processes. Each tailer maintains its own independent mmap window and read state. Tailers never block writers.
 
 ### Index (64-bit)
+
 Every message is identified by a 64-bit index composed of two parts:
 
 ```
@@ -141,58 +143,105 @@ Every message is identified by a 64-bit index composed of two parts:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The `cycle_shift` is currently hardcoded to 32 bits in libchronicle (matching the DAILY scheme split). The upper bits are the **cycle** (maps to a time-based filename) and the lower bits are the **seqnum** (sequential message number within that file).
+The upper bits are the **cycle** (maps to a time-based filename) and the lower bits are the **seqnum** (sequential message number within that file).
 
 ### Roll Cycle
+
 Determines when a new queue file is started. The cycle value is derived from the current clock:
 
 ```
 cycle = (current_time_ms - roll_epoch) / roll_length_ms
 ```
 
-When the cycle advances, `seqnum` resets to zero and a new `.cq4` file is created.
+When the cycle advances, `seqnum` resets to zero and a new `.brz` file is created.
 
 ## File Layout on Disk
 
 ```
 queue_directory/
-├── metadata.cq4t              # roll config + cycle counters (mmap'd)
+├── metadata.brz               # Fixed 512-byte shared metadata (mmap'd)
 │
-├── 20211118F.cq4              # Queue data file for cycle N
-├── 20211119F.cq4              # Queue data file for cycle N+1
+├── 20211118F.brz              # Queue data file for cycle N
+├── 20211119F.brz              # Queue data file for cycle N+1
 └── ...
 ```
 
-### Queue File (`.cq4`) Internal Layout
+### Metadata File (`metadata.brz`) Layout
+
+A fixed 512-byte `extern struct SharedMetadata` — just mmap and cast the pointer. Zero parsing required.
+
+```
+Offset   Size   Field                    Description
+──────   ────   ─────                    ───────────
+0x0000   4      magic                    0x42525A51 ("BRZQ")
+0x0004   4      version                  Format version (1)
+0x0008   4      flags                    Feature flags (bitfield)
+0x000C   4      reserved_0               Padding / future use
+0x0010   4      roll_length_ms           Roll period in milliseconds
+0x0014   4      roll_epoch_ms            Epoch offset in milliseconds
+0x0018   4      index_count              Entries in flat index region
+0x001C   4      index_spacing            Index every Nth data message
+0x0020   4      cycle_shift              Bits to shift for cycle
+0x0024   4      reserved_1               Padding / future use
+0x0028   32     roll_format              Date format string (zero-terminated)
+0x0048   24     reserved_2               Future use
+
+───── 8-byte aligned atomic fields begin at offset 0x0060 ─────
+
+0x0060   8      highest_cycle            u64, atomic (acquire/release)
+0x0068   8      lowest_cycle             u64, atomic (acquire/release)
+0x0070   8      modcount                 u64, atomic (fetch_add)
+0x0078   8      write_lock               u64, atomic (CAS)
+
+0x0080   384    reserved_3               Pad to 512 bytes total
+──────────────────────────────────────────────────────────────
+Total: 512 bytes (0x200)
+```
+
+All atomically-accessed `u64` fields are naturally 8-byte aligned. No wire encoding, no stop-bit encoding, no parsing.
+
+### Queue File (`.brz`) Internal Layout
 
 ```
 Offset 0x0000
 ┌─────────────────────────────────────────────────────────────┐
-│ [4-byte header: METADATA | size] Metadata: "header" block   │
-│    Contains: index2index, indexing config                     │
-│    Serialized using BinaryWire format                        │
+│ QueueFileHeader (64 bytes, extern struct)                     │
+│   magic: u32         = 0x42525A44 ("BRZD")                   │
+│   version: u32       = 1                                     │
+│   cycle: u64         = cycle number for this file            │
+│   index_count: u32   = number of index slots                 │
+│   index_spacing: u32 = messages between index entries        │
+│   data_offset: u64   = byte offset where data region starts │
+│   reserved: [32]u8   = zero                                  │
 ├─────────────────────────────────────────────────────────────┤
-│ [4-byte header: METADATA | size] Index2Index page            │
-│    Array of byte positions pointing to index pages           │
+│ Index Region: flat array of u64 (index_count entries)        │
+│   [0] → byte offset of data message at seqnum 0             │
+│   [1] → byte offset of data message at seqnum index_spacing │
+│   [2] → byte offset of data message at seqnum 2×spacing     │
+│   ...                                                        │
+│   [index_count-1] → ...                                      │
+│   (0 = not yet written)                                      │
+│                                                              │
+│   Size = index_count × 8 bytes                               │
+│   (e.g., 4096 × 8 = 32,768 bytes = 32 KiB)                  │
 ├─────────────────────────────────────────────────────────────┤
-│ [4-byte header: METADATA | size] Index page(s)              │
-│    Array of byte positions pointing to data messages         │
-├─────────────────────────────────────────────────────────────┤
+│ Data Region starts at offset 64 + (index_count × 8)         │
+│                                                              │
 │ [4-byte header: DATA | size] Data message 0                 │
-│    User payload bytes                                        │
+│    User payload bytes (+ padding to 4-byte alignment)        │
 ├─────────────────────────────────────────────────────────────┤
 │ [4-byte header: DATA | size] Data message 1                 │
-│    User payload bytes                                        │
+│    User payload bytes (+ padding to 4-byte alignment)        │
 ├─────────────────────────────────────────────────────────────┤
 │                        ...                                   │
 ├─────────────────────────────────────────────────────────────┤
 │ [4-byte header: EOF]  End of file marker                     │
 ├─────────────────────────────────────────────────────────────┤
-│ [HD_UNALLOCATED = 0x00000000 ...]  Unallocated space         │
+│ [UNALLOCATED = 0x00000000 ...]  Unallocated space            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Data and metadata messages are **4-byte aligned** (padded with `(-size) & 0x03` zero bytes after each entry).
+Data messages are **4-byte aligned** (padded with `(-size) & 0x03` zero bytes after each entry).
 
 ## Memory-Mapped I/O Design
 
@@ -202,7 +251,7 @@ The kernel guarantees that `MAP_SHARED` mappings of the same file region by mult
 
 ### Chunked Mapping Strategy
 
-Files are not mapped entirely. Instead, they are mapped in chunks of `blocksize` bytes (default: 1 MiB, always a power of two):
+Files are not mapped entirely. Instead, they are mapped in sliding windows of `2 × blocksize` bytes (default blocksize: 1 MiB, always a power of two):
 
 ```
 File on disk:
@@ -224,209 +273,252 @@ mmapoff = tip & ~(blocksize - 1)   // align down to blocksize boundary
 Key rules:
 - The mapping always covers **2 × blocksize** to guarantee any single message fits
 - If a message would cross the map boundary, the window is advanced
-- If a message is larger than blocksize, blocksize is **doubled** (`queue_double_blocksize`)
+- If a message is larger than blocksize, blocksize is **doubled**
 - The mmap is only refreshed when the desired window changes
 
-### File Extension (Appenders Only)
+### Appender Mapping Optimizations
 
-When an appender detects fewer than 2 blocks remain, it extends the file:
-1. `lseek()` to the new end position
-2. `write()` a single byte to materialize the space
-3. Re-`fstat()` to pick up the new size
+- **`MAP_POPULATE`:** Appender windows are mapped with `MAP_POPULATE` to pre-fault all pages into the page table at mmap time. This eliminates minor page faults on the write hot path.
+- **Pre-map next window:** When the write tip crosses 50% of the current window, the next window is pre-mapped in the background. When the tip actually reaches the boundary, the new mapping is already faulted and ready — zero latency on window transition.
+- **`MAP_HUGETLB` (optional):** When enabled, mappings use 2 MiB huge pages to reduce TLB pressure. This is particularly effective for large blocksize values where the working set spans many pages.
 
-The default extension size is ~83.7 MB (`qf_disk_sz = 83754496L`).
+### Tailer Mapping Optimizations
+
+- **`madvise(MADV_SEQUENTIAL)`:** Tailer windows use `MADV_SEQUENTIAL` to hint the kernel that access is sequential. This enables aggressive read-ahead prefetching, keeping data pages hot ahead of the read tip.
+
+### File Pre-allocation (`fallocate`)
+
+When an appender needs to extend a queue file, it uses `fallocate(2)` on Linux instead of `lseek` + `write`:
+
+```
+fallocate(fd, 0, current_size, extension_size)
+```
+
+This actually allocates disk blocks so that the first write to a new region does not trigger filesystem block allocation (which would cause latency spikes). Combined with `MAP_POPULATE`, this eliminates all major page faults on the write path.
 
 ## Message Framing and Header Protocol
 
-Every message (data or metadata) is preceded by a 4-byte header:
+Every data message is preceded by a 4-byte header word. Bits 31–30 encode the message type:
 
 ```
 ┌────────────────────────────────────────────────┐
 │              32-bit Header Word                 │
 │                                                 │
 │  Bit 31    Bit 30    Bits 29-0                  │
-│  (working) (meta)    (size / pid)               │
 │                                                 │
 │  0         0         0x00000000  → UNALLOCATED  │
-│  0         0         size        → DATA payload │
+│  0         0         0x01-0x3FFF→ DATA (=size)  │
 │  0         1         size        → METADATA     │
-│  1         0         pid         → WORKING      │
+│  1         0         0x00000000  → WORKING      │
 │  1         1         0x00000000  → EOF          │
 └────────────────────────────────────────────────┘
 
 Constants:
   HD_UNALLOCATED = 0x00000000
-  HD_WORKING     = 0x80000000
+  HD_WORKING     = 0x80000000  (write lock held, no PID)
   HD_METADATA    = 0x40000000
   HD_EOF         = 0xC0000000
   HD_MASK_LENGTH = 0x3FFFFFFF
-  HD_MASK_META   = 0xC0000000  (= HD_EOF)
+  HD_MASK_META   = 0xC0000000
+
+Encoding:
+  0x00000000                → UNALLOCATED
+  0x00000001 .. 0x3FFFFFFF  → DATA (value = payload size in bytes)
+  0x40000001 .. 0x7FFFFFFF  → METADATA (value & 0x3FFFFFFF = size)
+  0x80000000                → WORKING (write lock held)
+  0xC0000000                → EOF marker
 ```
 
 Maximum payload size: `0x3FFFFFFF` = 1,073,741,823 bytes (~1 GiB).
 
+**Key difference from legacy formats:** The WORKING state no longer encodes the writer's PID in the lower 30 bits. PID was decorative (never used for recovery or deadlock detection) and wasted bits. WORKING is now simply `0x80000000`.
+
 ## Write Arbitration (Lock-Free CAS Protocol)
 
-Writers compete for the write position using a compare-and-swap (CAS) operation on the 4-byte header at the current tail position:
+Writers compete for the write position using a compare-and-swap (CAS) operation on the 4-byte header at the current tail position.
+
+### Writer Protocol
 
 ```
-Writer Protocol:
-                                                    
-  ┌─────────────────────────────────────┐           
-  │ 1. Read header at tail position      │           
-  │    Expected: HD_UNALLOCATED (0x0)    │           
-  └──────────────┬──────────────────────┘           
-                 │                                   
-                 ▼                                   
-  ┌─────────────────────────────────────┐           
-  │ 2. CAS: UNALLOCATED → WORKING       │           
-  │    lock cmpxchgl(&header, 0, 0x80..)│           
-  │                                      │           
-  │    Returns old value:                │           
-  │    - If 0x0: WE WON THE LOCK ──────►├──┐       
-  │    - Otherwise: LOST, retry ────────►├──┤       
-  └─────────────────────────────────────┘  │       
-                                            │       
-          ┌─────────────────────────────────┘       
-          ▼                                         
-  ┌─────────────────────────────────────┐           
-  │ 3. mfence (write barrier)            │           
-  └──────────────┬──────────────────────┘           
-                 │                                   
-                 ▼                                   
-  ┌─────────────────────────────────────┐           
-  │ 4. Write payload to (header + 4)     │           
-  │    Using append_write callback       │           
-  └──────────────┬──────────────────────┘           
-                 │                                   
-                 ▼                                   
-  ┌─────────────────────────────────────┐           
-  │ 5. mfence (write barrier)            │           
-  └──────────────┬──────────────────────┘           
-                 │                                   
-                 ▼                                   
-  ┌─────────────────────────────────────┐           
-  │ 6. Write final header:               │           
-  │    header = size & HD_MASK_LENGTH    │           
-  │    (clears WORKING bit, sets size)   │           
-  └─────────────────────────────────────┘           
-
-
-Reader Protocol:
-                                                    
-  ┌─────────────────────────────────────┐           
-  │ 1. Read 4-byte header                │           
-  └──────────────┬──────────────────────┘           
-                 │                                   
-                 ▼                                   
-  ┌─────────────────────────────────────┐           
-  │ 2. mfence (read barrier)             │           
-  │    Prevents prefetch of payload      │           
-  │    before header is confirmed        │           
-  └──────────────┬──────────────────────┘           
-                 │                                   
-                 ▼                                   
-  ┌─────────────────────────────────────┐           
-  │ 3. Decode header:                    │           
-  │    UNALLOCATED → wait/return         │           
-  │    WORKING     → busy, retry later   │           
-  │    METADATA    → parse, skip         │           
-  │    EOF         → advance cycle       │           
-  │    DATA        → parse + dispatch    │           
-  └─────────────────────────────────────┘           
+  ┌─────────────────────────────────────┐
+  │ 1. Read header at tail position      │
+  │    Expected: HD_UNALLOCATED (0x0)    │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │ 2. CAS: UNALLOCATED → WORKING       │
+  │    @atomicRmw(.cmpxchg, ptr, ...)   │
+  │                                      │
+  │    Returns old value:                │
+  │    - If 0x0: WE WON THE LOCK ──────►├──┐
+  │    - Otherwise: LOST, backoff ──────►├──┤
+  └─────────────────────────────────────┘  │
+                                            │
+          ┌─────────────────────────────────┘
+          ▼
+  ┌─────────────────────────────────────┐
+  │ 3. Write payload to (header + 4)     │
+  │    Direct memcpy into mmap region    │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │ 4. Release store: write final header │
+  │    @atomicStore(ptr, size, .release) │
+  │    (clears WORKING bit, sets size)   │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │ 5. If (seqnum % index_spacing == 0) │
+  │    atomicStore index entry           │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │ 6. Signal eventfd (if io_uring      │
+  │    readers are waiting)              │
+  └─────────────────────────────────────┘
 ```
 
-The `lock; cmpxchgl` instruction is implemented via inline assembly:
+### Reader Protocol
 
-```c
-static inline uint32_t lock_cmpxchgl(unsigned char *mem, uint32_t newval, uint32_t oldval) {
-    __typeof (*mem) ret;
-    __asm __volatile ("lock; cmpxchgl %2, %1"
-    : "=a" (ret), "=m" (*mem)
-    : "r" (newval), "m" (*mem), "0" (oldval));
-    return (uint32_t) ret;
-}
+```
+  ┌─────────────────────────────────────┐
+  │ 1. Acquire load: read 4-byte header  │
+  │    @atomicLoad(ptr, .acquire)        │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │ 2. Decode header:                    │
+  │    UNALLOCATED → wait/return         │
+  │    WORKING     → busy, retry later   │
+  │    METADATA    → skip                │
+  │    EOF         → advance cycle       │
+  │    DATA        → read payload        │
+  └─────────────────────────────────────┘
 ```
 
-This returns the **original** value in memory. If it equals `oldval`, the swap succeeded.
+### Tiered CAS Backoff
+
+When CAS fails (another writer holds the position), the retry strategy uses a three-tier backoff to balance latency against CPU waste:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   CAS Retry Backoff                          │
+│                                                              │
+│  Tier 1: Spin (iterations 0–64, ~0–2 μs)                    │
+│    └─ spinLoopHint() — CPU pipeline hint (PAUSE on x86)     │
+│    └─ Lowest latency, highest CPU usage                      │
+│                                                              │
+│  Tier 2: Yield (iterations 64–256, ~2–50 μs)                │
+│    └─ std.Thread.yield() — give up timeslice to OS           │
+│    └─ Moderate latency, lets other threads run               │
+│                                                              │
+│  Tier 3: Exponential backoff (iterations 256+)               │
+│    └─ std.time.sleep(delay) — exponential, capped at 1 ms   │
+│    └─ Highest latency, lowest CPU usage                      │
+│    └─ Appropriate for extreme contention only                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Alignment Padding
+
+After each message, padding bytes are added to maintain 4-byte alignment:
+
+```
+pad = (-payload_size) & 0x03;
+next_header_offset = current_offset + 4 + payload_size + pad;
+```
+
+This ensures the next header's CAS target is always 4-byte aligned.
 
 ## Index Structure
 
-The index is a double-level structure stored as metadata messages within the queue file:
+The index is a **flat inline array** of `u64` offsets stored immediately after the 64-byte file header, before any data messages. There is no two-level indirection, no `I64_ARRAY` metadata messages, and no wire encoding.
 
 ```
-Index2Index Page (root):
-┌──────────────────────────────────────────────────────┐
-│ I64_ARRAY: capacity = index_count                     │
-│                                                       │
-│ [0] → byte offset of Index Page 0                     │
-│ [1] → byte offset of Index Page 1                     │
-│ [2] → byte offset of Index Page 2                     │
-│ ...                                                   │
-│ [index_count-1] → byte offset of Index Page N         │
-└──────────────────────────────────────────────────────┘
-          │
-          ▼
-Index Page 0:
-┌──────────────────────────────────────────────────────┐
-│ I64_ARRAY: capacity = index_count                     │
-│                                                       │
-│ [0] → byte offset of data msg (seqnum 0)              │
-│ [1] → byte offset of data msg (seqnum = index_spacing)│
-│ [2] → byte offset of data msg (seqnum = 2*spacing)    │
-│ ...                                                   │
-└──────────────────────────────────────────────────────┘
+Queue file layout with index:
+
+  Offset 0x0000:  QueueFileHeader (64 bytes)
+  Offset 0x0040:  Index Region starts
+                   ┌──────────────────────────────────────────┐
+                   │ [0]  u64 → byte offset of msg at seq 0   │
+                   │ [1]  u64 → byte offset of msg at seq S   │
+                   │ [2]  u64 → byte offset of msg at seq 2S  │
+                   │ ...                                       │
+                   │ [N-1] u64 → byte offset of msg at seq    │
+                   │              (N-1) × S                    │
+                   │                                           │
+                   │ (0 = not yet written)                     │
+                   └──────────────────────────────────────────┘
+  Offset 0x0040 + N×8:  Data region starts
 ```
 
-Configuration per roll scheme:
+Where `S` = `index_spacing` and `N` = `index_count`.
 
-| Scheme | index_count (entries per page) | index_spacing |
-|---|---|---|
-| DAILY | 8192 (8<<10) | 64 |
-| FAST_HOURLY | 4096 (4<<10) | 256 |
-| FAST_DAILY | 4096 (4<<10) | 256 |
-| TEST4_SECONDLY | 32 | 4 |
+**Example configuration:**
+- `index_spacing` = 256, `index_count` = 4096
+- Index region size = 4096 × 8 = 32,768 bytes (32 KiB)
+- Data starts at offset 64 + 32,768 = 32,832
 
-> **Note:** libchronicle does **not** currently write index structures. This is listed as a missing feature. Reading of index structures is partially supported through the wire parser.
+### Index Write Protocol
+
+The appender atomically stores a `u64` into the index every `index_spacing` data messages:
+
+```
+if (seqnum % index_spacing == 0) {
+    slot = seqnum / index_spacing;
+    if (slot < index_count) {
+        @atomicStore(&index[slot], msg_offset, .release);
+    }
+}
+```
+
+### Index Read Protocol (Seek)
+
+Readers perform a binary search over the index region for `O(log n)` seek instead of `O(n)` linear scan:
+
+```
+1. target_slot = target_seqnum / index_spacing
+2. Binary search index[0..index_count] for the largest slot ≤ target_slot
+   where index[slot] != 0
+3. Start linear scan from that byte offset
+4. Skip forward (target_seqnum % index_spacing) messages
+```
+
+### Index Configuration by Roll Scheme
+
+| Scheme | index_count | index_spacing | Index Region Size |
+|---|---|---|---|
+| DAILY | 8192 | 64 | 64 KiB |
+| FAST_DAILY | 4096 | 256 | 32 KiB |
+| FAST_HOURLY | 4096 | 256 | 32 KiB |
+| TEST4_SECONDLY | 32 | 4 | 256 B |
 
 ## Roll Cycle Mechanism
 
 ### Roll Schemes
 
-libchronicle ships with 25+ built-in roll schemes. Each defines:
+brz-queue ships with multiple built-in roll schemes. Each defines:
 
 | Field | Description |
 |---|---|
 | `name` | Identifier (e.g., `"FAST_DAILY"`) |
-| `formatstr` | Java-style date format (e.g., `"yyyyMMdd'F'"`) |
-| `roll_length_secs` | Duration of each cycle in seconds |
-| `entries` | `index_count` — entries per index page |
-| `index` | `index_spacing` — every Nth message is indexed |
-
-### Date Format Conversion
-
-Java date format strings (e.g., `yyyyMMdd-HH'F'`) are converted to `strftime` patterns:
-
-| Java | strftime |
-|---|---|
-| `yyyy` | `%Y` |
-| `MM` | `%m` |
-| `dd` | `%d` |
-| `HH` | `%H` |
-| `mm` | `%M` |
-| `ss` | `%S` |
-| `'...'` | literal (quotes stripped) |
-| `-` | literal dash |
-
-Example: `yyyyMMdd-HH'F'` → `%Y%m%d-%HF`
+| `format` | Date format string (e.g., `"yyyyMMdd'F'"`) |
+| `roll_length_ms` | Duration of each cycle in milliseconds |
+| `index_count` | Number of entries in the flat index region |
+| `index_spacing` | Every Nth data message is indexed |
 
 ### Filename Generation
 
 ```
-filename = dirname + "/" + strftime(cycle * roll_length_secs) + ".cq4"
+filename = dirname ++ "/" ++ formatDate(cycle × roll_length_ms) ++ ".brz"
 ```
 
-The cycle number maps to a time: `time_t rawtime = cycle * (roll_length / 1000)`
+The cycle number maps to a time: `timestamp_ms = cycle × roll_length_ms + roll_epoch`
 
 ### Roll Detection During Append
 
@@ -436,214 +528,196 @@ current_cycle = (clock_ms - roll_epoch) / roll_length_ms
 if current_cycle > appender_cycle:
     1. CAS-lock the current position
     2. Write HD_EOF marker
-    3. Create new queue file for current_cycle
-    4. Update highest_cycle in directory listing
-    5. Bump modcount (atomic increment)
+    3. Swap to pre-created next cycle file (if available)
+       — OR create new queue file for current_cycle
+    4. Update highest_cycle in shared metadata (atomic store, release)
+    5. Bump modcount (atomic fetch_add)
     6. Retry append in new file
 ```
 
 ### EOF Patching
 
-If an appender finds itself holding the write lock but the current file's cycle is behind `highest_cycle`, it writes an EOF marker to "patch" the old file. This handles the case where a previous writer crashed without writing EOF. The `patch_cycles` constant (default: 3) controls how far back this lookback extends.
+If an appender finds itself holding the write lock but the current file's cycle is behind `highest_cycle`, it writes an EOF marker to "patch" the old file. This handles the case where a previous writer crashed without writing EOF.
 
-## Directory Listing / Metadata File
+### Pre-Create Next Cycle File
 
-### Purpose
-
-The directory listing file (`metadata.cq4t`) is a small file that is mmap'd by all processes. It contains:
-
-1. **Roll configuration**
-2. **Shared counters** (memory-mapped pointers for real-time updates):
-   - `listing.highestCycle` — uint64, highest active cycle
-   - `listing.lowestCycle` — uint64, lowest active cycle
-   - `listing.modCount` — uint64, atomically incremented on changes
-
-### Structure (v5 metadata.cq4t)
+To eliminate the latency spike during roll transitions (which would otherwise require 8+ syscalls for file creation, allocation, and mmap), brz-queue pre-creates the next cycle file:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ METADATA message: "header" (STStore)                 │
-│   wireType: BINARY_LIGHT                             │
-│   metadata: (SCQMeta)                                │
-│     roll: (SCQSRoll)                                 │
-│       length: 86400000  (ms)                         │
-│       format: "yyyyMMdd'F'"                          │
-│       epoch: 0                                       │
-│     deltaCheckpointInterval: 64                      │
-│     sourceId: 0                                      │
-├─────────────────────────────────────────────────────┤
-│ DATA message: listing.highestCycle = uint64           │
-│ DATA message: listing.lowestCycle  = uint64           │
-│ DATA message: listing.modCount     = uint64           │
-│ DATA message: chronicle.write.lock = uint64           │
-│ DATA message: chronicle.lastIndexReplicated = uint64  │
-│ DATA message: chronicle.lastAcknowledgedIndexRep...   │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                  Pre-Roll Protocol                           │
+│                                                              │
+│  1. When current time is within preroll_ms of roll boundary  │
+│     (configurable, default: 1000 ms)                         │
+│                                                              │
+│  2. Create next cycle's .brz file:                           │
+│     a. open() + fallocate() to pre-allocate disk blocks     │
+│     b. Write QueueFileHeader + zero index region             │
+│     c. mmap() with MAP_POPULATE to pre-fault pages          │
+│                                                              │
+│  3. Store pre-mapped file handle in appender state           │
+│                                                              │
+│  4. When roll actually happens:                              │
+│     a. Write EOF to current file (single atomic store)       │
+│     b. Swap appender pointers to pre-mapped file             │
+│     c. Zero syscalls on the hot path                         │
+│                                                              │
+│  Result: Roll transition goes from ~50 μs to ~50 ns         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Shared Metadata File
+
+The shared metadata file (`metadata.brz`) is a fixed 512-byte `extern struct SharedMetadata` that is mmap'd by all processes. There is no wire protocol, no parsing — just mmap the file and cast the pointer to the struct type.
+
+### Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ extern struct SharedMetadata (512 bytes)                      │
+│                                                              │
+│  Fixed fields (offset 0x00 – 0x5F):                          │
+│    magic .............. u32 = 0x42525A51 ("BRZQ")            │
+│    version ............ u32 = 1                               │
+│    flags .............. u32 = feature bitfield                │
+│    roll_length_ms ..... u32 = cycle duration                  │
+│    roll_epoch_ms ...... u32 = epoch offset                    │
+│    index_count ........ u32 = flat index entries              │
+│    index_spacing ...... u32 = index every Nth msg             │
+│    cycle_shift ........ u32 = bits for cycle in index         │
+│    roll_format ........ [32]u8 = date format string           │
+│    (reserved padding to 0x60)                                │
+│                                                              │
+│  Atomic fields (offset 0x60 – 0x7F, 8-byte aligned):        │
+│    highest_cycle ...... u64 (atomic acquire/release)          │
+│    lowest_cycle ....... u64 (atomic acquire/release)          │
+│    modcount ........... u64 (atomic fetch_add)                │
+│    write_lock ......... u64 (atomic CAS)                      │
+│                                                              │
+│  Reserved (offset 0x80 – 0x1FF):                             │
+│    384 bytes for future use                                  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Modcount Protocol
 
 ```
 Reader/Tailer polling:
-  1. memcpy(&modcount, dirlist_fields.modcount, 8)
-  2. If modcount != cached_modcount:
-     - Copy highest_cycle, lowest_cycle from shared memory
+  1. val = @atomicLoad(&metadata.modcount, .acquire)
+  2. If val != cached_modcount:
+     - Read highest_cycle, lowest_cycle (atomic acquire loads)
      - May trigger opening new queue files
 
 Writer updating:
-  1. memcpy(dirlist_fields.highest_cycle, &new_value, 8)
-  2. memcpy(dirlist_fields.lowest_cycle, &new_value, 8)
-  3. lock_xadd(dirlist_fields.modcount, 1)  // atomic increment
+  1. @atomicStore(&metadata.highest_cycle, new_value, .release)
+  2. @atomicStore(&metadata.lowest_cycle, new_value, .release)
+  3. _ = @atomicRmw(&metadata.modcount, .Add, 1, .release)
 ```
-
-## Wire Protocol (BinaryWire Serialization)
-
-The wire protocol is used for metadata messages, directory listing contents, and optionally for user data payloads. It is a self-describing binary format.
-
-### Control Bytes
-
-| Range | Meaning |
-|---|---|
-| `0x00–0x7F` | Inline unsigned integer value (0–127) |
-| `0x82` | `BYTES_LENGTH32` — nested structure with 4-byte length |
-| `0x8D` | `I64_ARRAY` — array of 64-bit integers |
-| `0x8E` | `PADDING_32` — variable-length padding |
-| `0x8F` | `PADDING` — single byte padding |
-| `0x90` | `FLOAT32` — 4-byte IEEE float |
-| `0xA5` | `INT16` — 2-byte little-endian integer |
-| `0xA6` | `INT32` — 4-byte little-endian integer |
-| `0xA7` | `INT64` — 8-byte little-endian integer |
-| `0xB6` | `TYPE_PREFIX` — type name with stop-bit length |
-| `0xB8` | Text value with stop-bit length |
-| `0xB9` | `EVENT_NAME` — event/key name with stop-bit length |
-| `0xC0–0xDF` | Small field name (length = byte - 0xC0) |
-| `0xE0–0xFF` | Small text value (length = byte - 0xE0) |
-
-### Stop-Bit Encoding
-
-Variable-length integer encoding where each byte's MSB indicates continuation:
-
-```
-Byte:  [1xxxxxxx] [1xxxxxxx] [0xxxxxxx]
-        ▲ more      ▲ more     ▲ last
-        7 bits       7 bits     7 bits
-```
-
-### Nesting
-
-The `0x82` control byte introduces a nested structure. A 4-byte little-endian length follows, defining how many bytes the nested content spans. Nesting is tracked with a stack of end-positions.
-
-### Alignment for Shared Memory Fields
-
-Fields that are memory-mapped for concurrent access (like `listing.highestCycle`) use `INT64` with padding to ensure 8-byte alignment. The `wirepad_uint64_aligned` function handles this by inserting `0x8F` or `0x8E` padding bytes before the `0xA7` prefix.
 
 ## Data Structures
 
-### `queue_t` (struct queue)
+### `Queue`
 
 ```
-struct queue {
-    char*             dirname;          // Queue directory path
-    uint              blocksize;        // mmap chunk size (power of 2, default 1MiB)
-    uint8_t           version;          // 4 or 5
-    uint8_t           create;           // Permission to create queue files
+const Queue = struct {
+    dirname: []const u8,              // Queue directory path
+    blocksize: u32,                   // mmap chunk size (power of 2, default 1 MiB)
 
-    // Directory listing (mmap'd)
-    char*             dirlist_name;     // Path to .cq4t file
-    int               dirlist_fd;       // File descriptor
-    unsigned char*    dirlist;          // mmap base pointer
-    dirlist_fields_t  dirlist_fields;   // Pointers into mmap for live fields
+    // Shared metadata (mmap'd)
+    metadata_fd: std.posix.fd_t,      // File descriptor for metadata.brz
+    metadata: *SharedMetadata,        // Pointer into mmap (cast from mmap base)
 
-    // File discovery
-    char*             queuefile_pattern;// Glob pattern "dirname/*.cq4"
-    glob_t            queuefile_glob;   // Results of glob()
+    // Observed cycle range (cached from shared metadata)
+    highest_cycle: u64,
+    lowest_cycle: u64,
+    modcount: u64,
 
-    // Observed cycle range (from directory listing)
-    uint64_t          highest_cycle;
-    uint64_t          lowest_cycle;
-    uint64_t          modcount;
-
-    // Roll configuration
-    int               roll_length;      // Roll period in milliseconds
-    int               roll_epoch;       // Epoch offset in milliseconds
-    char*             roll_format;      // Java-style date format
-    char*             roll_name;        // Scheme name (e.g., "FAST_DAILY")
-    char*             roll_strftime;    // Converted strftime pattern
-    int               index_count;      // Entries per index page
-    int               index_spacing;    // Index every Nth message
+    // Roll configuration (copied from metadata on open)
+    roll_length_ms: u32,
+    roll_epoch_ms: u32,
+    roll_format: [32]u8,
+    index_count: u32,
+    index_spacing: u32,
 
     // Index decomposition
-    int               cycle_shift;      // Bits to shift for cycle (always 32)
-    uint64_t          seqnum_mask;      // Mask for seqnum (0x00000000FFFFFFFF)
+    cycle_shift: u6,                  // Bits to shift for cycle
+    seqnum_mask: u64,                 // Mask for seqnum
 
-    // User-provided serialization callbacks
-    cparse_f          parser;           // Deserialize bytes → object
-    cparsefree_f      parser_free;      // Free deserialized object
-    csizeof_f         append_sizeof;    // Size of object in bytes
-    cappend_f         append_write;     // Serialize object → bytes
+    // io_uring notification (optional)
+    ring: ?IoUring,                   // io_uring instance
+    eventfd: ?std.posix.fd_t,         // eventfd for writer→reader signaling
 
-    // Linked list of tailers
-    tailer_t*         tailers;          // Doubly-linked list head
-
-    // Appender (special tailer with PROT_READ|PROT_WRITE)
-    tailer_t*         appender;
-
-    // Global queue linked list
-    struct queue*     next;
+    // Allocator for non-hot-path allocations
+    allocator: std.mem.Allocator,
 };
 ```
 
-### `tailer_t` (struct tailer)
+### `Appender`
 
 ```
-struct tailer {
-    uint64_t          dispatch_after;   // Resume support: skip messages ≤ this index
-    tailstate_t       state;            // Current state (enum)
-    cdispatch_f       dispatcher;       // User callback for messages
-    void*             dispatch_ctx;     // User context for callback
-    collected_t*      collect;          // For synchronous collect operation
-
-    int               mmap_protection;  // PROT_READ or PROT_READ|PROT_WRITE
+const Appender = struct {
+    queue: *Queue,
 
     // Currently open queue file
-    uint64_t          qf_cycle_open;    // Cycle of currently open file
-    char*             qf_fn;            // Filename of currently open file
-    struct stat       qf_statbuf;       // Cached stat of open file
-    int               qf_fd;            // File descriptor
+    cycle: u64,                       // Cycle of currently open file
+    fd: std.posix.fd_t,               // File descriptor
+    seqnum: u64,                      // Next sequence number to write
 
-    uint64_t          qf_tip;           // Byte position of next header in file
-    uint64_t          qf_index;         // Full 64-bit index (cycle << 32 | seqnum)
+    // Current mmap window (PROT_READ | PROT_WRITE)
+    buf: [*]align(4096) u8,          // mmap base address
+    mmap_offset: u64,                 // Offset from file start
+    mmap_size: u64,                   // Size of mapping
+    tip: u64,                         // Byte position of next header
 
-    // Currently mapped region
-    unsigned char*    qf_buf;           // mmap base address
-    uint64_t          qf_mmapoff;       // Offset from file start
-    uint64_t          qf_mmapsz;        // Size of mapping
-
-    struct queue*     queue;            // Parent queue pointer
-
-    // Doubly-linked list
-    struct tailer*    next;
-    struct tailer*    prev;
+    // Pre-rolled next cycle file
+    preroll_cycle: ?u64,              // Cycle of pre-created file (null if none)
+    preroll_fd: ?std.posix.fd_t,      // Pre-created file descriptor
+    preroll_buf: ?[*]align(4096) u8,  // Pre-mapped buffer
 };
 ```
 
-### Tailer States (`tailstate_t`)
+### `Tailer`
+
+```
+const Tailer = struct {
+    queue: *Queue,
+    dispatch_after: u64,              // Resume: skip messages ≤ this index
+    state: TailerState,               // Current state
+
+    // Currently open queue file
+    cycle: u64,                       // Cycle of currently open file
+    fd: std.posix.fd_t,               // File descriptor
+
+    // Current mmap window (PROT_READ only)
+    buf: [*]align(4096) const u8,     // mmap base address
+    mmap_offset: u64,                 // Offset from file start
+    mmap_size: u64,                   // Size of mapping
+
+    tip: u64,                         // Byte position of next header
+    index: u64,                       // Full 64-bit index (cycle << shift | seqnum)
+
+    // io_uring wakeup (optional)
+    waiting_on_uring: bool,           // Whether an SQE is submitted
+};
+```
+
+### Tailer States
 
 | Value | Name | Meaning |
 |---|---|---|
-| 0 | `TS_AWAITING_ENTRY` | At end of data, waiting for new entry |
-| 1 | `TS_BUSY` | Hit a WORKING header, writer in progress |
-| 2 | `TS_AWAITING_QUEUEFILE` | Expected queue file doesn't exist yet |
-| 3 | `TS_E_STAT` | `fstat()` failed |
-| 4 | `TS_E_MMAP` | `mmap()` failed (probably fatal) |
-| 5 | `TS_PEEK` | Not yet polled |
-| 6 | `TS_EXTEND_FAIL` | Queue file needs extending (appender only) |
-| 7 | `TS_COLLECTED` | A value was collected (collect mode) |
+| 0 | `awaiting_entry` | At end of data, waiting for new entry |
+| 1 | `busy` | Hit a WORKING header, writer in progress |
+| 2 | `awaiting_queuefile` | Expected queue file doesn't exist yet |
+| 3 | `error_stat` | `fstat()` failed |
+| 4 | `error_mmap` | `mmap()` failed (probably fatal) |
+| 5 | `ready` | Not yet polled |
+| 6 | `collected` | A value was collected (collect mode) |
 
 ## Appender Lifecycle
 
 ```
-chronicle_append(queue, msg)
+Appender.append(payload)
          │
          ▼
 ┌─────────────────────────┐
@@ -654,68 +728,86 @@ chronicle_append(queue, msg)
              │
              ▼
 ┌─────────────────────────┐
-│ peek_queue_modcount()    │◄─── Refresh cycle info from shared memory
+│ Check modcount            │◄─── Refresh cycle info from shared metadata
+│ (atomic acquire load)     │     (only if modcount changed)
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ Create appender tailer   │  (first call only)
-│ - PROT_READ|PROT_WRITE  │
-│ - Start from highest     │
-│   cycle - patch_cycles   │
-│ - Reopen dirlist as RW   │
+│ Check pre-roll            │  If within preroll_ms of next cycle boundary
+│ Pre-create next file      │  and preroll file not already created
+│ (fallocate + MAP_POPULATE)│
 └────────────┬────────────┘
              │
              ▼
   ┌──────────────────────┐
   │  WRITE LOOP           │◄──────────────────────────┐
   │                        │                           │
-  │  peek_queue_tailer()   │                           │
+  │  Check tip position    │                           │
   └──────────┬─────────────┘                           │
              │                                         │
      ┌───────┼──────────┬────────────┐                 │
      ▼       ▼          ▼            ▼                 │
-  AWAITING  AWAITING   EXTEND     OTHER               │
-  _ENTRY    _QUEUEFILE _FAIL      (sleep+retry)───────┤
-     │       │          │                              │
-     │       │          ▼                              │
-     │       │   lseek+write to                        │
-     │       │   extend file ──────────────────────────┤
+  AWAITING  AWAITING   NEED_REMAP  ROLL               │
+  _ENTRY    _QUEUEFILE             DETECTED            │
+     │       │          │            │                 │
+     │       │          ▼            ▼                 │
+     │       │   Advance mmap     Write EOF,           │
+     │       │   window           swap to preroll──────┤
+     │       │   (MAP_POPULATE)   (or create new file) │
      │       │                                         │
      │       ▼                                         │
-     │   Create new .cq4 file:                         │
-     │   1. queuefile_init(tmp_name)                   │
-     │   2. rename(tmp → final)                        │
-     │   3. Update highest_cycle                       │
-     │   4. poke_queue_modcount() ─────────────────────┘
+     │   Create new .brz file:                         │
+     │   1. open + fallocate                           │
+     │   2. Write QueueFileHeader + zero index         │
+     │   3. mmap with MAP_POPULATE                     │
+     │   4. Update highest_cycle (atomic release)      │
+     │   5. Bump modcount (atomic fetch_add) ──────────┘
      │
      ▼
-  ┌──────────────────────────────┐
-  │ CAS: lock_cmpxchgl            │
-  │   (&header, UNALLOC, WORKING) │
-  └──────────┬───────────────────┘
+  ┌──────────────────────────────────┐
+  │ CAS: @cmpxchgWeak                 │
+  │   (&header, UNALLOC, WORKING)     │
+  │   .success = .acq_rel             │
+  │   .failure = .monotonic            │
+  └──────────┬───────────────────────┘
              │
       ┌──────┴──────┐
       ▼             ▼
-   SUCCESS        FAILED
-      │          (sleep+retry)
+   SUCCESS     FAILED → tiered backoff
+      │          Tier 1: spinLoopHint (0-64)
+      │          Tier 2: yield (64-256)
+      │          Tier 3: exp sleep ≤1ms (256+)
+      │
       ▼
   ┌──────────────────────────┐
-  │ Check cycle / write EOF   │
-  │ if roll needed            │
+  │ Write payload at tip + 4  │
+  │ (direct memcpy into mmap) │
   └──────────┬───────────────┘
              │
              ▼
   ┌──────────────────────────┐
-  │ mfence                    │
-  │ Write payload at ptr+4    │
-  │ mfence                    │
-  │ Write size header at ptr  │
+  │ Release store: final hdr  │
+  │ @atomicStore(.release)    │
+  │ header = payload_size     │
+  │ (clears WORKING, sets sz) │
   └──────────┬───────────────┘
              │
              ▼
   ┌──────────────────────────┐
-  │ Return appender->qf_index │
+  │ Update index if           │
+  │ seqnum % spacing == 0    │
+  └──────────┬───────────────┘
+             │
+             ▼
+  ┌──────────────────────────┐
+  │ Signal eventfd for        │
+  │ io_uring readers          │
+  └──────────┬───────────────┘
+             │
+             ▼
+  ┌──────────────────────────┐
+  │ Return 64-bit index       │
   └──────────────────────────┘
 ```
 
@@ -723,32 +815,32 @@ chronicle_append(queue, msg)
 
 ### Registration
 
-```c
-tailer = chronicle_tailer(queue, callback, context, start_index);
+```
+tailer = Tailer.init(queue, start_index);
 ```
 
 1. Decomposes `start_index` into cycle and seqnum
 2. Clamps cycle to `[lowest_cycle, highest_cycle]`
 3. Sets `dispatch_after = start_index - 1`
-4. Sets `qf_index` to the start of the cycle's file (seqnum 0)
-5. Links into the queue's doubly-linked tailer list
+4. Sets `index` to the start of the cycle's file (seqnum 0)
+5. If io_uring is available, prepares eventfd SQE for wakeup
 
-### Polling (`chronicle_peek_queue_tailer_r`)
+### Polling (`Tailer.poll`)
 
-This is the core tailer loop, structured as a generator/coroutine that suspends when blocked:
+This is the core tailer read path:
 
 ```
 ┌─────────────────────────────────────────┐
 │ OUTER LOOP (while true)                  │
 │                                          │
 │ ┌───────────────────────────────────┐    │
-│ │ Extract cycle from qf_index       │    │
-│ │ cycle = qf_index >> cycle_shift   │    │
+│ │ Extract cycle from index           │    │
+│ │ cycle = index >> cycle_shift       │    │
 │ └──────────────┬────────────────────┘    │
 │                │                         │
 │      ┌─────────┴──────────┐              │
 │      │ cycle != open?     │              │
-│      │ or qf_fn == NULL?  │              │
+│      │ or fd not valid?   │              │
 │      └─────────┬──────────┘              │
 │           YES  │                         │
 │                ▼                         │
@@ -760,132 +852,255 @@ This is the core tailer loop, structured as a generator/coroutine that suspends 
 │  │   cycle < highest?       │             │
 │  │     → skip to next cycle │             │
 │  │   else                   │             │
-│  │     → return AWAITING_QF │             │
+│  │     → return .awaiting_qf│             │
 │  └──────────┬──────────────┘             │
+│             │                            │
+│             ▼                            │
+│  ┌──────────────────────────────┐        │
+│  │ Seek using flat index         │        │
+│  │ (binary search for O(log n)) │        │
+│  │ Then linear scan to exact pos │        │
+│  └──────────┬───────────────────┘        │
 │             │                            │
 │             ▼                            │
 │  ┌─────────────────────────┐             │
 │  │ Calculate mmap window    │             │
 │  │ mmapoff = tip & mask     │             │
-│  │ Refresh fstat if needed  │             │
+│  │ madvise(MADV_SEQUENTIAL) │             │
 │  │ mmap 2×blocksize chunk   │             │
 │  └──────────┬──────────────┘             │
 │             │                            │
 │             ▼                            │
-│  ┌─────────────────────────┐             │
-│  │ parse_queue_block()      │             │
-│  │  → iterate headers       │             │
-│  │  → dispatch data msgs    │             │
-│  └──────────┬──────────────┘             │
+│  ┌─────────────────────────────┐         │
+│  │ Acquire load: read header    │         │
+│  │ @atomicLoad(ptr, .acquire)   │         │
+│  └──────────┬──────────────────┘         │
 │             │                            │
 │     ┌───────┼─────────┬──────┐           │
 │     ▼       ▼         ▼      ▼           │
-│  AWAITING  BUSY    EOF    EXTEND         │
-│  _ENTRY             │    (double blk)    │
-│     │               ▼                    │
-│     │         Advance to                 │
-│     │         next cycle ────────────────┤
+│  AWAITING  BUSY    EOF    DATA           │
+│  _ENTRY             │      │             │
+│     │               ▼      ▼             │
+│     │         Advance    Read payload    │
+│     │         to next    Dispatch to     │
+│     │         cycle      callback        │
+│     │         ──────────────────────────►│
 │     │                                    │
 │     ▼                                    │
-│  (If cycle < highest - patch_cycles)     │
-│  → Skip missing EOF, advance ────────────┤
-│  (else)                                  │
-│  → return AWAITING_ENTRY                 │
+│  Wait for new data:                      │
+│  ┌────────────────────────────────┐      │
+│  │ If io_uring available:         │      │
+│  │   Submit SQE on eventfd        │      │
+│  │   Near-zero wakeup latency     │      │
+│  │   Zero CPU during idle         │      │
+│  │ Else:                          │      │
+│  │   Tiered backoff polling        │      │
+│  └────────────────────────────────┘      │
 │                                          │
 └──────────────────────────────────────────┘
 ```
 
+### io_uring Wakeup Protocol
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    io_uring Notification                        │
+│                                                                │
+│  Setup:                                                        │
+│    - Queue creates an eventfd (EFD_NONBLOCK | EFD_SEMAPHORE)   │
+│    - Queue initializes io_uring instance                       │
+│                                                                │
+│  Writer (after publishing header):                              │
+│    - write(eventfd, 1) — signal that new data is available     │
+│                                                                │
+│  Reader (when no data available):                               │
+│    1. Submit io_uring SQE: IORING_OP_READ on eventfd           │
+│    2. io_uring_submit_and_wait(1) — blocks in kernel           │
+│    3. Kernel wakes reader when eventfd becomes readable         │
+│    4. Reader resumes polling immediately                        │
+│                                                                │
+│  Latency: writer publish → reader wake ≈ 1–3 μs                │
+│  CPU during idle: 0% (blocked in kernel)                        │
+│                                                                │
+│  Fallback: If io_uring is unavailable (old kernel, no support), │
+│  readers use tiered backoff polling (same as CAS backoff).      │
+└───────────────────────────────────────────────────────────────┘
+```
+
 ### Collect Mode
 
-`chronicle_collect()` provides a synchronous blocking interface:
+`Tailer.collect()` provides a synchronous blocking interface:
 
-1. Sets `tailer->collect` to point to a `collected_t` struct
-2. Polls in a loop calling `chronicle_peek_tailer()`
-3. When `parse_data_cb` finds a message, it fills the collect struct and returns `QB_COLLECTED`
-4. The loop breaks when state becomes `TS_COLLECTED`
-5. Returns the parsed message object
+1. Polls in a loop calling `Tailer.poll()`
+2. If io_uring is available, blocks efficiently in kernel between polls
+3. Otherwise uses tiered backoff
+4. When a DATA message is found, returns the payload slice
+5. The slice points directly into the mmap region (zero-copy)
 
 ## Module Decomposition
 
-### `libchronicle.h` / `libchronicle.c` — Core Queue Engine
+brz-queue has a simple module structure — no wire protocol serialization layer is needed.
+
+### `queue.zig` — Queue Management
 
 | Responsibility | Key Functions |
 |---|---|
-| Initialization | `chronicle_init`, `chronicle_open`, `chronicle_cleanup` |
-| Configuration | `chronicle_set_version`, `chronicle_set_roll_scheme`, `chronicle_set_create`, `chronicle_set_encoder`, `chronicle_set_decoder` |
-| Writing | `chronicle_append`, `chronicle_append_ts` |
-| Reading | `chronicle_tailer`, `chronicle_peek`, `chronicle_peek_queue`, `chronicle_collect`, `chronicle_return` |
-| State Query | `chronicle_tailer_state`, `chronicle_tailer_index`, `chronicle_debug` |
-| File Management | `queuefile_init`, `directory_listing_init`, `directory_listing_reopen` |
-| Internal | `parse_queue_block`, `parse_data_cb`, `parse_dirlist`, `parse_queuefile_meta`, `lock_cmpxchgl`, `lock_xadd` |
+| Initialization | `Queue.init`, `Queue.open`, `Queue.deinit` |
+| Configuration | `Queue.setRollScheme`, `Queue.setBlocksize` |
+| Metadata | `Queue.openMetadata`, `Queue.refreshModcount` |
+| File management | `Queue.createQueueFile`, `Queue.openQueueFile` |
 
-### `wire.h` / `wire.c` — BinaryWire Serialization
+### `appender.zig` — Single-Writer Append Engine
 
 | Responsibility | Key Functions |
 |---|---|
-| Parsing | `wire_parse` — stateful parser with callbacks |
-| Writing | `wirepad_init`, `wirepad_field_*`, `wirepad_text`, `wirepad_event_name`, `wirepad_type_prefix` |
-| QC framing | `wirepad_qc_start`, `wirepad_qc_finish` |
-| Nesting | `wirepad_nest_enter`, `wirepad_nest_exit` |
-| Integration | `wire_parse_textonly`, `wirepad_sizeof`, `wirepad_write` |
+| Writing | `Appender.append`, `Appender.appendWithTimestamp` |
+| CAS + backoff | `Appender.acquireWriteLock`, `Appender.tieredBackoff` |
+| Roll handling | `Appender.checkRoll`, `Appender.preCreateNextCycle` |
+| Index update | `Appender.updateIndex` |
+| Notification | `Appender.signalReaders` |
 
-### `buffer.h` / `buffer.c` — Debug Utilities
+### `tailer.zig` — Multi-Reader Engine
 
-| Function | Purpose |
+| Responsibility | Key Functions |
 |---|---|
-| `printbuf` | Print buffer as C-string with octal escapes |
-| `formatbuf` | Format buffer as hex+ASCII dump (16 bytes per line) |
+| Reading | `Tailer.poll`, `Tailer.collect` |
+| Seeking | `Tailer.seekToIndex`, `Tailer.binarySearchIndex` |
+| Wakeup | `Tailer.waitForData`, `Tailer.submitUringRead` |
+| State | `Tailer.state`, `Tailer.currentIndex` |
 
-## Data Alignment Padding
+### `mmap.zig` — Memory Mapping Utilities
 
-After each message, padding bytes are added:
-```c
-int pad4 = -sz & 0x03;
-base = base + 4 + sz + pad4;
-```
-This ensures the next header's CAS target is 4-byte aligned.
+| Responsibility | Key Functions |
+|---|---|
+| Mapping | `MappedWindow.init`, `MappedWindow.remap` |
+| Optimization | `MappedWindow.populate`, `MappedWindow.adviseSequential` |
+| Huge pages | `MappedWindow.tryHugePages` |
+| Pre-mapping | `MappedWindow.premapNext` |
+
+### `metadata.zig` — Shared Metadata Structures
+
+| Responsibility | Key Types |
+|---|---|
+| Metadata struct | `SharedMetadata` (extern struct, 512 bytes) |
+| File header | `QueueFileHeader` (extern struct, 64 bytes) |
+| Header constants | `HD_UNALLOCATED`, `HD_WORKING`, `HD_EOF`, etc. |
+| Roll schemes | `RollScheme`, builtin scheme table |
+
+### `uring.zig` — io_uring Integration (Optional)
+
+| Responsibility | Key Functions |
+|---|---|
+| Setup | `UringNotifier.init`, `UringNotifier.deinit` |
+| Writer signal | `UringNotifier.signal` |
+| Reader wait | `UringNotifier.waitForSignal` |
+| Fallback | `UringNotifier.isAvailable` |
 
 ## Concurrency and Memory Ordering
 
+### Acquire/Release Instead of SeqCst
+
+brz-queue uses **acquire/release** semantics rather than sequential consistency (`SeqCst`) for all hot-path atomic operations:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              Memory Ordering on x86 (TSO)                    │
+│                                                              │
+│  Operation              Ordering        x86 Cost             │
+│  ─────────              ────────        ────────             │
+│  Writer: store header   .release        FREE (MOV)           │
+│  Reader: load header    .acquire        FREE (MOV)           │
+│  Writer: CAS lock       .acq_rel        LOCK CMPXCHG (same) │
+│  Writer: modcount++     .release        LOCK XADD            │
+│  SeqCst store           .seq_cst        MOV + MFENCE (~33ns) │
+│                                                              │
+│  On x86 TSO:                                                 │
+│  - All stores are release stores (hardware provides this)    │
+│  - All loads are acquire loads (hardware provides this)      │
+│  - acquire/release fences compile to plain MOV instructions  │
+│  - SeqCst requires MFENCE which costs ~33ns per operation    │
+│                                                              │
+│  Savings: ~33 ns per message on the read path                │
+│  (eliminates MFENCE that SeqCst would require)               │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ### Guarantees Relied Upon
 
-1. **x86 Total Store Order (TSO):** Stores are visible in program order. However, loads can be reordered before stores.
+1. **x86 Total Store Order (TSO):** Stores are visible in program order. Loads are not reordered with respect to other loads. Acquire/release maps to plain MOV on x86.
 
-2. **`mfence`:** Used as a full barrier to prevent:
-   - Compiler reordering (`asm volatile` with `"memory"` clobber)
-   - CPU speculative loads (prevents reading payload before header write is visible)
+2. **Acquire semantics (readers):** The `@atomicLoad(.acquire)` on the header ensures that all subsequent reads of the payload see the data written by the producer. On x86, this is a plain load (free).
 
-3. **`lock cmpxchgl`:** Atomic compare-and-swap with implicit full barrier. Used for write lock acquisition.
+3. **Release semantics (writers):** The `@atomicStore(.release)` of the final header ensures that all prior writes (payload data) are visible before the header becomes visible to readers. On x86, this is a plain store (free).
 
-4. **`lock xaddl`:** Atomic fetch-and-add with implicit barrier. Used for modcount increment.
+4. **CAS (`cmpxchg`):** Atomic compare-and-swap with implicit full barrier. Used for write lock acquisition. The `LOCK` prefix provides a full fence on x86.
+
+5. **`@atomicRmw(.Add, ...)` (`lock xadd`):** Atomic fetch-and-add with implicit barrier. Used for modcount increment.
+
+### Threading Model
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Threading Model                            │
+│                                                              │
+│  Within a single process:                                    │
+│    - Appender: single-threaded (NOT thread-safe)             │
+│    - Tailers: each tailer is independent, can run on its     │
+│      own thread. Multiple tailer threads are safe.           │
+│    - No per-process locking needed for tailers               │
+│                                                              │
+│  Across processes:                                           │
+│    - Multiple processes can share the queue directory         │
+│    - Each process mmaps the same files                       │
+│    - Write arbitration via CAS on shared mmap pages          │
+│    - Reader processes never interfere with writers            │
+│    - Each process has independent mmap windows               │
+│                                                              │
+│  Summary:                                                    │
+│    ┌──────────┬──────────────┬───────────────────┐           │
+│    │          │ Same Process │ Different Process  │           │
+│    ├──────────┼──────────────┼───────────────────┤           │
+│    │ Writer   │ 1 thread only│ 1 per process, CAS│           │
+│    │ Reader   │ N threads OK │ N processes OK     │           │
+│    │ W+R      │ Separate     │ Independent        │           │
+│    │          │ threads      │ mmap windows       │           │
+│    └──────────┴──────────────┴───────────────────┘           │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Critical Sections
 
 There are no traditional locks. The protocol is lock-free:
 - Writers use CAS on the 4-byte header as a spinlock
-- If CAS fails, the writer sleeps and retries
-- Readers never block writers (readers only do `memcpy` of the header)
-- The `mfence` between header read and payload read is essential for correctness
-
-### Single-Threaded per Process
-
-The library is **not thread-safe** within a single process. External locking is required if multiple threads share a queue handle. However, multiple **processes** can safely share the same queue directory.
+- If CAS fails, the writer uses tiered backoff (spin → yield → sleep)
+- Readers never block writers (readers only do atomic loads)
+- The acquire ordering on header read ensures payload visibility
 
 ## Error Handling
 
-Errors are stored in a global `cerr_msg` string:
+brz-queue uses Zig's native error handling via error unions:
 
-```c
-int chronicle_err(const char* msg);        // Sets error, returns -1
-void* chronicle_perr(const char* msg);     // Sets error, returns NULL
-const char* chronicle_strerror();          // Retrieves last error message
+```
+pub const QueueError = error{
+    InvalidMagic,
+    UnsupportedVersion,
+    MmapFailed,
+    FallocateFailed,
+    FileOpenFailed,
+    MetadataCorrupted,
+    MessageTooLarge,
+    BlocksizeExceeded,
+    RollFailed,
+    IoUringSetupFailed,
+};
 ```
 
-Functions return:
-- `0` for success, non-zero for failure (int-returning functions)
-- `NULL` for failure (pointer-returning functions)
+Functions return error unions:
+- `Queue.init() !Queue` — returns Queue or error
+- `Appender.append() !u64` — returns 64-bit index or error
+- `Tailer.poll() !?Message` — returns optional message or error
 
-This is a simple, non-thread-safe error model.
+Errors on the hot path (CAS failure, WORKING header) are **not** represented as errors — they are handled inline via retry loops. Only truly exceptional conditions (mmap failure, corrupted files, disk full) surface as Zig errors.
 
 ## Diagrams
 
@@ -894,93 +1109,132 @@ This is a simple, non-thread-safe error model.
 ```
   Process A (Writer)                   Shared Memory (mmap)              Process B (Reader)
   ──────────────────                   ────────────────────              ──────────────────
-                                       
-  1. sizeof(msg) → sz                  ┌────────┐
+
+  1. len = payload.len                 ┌────────┐
                                        │  0x00  │ UNALLOCATED
-  2. CAS(0x00 → 0x80|pid) ──────────► │  0x80  │ WORKING                3. Read header
-                                       │  xxxx  │                            → sees WORKING
-  4. mfence                            └────────┘                            → returns BUSY
-  5. Write payload ──────────────────► ┌────────┐
+  2. CAS(0x00 → 0x80000000) ────────►  │  0x80  │ WORKING                3. atomicLoad(.acquire)
+                                       │  0000  │                            → sees WORKING
+                                       │  00    │                            → returns .busy
+  4. memcpy payload ─────────────────► ├────────┤
                                        │  data  │ payload bytes
-  6. mfence                            └────────┘
-  7. Write header(sz) ──────────────►  ┌────────┐
-                                       │  sz    │ DATA                   8. Read header
-                                       ├────────┤                            → sees DATA|sz
-                                       │  data  │                        9. mfence
-                                       └────────┘                       10. Read payload
-                                                                        11. Dispatch callback
+  5. atomicStore(.release) ──────────► ├────────┤
+     header = len                      │  len   │ DATA                   6. atomicLoad(.acquire)
+                                       ├────────┤                            → sees DATA|len
+                                       │  data  │                        7. Read payload
+  8. write(eventfd, 1)                 └────────┘                            (visible due to
+     signal readers                                                          acquire ordering)
+                                                                         8. Dispatch callback
 ```
 
 ### Multi-Process Queue Interaction
 
 ```
   ┌────────────┐     ┌────────────┐     ┌────────────┐
-  │ Appender 1 │     │ Appender 2 │     │  Tailer 1  │
+  │ Appender   │     │  Tailer 1  │     │  Tailer 2  │
   │ (Process A)│     │ (Process B)│     │ (Process C)│
   └─────┬──────┘     └─────┬──────┘     └─────┬──────┘
         │                   │                   │
         │   mmap(SHARED)    │   mmap(SHARED)    │   mmap(SHARED)
+        │   MAP_POPULATE    │   MADV_SEQUENTIAL │   MADV_SEQUENTIAL
         │                   │                   │
         ▼                   ▼                   ▼
   ┌─────────────────────────────────────────────────────┐
   │              Kernel Page Cache                       │
   │   (same physical pages for same file regions)        │
   │                                                      │
-  │  ┌──────────────┐  ┌──────────────┐                  │
-  │  │metadata.cq4t │  │ 20211118.cq4 │                  │
-  │  │ modcount: 5  │  │ [HDR][DATA]  │                  │
-  │  │ highest: 42  │  │ [HDR][DATA]  │                  │
-  │  │ lowest: 40   │  │ [UNALLOC...] │                  │
-  │  └──────────────┘  └──────────────┘                  │
+  │  ┌──────────────┐  ┌──────────────────────────┐      │
+  │  │metadata.brz  │  │ 20211118F.brz            │      │
+  │  │ (512 bytes)  │  │ ┌──────────────────────┐ │      │
+  │  │ modcount: 5  │  │ │ QueueFileHeader 64B  │ │      │
+  │  │ highest: 42  │  │ ├──────────────────────┤ │      │
+  │  │ lowest: 40   │  │ │ Index Region 32 KiB  │ │      │
+  │  │ write_lock:0 │  │ ├──────────────────────┤ │      │
+  │  └──────────────┘  │ │ [HDR][DATA]          │ │      │
+  │                     │ │ [HDR][DATA]          │ │      │
+  │  ┌──────────────┐   │ │ [UNALLOC...]        │ │      │
+  │  │ eventfd      │  │ └──────────────────────┘ │      │
+  │  │ (io_uring)   │  └──────────────────────────┘      │
+  │  └──────────────┘                                     │
   └─────────────────────────────────────────────────────┘
         │                   │                   │
         ▼                   ▼                   ▼
   ┌─────────────────────────────────────────────────────┐
   │                   Disk (Filesystem)                   │
+  │   Pre-allocated via fallocate(2)                      │
   │   Kernel writes dirty pages asynchronously            │
   └─────────────────────────────────────────────────────┘
 ```
 
-### Queue File Lifecycle
+### Queue File Lifecycle with Pre-Roll
 
 ```
-Time ─────────────────────────────────────────────────────────►
+Time ─────────────────────────────────────────────────────────────────►
 
-Cycle N                          Cycle N+1
-├────────────────────────────────┤────────────────────────────┤
+Cycle N                               Cycle N+1
+├─────────────────────────────────────┤──────────────────────────────┤
 
-  File: 20211118F.cq4              File: 20211119F.cq4
-  ┌────────────────────────┐       ┌────────────────────────┐
-  │ META: header           │       │ META: header           │
-  │ DATA: msg 0            │       │ DATA: msg 0            │
-  │ DATA: msg 1            │       │ DATA: msg 1            │
-  │ DATA: msg 2            │       │ ...                    │
-  │ ...                    │       │ UNALLOCATED...         │
-  │ DATA: msg N            │       └────────────────────────┘
-  │ EOF ◄──── written by   │
-  │      appender on roll  │
-  │ UNALLOCATED...         │
-  └────────────────────────┘
-
-  Index: 0x4A050000_00000000       Index: 0x4A060000_00000000
-         to 0x4A050000_0000000N           ...
+  File: 20211118F.brz                   File: 20211119F.brz
+  ┌────────────────────────┐            ┌────────────────────────┐
+  │ QueueFileHeader (64B)  │            │ QueueFileHeader (64B)  │
+  │ Index Region (32 KiB)  │            │ Index Region (32 KiB)  │
+  │ DATA: msg 0            │            │ DATA: msg 0            │
+  │ DATA: msg 1            │            │ DATA: msg 1            │
+  │ DATA: msg 2            │            │ ...                    │
+  │ ...                    │            │ UNALLOCATED...         │
+  │ DATA: msg N            │            └────────────────────────┘
+  │ EOF ◄── written on roll│                     ▲
+  │ UNALLOCATED...         │                     │
+  └────────────────────────┘              Pre-created within
+                                          preroll_ms (1000ms)
+  Index: 0x4A050000_00000000              of roll boundary.
+         to 0x4A050000_0000000N           Already fallocate'd
+                                          and MAP_POPULATE'd.
+                                          Roll = pointer swap,
+                                          zero syscalls.
 ```
 
-### Global Linked List Structure
+### Tiered Backoff Timing
 
 ```
-  queue_head ──► queue_t ──► queue_t ──► NULL
-                   │             │
-                   │             └─ tailers ──► tailer_t ──► NULL
-                   │
-                   ├─ tailers ──► tailer_t ◄──► tailer_t ──► NULL
-                   │              (doubly linked)
-                   │
-                   └─ appender ──► tailer_t (special: RW mmap)
+  CAS Failure
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  Iteration   0        64       256                    ∞     │
+  │  ────────── ├─────────┼─────────┼─────────────────────►     │
+  │              │ TIER 1  │ TIER 2  │      TIER 3              │
+  │              │  SPIN   │  YIELD  │  EXPONENTIAL SLEEP       │
+  │              │         │         │                           │
+  │  Latency:    │  0-2 μs │ 2-50 μs│  50 μs → 1 ms (cap)     │
+  │  CPU cost:   │  100%   │  ~50%  │  ~0%                     │
+  │  Mechanism:  │ PAUSE   │ sched  │  nanosleep               │
+  │              │ hint    │ yield  │  (doubles each iter)     │
+  │              │         │        │                           │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-All queues are linked in a singly-linked global list (`queue_head`). `chronicle_peek()` iterates all queues and all their tailers. Within a queue, tailers form a **doubly-linked list** (for O(1) removal). The appender is a separate tailer with write permissions.
+### Flat Index Lookup (Seek)
+
+```
+  Target: seqnum = 1500, index_spacing = 256
+
+  Step 1: target_slot = 1500 / 256 = 5
+
+  Step 2: Binary search index region
+  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+  │  0  │  1  │  2  │  3  │  4  │  5  │  6  │  7  │  ...
+  │32832│34100│35980│37200│39500│41000│  0  │  0  │
+  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+                                  ▲
+                                  └── slot 5: offset 41000
+                                      → seqnum 1280
+
+  Step 3: Linear scan from offset 41000
+           Skip (1500 - 1280) = 220 messages
+           → O(log n) + O(index_spacing) instead of O(n)
+```
 
 ---
 
-*This document was generated from analysis of the libchronicle source code. For protocol changes between versions, see `CHANGES.md`.*
+*This document describes the architecture of brz-queue, a clean-room lock-free memory-mapped IPC queue implemented in Zig. For protocol changes between versions, see `CHANGES.md`.*

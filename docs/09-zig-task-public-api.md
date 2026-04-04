@@ -1,1034 +1,676 @@
-# Task 7: Public API and Language Bindings
+# Task 7: Public API Design
 
-## Overview
+## 1. Overview
 
-This task covers the design of the public Zig API for the Chronicle Queue reimplementation,
-equivalent to the C library's `libchronicle.h`. The goal is to provide an idiomatic Zig
-interface that leverages the type system for safety and ergonomics, while also exposing a
-C ABI layer for backwards compatibility with existing Python and kdb+ bindings.
+The brz-queue public API is designed as an idiomatic Zig library. It exposes a
+single-writer, multiple-reader, memory-mapped IPC queue with the lowest possible
+latency and zero allocations on the hot path.
 
-The C API uses opaque pointers (`queue_t*`, `tailer_t*`), global error strings, and
-`void*` callback signatures — all patterns that Zig can improve upon with generics,
-error unions, and comptime type safety.
+**Key principles:**
+
+| Principle | How it is realised |
+|---|---|
+| Comptime generics | `Queue(MessageType)` / `Tailer(MessageType)` — monomorphised at compile time for zero function-pointer overhead |
+| Zero hot-path allocations | All data lives in mmap'd `.brz` files; the append and poll paths never call an allocator |
+| Error unions | Every fallible operation returns `!T`; no error codes, no global error string |
+| No global state | Each `Queue` instance is fully independent |
+| No C ABI layer | Pure Zig library — a C-compatible shim can be added later if needed |
 
 ---
 
-## 1. Idiomatic Zig API Design
-
-### 1.1 Core Types
-
-Replace the C library's opaque pointer + free-function pairs with Zig structs that own
-their resources and clean up via `deinit()`.
+## 2. Core Types
 
 ```zig
-// src/chronicle.zig — Public API
-
 const std = @import("std");
 
-pub const RollScheme = @import("roll_scheme.zig").RollScheme;
-pub const Wire = @import("wire.zig");
+/// A 64-bit index that uniquely identifies a message within the queue.
+/// The upper bits encode the cycle (file), the lower bits encode the
+/// sequence number within that cycle.
 pub const Index = u64;
 
-pub const TailerState = enum(u8) {
-    awaiting_entry = 0,
-    busy = 1,
-    awaiting_queuefile = 2,
-    err_stat = 3,
-    err_mmap = 4,
-    not_yet_polled = 5,
-    extend_fail = 6,
-    collected = 7,
-};
-
+/// On-disk format version.
 pub const Version = enum(u8) {
     unknown = 0,
-    v5 = 5,
+    v1 = 1,
+};
+
+/// State machine for a tailer's position within the queue.
+pub const TailerState = enum(u8) {
+    /// Waiting for the next entry to appear in the current cycle file.
+    awaiting_entry,
+    /// Currently processing an entry.
+    busy,
+    /// Current cycle file exhausted; waiting for the next roll.
+    awaiting_queuefile,
+    /// stat() on a cycle file failed.
+    err_stat,
+    /// mmap() on a cycle file failed.
+    err_mmap,
+    /// poll()/collect() has not been called yet.
+    not_yet_polled,
+    /// Attempted to extend a cycle file and failed.
+    extend_fail,
+    /// An entry was successfully collected via collect().
+    collected,
+};
+
+/// Describes how the queue rolls to a new cycle file.
+pub const RollScheme = struct {
+    /// Length of each cycle in milliseconds (e.g. 86_400_000 for daily).
+    cycle_ms: u64,
+    /// strftime-compatible format string for the cycle file name.
+    date_format: []const u8,
+    /// File extension for cycle files.
+    extension: []const u8 = ".brz",
 };
 ```
 
-### 1.2 Queue Struct with Builder Pattern
+---
 
-The C API uses a multi-step init → set → open sequence:
+## 3. QueueConfig (Builder Pattern)
 
-```c
-queue_t* q = chronicle_init(dir);
-chronicle_set_version(q, 5);
-chronicle_set_roll_scheme(q, "FAST_DAILY");
-chronicle_set_encoder(q, &sizeof_fn, &write_fn);
-chronicle_set_create(q, 1);
-chronicle_open(q);
-```
-
-The Zig equivalent uses a configuration struct and a single `open()` call:
+`QueueConfig` aggregates every knob needed to open or create a queue.
+All fields except `dir` have sensible defaults so the simplest call site is
+just `.{ .dir = "/tmp/my-queue" }`.
 
 ```zig
 pub const QueueConfig = struct {
-    /// Directory containing queue files
+    /// Path to the queue directory.  Must already exist unless `create` is set.
     dir: []const u8,
 
-    /// Protocol version. If `.unknown`, auto-detected from existing queue files.
-    version: Version = .unknown,
+    /// On-disk format version.
+    version: Version = .v1,
 
-    /// Roll scheme name (e.g. "FAST_DAILY", "DAILY"). null = auto-detect.
+    /// Override the default roll scheme (daily, `.brz` extension).
     roll_scheme: ?RollScheme = null,
 
-    /// Custom roll date format. Overrides the roll_scheme format if set.
-    roll_date_format: ?[]const u8 = null,
-
-    /// If true, create the queue directory and metadata if it doesn't exist.
+    /// If true, create the directory and `metadata.brz` when they do not exist.
     create: bool = false,
 
-    /// Allocator for internal buffers, mmap bookkeeping, tailer lists.
-    allocator: std.mem.Allocator,
+    /// Request MAP_HUGETLB for cycle file mappings.
+    use_huge_pages: bool = false,
+
+    /// How many milliseconds before the next roll boundary to pre-create the
+    /// next cycle file, avoiding latency spikes at roll time.
+    preroll_ms: u64 = 1000,
+
+    /// Use io_uring for blocking tailer wakeup (the `collect` API).
+    /// Falls back to poll/futex when false or when the kernel is too old.
+    enable_io_uring: bool = true,
+
+    /// Allocator used for metadata bookkeeping (never on the hot path).
+    allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 ```
 
-### 1.3 Queue with Comptime Generic Message Type
+---
 
-Instead of `void*` callbacks, use Zig's comptime generics. The user provides a
-`MessageType` and a `Codec` that knows how to serialize/deserialize it:
+## 4. Queue(comptime MessageType) — Generic Queue
+
+`Queue` is the central type.  It is parameterised over the user's message type
+so that the codec, serialisation sizes, and poll/append paths are all resolved
+at comptime and fully inlined.
 
 ```zig
-/// A Codec tells the Queue how to transform between raw bytes and user messages.
-///
-/// For simple string queues, use `chronicle.StringCodec`.
-/// For BinaryWire messages, use `chronicle.WireCodec`.
-pub fn Codec(comptime T: type) type {
-    return struct {
-        /// Deserialize bytes from the queue into a user message.
-        /// The returned value borrows from `data` — it is only valid until
-        /// the next call to `poll()` or `collect()` on the same tailer.
-        parse: *const fn (data: []const u8) error{ParseError}!T,
-
-        /// Return the serialized size of a message (for pre-allocation).
-        serialized_size: *const fn (msg: T) usize,
-
-        /// Serialize a message into the provided buffer.
-        /// `buf.len` is guaranteed to be >= `serialized_size(msg)`.
-        write: *const fn (buf: []u8, msg: T) void,
-    };
-}
-
 pub fn Queue(comptime MessageType: type) type {
     return struct {
         const Self = @This();
 
-        // --- internal fields ---
+        // ── internal state (not part of the public contract) ──────────
         allocator: std.mem.Allocator,
         dir: []const u8,
         version: Version,
-        roll: RollSchemeInfo,
+        roll: RollScheme,
         codec: Codec(MessageType),
-        // ... mmap state, directory listing, tailer linked list, etc.
+        // … mmap bookkeeping, ring pointers, io_uring fd, etc.
 
-        /// Open a queue with the given configuration and codec.
+        // ── lifecycle ─────────────────────────────────────────────────
+
+        /// Open (or create) a queue rooted at `config.dir`.
+        /// The `codec` translates between `MessageType` and the raw bytes
+        /// stored on disk.
         pub fn open(config: QueueConfig, codec: Codec(MessageType)) !Self {
-            // 1. stat directory, detect version from existing files
-            // 2. mmap metadata.cq4t
-            // 3. parse roll config from metadata
-            // 4. populate highest_cycle / lowest_cycle / modcount
-            _ = config;
-            _ = codec;
-            @panic("TODO: implement");
+            // 1. Resolve / create directory
+            // 2. Read or write metadata.brz
+            // 3. mmap the current cycle file
+            // 4. Optionally initialise io_uring
+            _ = .{ config, codec };
+            @compileError("stub");
         }
 
-        /// Close the queue and release all resources (munmap, close fds).
+        /// Release all resources: unmap files, close fds, free metadata.
         pub fn deinit(self: *Self) void {
             _ = self;
-            @panic("TODO: implement");
         }
 
-        /// Append a message to the queue using the current wall-clock time.
-        /// Returns the index (cycle << shift | seqnum) of the written entry.
+        // ── writer (single thread only) ───────────────────────────────
+
+        /// Append a message and return the assigned index.
+        /// This is the **hot path** — no allocator calls, no syscalls
+        /// (the mmap page fault is the only implicit kernel interaction).
         pub fn append(self: *Self, msg: MessageType) !Index {
-            return self.appendWithTimestamp(msg, std.time.milliTimestamp());
+            _ = .{ self, msg };
+            @compileError("stub");
         }
 
-        /// Append a message with an explicit timestamp (milliseconds since epoch).
-        /// This is essential for deterministic testing and replay.
-        pub fn appendWithTimestamp(self: *Self, msg: MessageType, timestamp_ms: i64) !Index {
-            _ = self;
-            _ = msg;
-            _ = timestamp_ms;
-            @panic("TODO: implement");
+        /// Append with an explicit wall-clock timestamp (milliseconds
+        /// since epoch).  Useful for replaying captured data.
+        pub fn appendWithTimestamp(self: *Self, msg: MessageType, ts_ms: u64) !Index {
+            _ = .{ self, msg, ts_ms };
+            @compileError("stub");
         }
 
-        /// Create a tailer starting from the given index (0 = beginning).
+        // ── reader (thread-safe — each tailer is independent) ─────────
+
+        /// Create a new tailer starting at `start_index`.
+        /// Pass `0` to read from the very beginning of the queue.
         pub fn tailer(self: *Self, start_index: Index) !Tailer(MessageType) {
-            _ = self;
-            _ = start_index;
-            @panic("TODO: implement");
+            _ = .{ self, start_index };
+            @compileError("stub");
         }
 
-        /// Peek all tailers, advancing any that have new data available.
-        pub fn peek(self: *Self) void {
-            _ = self;
-            @panic("TODO: implement");
-        }
+        // ── metadata access ───────────────────────────────────────────
 
-        /// Return the queue version (4 or 5).
         pub fn getVersion(self: *const Self) Version {
             return self.version;
         }
 
-        /// Return the roll scheme name, e.g. "FAST_DAILY".
-        pub fn getRollScheme(self: *const Self) ?[]const u8 {
-            _ = self;
-            @panic("TODO: implement");
-        }
-
-        /// Return the filename for a given cycle number.
-        pub fn getCyclePath(self: *const Self, cycle: u32) ![]const u8 {
-            _ = self;
-            _ = cycle;
-            @panic("TODO: implement");
+        pub fn getRollScheme(self: *const Self) RollScheme {
+            return self.roll;
         }
     };
 }
 ```
 
-### 1.4 Tailer Struct — Iterator Pattern
+### Threading contract
 
-The C API has two consumption models: callback-based (`cdispatch_f`) and blocking
-(`chronicle_collect`/`chronicle_return`). In Zig, we unify these into an **iterator**:
+| Operation | Thread safety |
+|---|---|
+| `append` / `appendWithTimestamp` | **Single writer only.** No internal locking. |
+| `tailer` | Safe to call from any thread. |
+| `Tailer.poll` / `Tailer.collect` | Each tailer instance must be used by a single thread at a time, but different tailers may run concurrently. |
+| `getVersion` / `getRollScheme` | Immutable after `open`; safe from any thread. |
+
+All shared state between writer and readers is synchronised with
+**acquire/release** atomic ordering on the sequence counter in the mapped file
+header.
+
+---
+
+## 5. Tailer(comptime MessageType) — Iterator Pattern
+
+A `Tailer` is a lightweight cursor over the queue.  It never allocates — the
+returned `Entry.message` borrows directly from the mmap'd region and is valid
+until the next call to `poll` or `collect`.
 
 ```zig
 pub fn Tailer(comptime MessageType: type) type {
     return struct {
         const Self = @This();
 
-        state: TailerState,
-        current_index: Index,
-        // ... internal mmap state, queue back-pointer, etc.
-
-        /// A single entry read from the queue.
         pub const Entry = struct {
+            /// The unique index of this message.
             index: Index,
+            /// The deserialised message.  Borrows from the mmap region —
+            /// valid until the next poll/collect call on this tailer.
             message: MessageType,
+            /// Size of the raw on-disk representation in bytes.
             raw_size: usize,
         };
 
-        /// Attempt to read the next entry without blocking.
-        /// Returns `null` if no entry is available yet.
+        // ── reading ───────────────────────────────────────────────────
+
+        /// Non-blocking poll.  Returns `null` when no new message is
+        /// available yet.  This is the lowest-latency read path.
         pub fn poll(self: *Self) !?Entry {
             _ = self;
-            @panic("TODO: implement");
+            @compileError("stub");
         }
 
-        /// Block until the next entry is available, then return it.
-        /// Equivalent to the C `chronicle_collect` function.
-        ///
-        /// Uses exponential backoff internally (usleep with increasing delay
-        /// after 20 unsuccessful polls, then re-checks modcount).
+        /// Blocking wait using io_uring (or fallback).  Returns the next
+        /// message, sleeping until one is appended.
         pub fn collect(self: *Self) !Entry {
-            var delay_count: u64 = 0;
-            while (true) {
-                if (try self.poll()) |entry| {
-                    return entry;
-                }
-                delay_count += 1;
-                if (delay_count > 20) {
-                    std.time.sleep(delay_count * std.time.ns_per_us);
-                    // re-check directory listing modcount
-                }
-            }
+            _ = self;
+            @compileError("stub");
         }
 
-        /// Return the current tailer state.
+        // ── positioning ───────────────────────────────────────────────
+
+        /// Seek to a specific index.  The next poll/collect will return
+        /// the message at (or after) `index`.
+        pub fn seekTo(self: *Self, index: Index) !void {
+            _ = .{ self, index };
+        }
+
+        // ── introspection ─────────────────────────────────────────────
+
         pub fn getState(self: *const Self) TailerState {
             return self.state;
         }
 
-        /// Return the index of the last entry read (or the start position).
         pub fn getIndex(self: *const Self) Index {
             return self.current_index;
         }
 
-        /// Close the tailer, releasing its mmap region.
+        // ── lifecycle ─────────────────────────────────────────────────
+
+        /// Release cycle-file mappings held by this tailer.
         pub fn deinit(self: *Self) void {
             _ = self;
-            @panic("TODO: implement");
         }
     };
 }
 ```
 
-There is no need for a separate `chronicle_return` in Zig. The C library uses it to
-call `parser_free` on the deserialized object. In the Zig API, the `Entry.message`
-borrows from the memory-mapped buffer and requires no explicit free. If the codec
-allocates (e.g. for deep copies), the codec's `parse` function should use an arena
-allocator owned by the tailer, which is reset on each `poll()` call.
-
 ---
 
-## 2. Zig Generics for Message Types
+## 6. Codec Interface and Built-in Codecs
 
-### 2.1 The `Queue(comptime MessageType)` Pattern
+A **codec** bridges the gap between the user's `MessageType` and the raw bytes
+on disk.  brz-queue does **not** use BinaryWire or any self-describing wire
+format — the codec is a simple, user-supplied pair of serialize/deserialize
+functions resolved at comptime.
 
-The key insight is that `void*` in the C API is a type erasure mechanism. Zig's comptime
-generics remove the need for this entirely:
+### 6.1 Codec definition
 
 ```zig
-// --- String queue (simplest case) ---
-const StringQueue = chronicle.Queue([]const u8);
+pub fn Codec(comptime MessageType: type) type {
+    return struct {
+        /// Deserialise `MessageType` from a raw byte buffer.
+        parse: *const fn (buf: []const u8) ?MessageType,
 
-// --- Structured message queue ---
-const TradeMessage = struct {
-    symbol: []const u8,
-    price: f64,
-    quantity: u64,
-    timestamp: i64,
-};
-const TradeQueue = chronicle.Queue(TradeMessage);
+        /// Return the serialised size of `msg` in bytes.
+        serialized_size: *const fn (msg: MessageType) usize,
+
+        /// Write `msg` into `buf`.  `buf.len` is guaranteed to be at
+        /// least `serialized_size(msg)`.
+        write: *const fn (buf: []u8, msg: MessageType) void,
+    };
+}
 ```
 
-### 2.2 Built-in Codecs
+### 6.2 RawCodec — `[]const u8`, no validation
 
-Provide common codecs out of the box:
+The simplest built-in codec.  It stores and retrieves raw byte slices with
+no copying and no validation.
 
 ```zig
-/// Codec for queues where each entry is plain UTF-8 text.
-/// This is the equivalent of the C library's `wire_parse_textonly` +
-/// `chronicle_encoder_default_*` functions.
-pub const StringCodec = Codec([]const u8){
+pub const RawCodec = Codec([]const u8){
     .parse = struct {
-        fn parse(data: []const u8) error{ParseError}![]const u8 {
-            return data;
+        fn f(buf: []const u8) ?[]const u8 {
+            return buf;
         }
-    }.parse,
+    }.f,
     .serialized_size = struct {
-        fn size(msg: []const u8) usize {
+        fn f(msg: []const u8) usize {
             return msg.len;
         }
-    }.size,
+    }.f,
     .write = struct {
-        fn write(buf: []u8, msg: []const u8) void {
+        fn f(buf: []u8, msg: []const u8) void {
             @memcpy(buf[0..msg.len], msg);
         }
-    }.write,
-};
-
-/// Codec that uses BinaryWire framing (event_name → text).
-/// Wraps the text in a wire text field, matching Java Chronicle Queue's
-/// default text message format.
-pub const WireTextCodec = Codec([]const u8){
-    .parse = wireParseText,
-    .serialized_size = wireTextSize,
-    .write = wireTextWrite,
+    }.f,
 };
 ```
 
-### 2.3 Custom Codec Example
+### 6.3 TextCodec — `[]const u8`, UTF-8 validated
 
-Users implement their own codec for structured types:
+Identical to `RawCodec` on the write side.  On parse, it rejects buffers
+that are not valid UTF-8.
 
 ```zig
-const TradeCodec = chronicle.Codec(TradeMessage){
+pub const TextCodec = Codec([]const u8){
     .parse = struct {
-        fn parse(data: []const u8) !TradeMessage {
-            // Use Wire.parse to walk BinaryWire fields
-            var reader = Wire.Reader.init(data);
-            return TradeMessage{
-                .symbol = try reader.readField("symbol").text(),
-                .price = try reader.readField("price").float64(),
-                .quantity = try reader.readField("quantity").uint64(),
-                .timestamp = try reader.readField("timestamp").int64(),
-            };
+        fn f(buf: []const u8) ?[]const u8 {
+            if (!std.unicode.utf8ValidateSlice(buf)) return null;
+            return buf;
         }
-    }.parse,
+    }.f,
+    .serialized_size = RawCodec.serialized_size,
+    .write = RawCodec.write,
+};
+```
+
+### 6.4 Custom codec example — `Trade`
+
+```zig
+const Trade = struct {
+    symbol: [8]u8,
+    price: f64,
+    quantity: u32,
+};
+
+const trade_codec = brz.Codec(Trade){
+    .parse = struct {
+        fn f(buf: []const u8) ?Trade {
+            if (buf.len < @sizeOf(Trade)) return null;
+            return std.mem.bytesToValue(Trade, buf[0..@sizeOf(Trade)]);
+        }
+    }.f,
     .serialized_size = struct {
-        fn size(msg: TradeMessage) usize {
-            var pad = Wire.Pad.init();
-            pad.fieldText("symbol", msg.symbol);
-            pad.fieldFloat64("price", msg.price);
-            pad.fieldUint64("quantity", msg.quantity);
-            pad.fieldInt64("timestamp", msg.timestamp);
-            return pad.size();
+        fn f(_: Trade) usize {
+            return @sizeOf(Trade);
         }
-    }.size,
+    }.f,
     .write = struct {
-        fn write(buf: []u8, msg: TradeMessage) void {
-            var pad = Wire.Pad.initBuf(buf);
-            pad.fieldText("symbol", msg.symbol);
-            pad.fieldFloat64("price", msg.price);
-            pad.fieldUint64("quantity", msg.quantity);
-            pad.fieldInt64("timestamp", msg.timestamp);
+        fn f(buf: []u8, msg: Trade) void {
+            @memcpy(buf[0..@sizeOf(Trade)], std.mem.asBytes(&msg));
         }
-    }.write,
+    }.f,
 };
-```
-
----
-
-## 3. Error Handling
-
-### 3.1 Replace Global Error String with Error Unions
-
-The C library stores errors in a global `cerr_msg` string and returns `-1` or `NULL`:
-
-```c
-// C: caller must check return AND call chronicle_strerror()
-int rc = chronicle_open(queue);
-if (rc != 0) {
-    printf("Error: %s\n", chronicle_strerror());
-}
-```
-
-The Zig API uses error unions — the idiomatic way to propagate errors:
-
-```zig
-pub const ChronicleError = error{
-    /// The queue directory does not exist and `create` was not set.
-    DirNotFound,
-    /// The path exists but is not a directory.
-    NotADirectory,
-    /// Could not detect queue version from existing files and none was specified.
-    VersionDetectFailed,
-    /// The requested roll scheme name is not recognized.
-    InvalidRollScheme,
-    /// fstat() failed on a queue file.
-    StatFailed,
-    /// mmap() failed — possibly fatal, check system limits.
-    MmapFailed,
-    /// Attempted to append a message larger than 30-bit length field allows.
-    MessageTooLarge,
-    /// The wire protocol parser encountered invalid data.
-    ParseError,
-    /// A CAS operation on the working header timed out (contention).
-    LockTimeout,
-    /// Memory allocation failure.
-    OutOfMemory,
-    /// Queue file on disk needs extending but the extend operation failed.
-    ExtendFailed,
-};
-```
-
-Usage becomes clean and composable:
-
-```zig
-var queue = try StringQueue.open(.{
-    .dir = "/var/chronicle/trades",
-    .version = .v5,
-    .roll_scheme = .fast_daily,
-    .allocator = allocator,
-}, chronicle.StringCodec);
-defer queue.deinit();
-
-const index = try queue.append("hello world");
-```
-
-### 3.2 Error Context for Diagnostics
-
-For cases where callers need detailed error context (like the C `chronicle_strerror()`),
-attach context to errors using Zig's `@errorReturnTrace()` in debug builds, and consider
-a separate diagnostic channel:
-
-```zig
-/// Optional: retrieve detailed error information after a failed operation.
-/// This is primarily for the C ABI compatibility layer. In pure Zig code,
-/// prefer using error unions directly.
-pub fn lastErrorMessage() []const u8 {
-    return thread_local_error_message orelse "no error";
-}
-
-threadlocal var thread_local_error_message: ?[]const u8 = null;
-```
-
----
-
-## 4. C ABI Compatibility Layer
-
-### 4.1 Exporting Functions from Zig
-
-To maintain backwards compatibility with the existing Python (ctypes) and kdb+ bindings,
-expose a C ABI using Zig's `export` keyword. This replaces the C `.so` with a Zig-built
-`.so` that has the exact same symbol names.
-
-```zig
-// src/c_api.zig — C ABI compatibility layer
-//
-// This file wraps the idiomatic Zig API in extern "C" functions matching
-// the original libchronicle.h signatures.
-
-const std = @import("std");
-const chronicle = @import("chronicle.zig");
-
-/// We use the page allocator for C ABI allocations since the C caller
-/// cannot provide a Zig allocator.
-const c_allocator = std.heap.page_allocator;
-
-// Opaque handles — the C caller sees these as void pointers.
-// Internally they wrap a type-erased Queue and Tailer.
-const CQueue = chronicle.Queue(CObj);
-const CTailer = chronicle.Tailer(CObj);
-
-// The C object type — an opaque pointer, matching `typedef void* COBJ`.
-const CObj = *anyopaque;
-
-// ─── Callback types matching libchronicle.h ───
-const CParseF = *const fn ([*]u8, c_int) callconv(.C) ?CObj;
-const CParseFreeF = *const fn (?CObj) callconv(.C) void;
-const CSizeofF = *const fn (?CObj) callconv(.C) usize;
-const CAppendF = *const fn ([*]u8, ?CObj, usize) callconv(.C) void;
-const CDispatchF = *const fn (?*anyopaque, u64, ?CObj) callconv(.C) c_int;
-
-// ─── Lifecycle ───
-
-export fn chronicle_init(dir: [*:0]const u8) ?*CQueue {
-    const queue = c_allocator.create(CQueue) catch return null;
-    queue.* = CQueue.init(.{
-        .dir = std.mem.sliceTo(dir, 0),
-        .allocator = c_allocator,
-    });
-    return queue;
-}
-
-export fn chronicle_set_version(queue: *CQueue, version: c_int) void {
-    queue.setVersion(switch (version) {
-        5 => .v5,
-        else => return,
-    });
-}
-
-export fn chronicle_set_roll_scheme(queue: *CQueue, scheme: [*:0]const u8) c_int {
-    queue.setRollScheme(std.mem.sliceTo(scheme, 0)) catch return -1;
-    return 0;
-}
-
-export fn chronicle_set_create(queue: *CQueue, create: c_int) void {
-    queue.config.create = (create != 0);
-}
-
-export fn chronicle_open(queue: *CQueue) c_int {
-    queue.openFromConfig() catch |err| {
-        setLastError(err);
-        return -1;
-    };
-    return 0;
-}
-
-export fn chronicle_cleanup(queue: *CQueue) c_int {
-    queue.deinit();
-    c_allocator.destroy(queue);
-    return 0;
-}
-
-export fn chronicle_strerror() [*:0]const u8 {
-    return @ptrCast(chronicle.lastErrorMessage().ptr);
-}
-
-// ─── Appending ───
-
-export fn chronicle_append(queue: *CQueue, msg: ?CObj) u64 {
-    return queue.append(msg) catch return 0;
-}
-
-export fn chronicle_append_ts(queue: *CQueue, msg: ?CObj, ms: c_long) u64 {
-    return queue.appendWithTimestamp(msg, ms) catch return 0;
-}
-
-// ─── Tailer ───
-
-export fn chronicle_tailer(
-    queue: *CQueue,
-    dispatcher: ?CDispatchF,
-    ctx: ?*anyopaque,
-    index: u64,
-) ?*CTailer {
-    _ = dispatcher;
-    _ = ctx;
-    const t = queue.tailer(index) catch return null;
-    const tailer_ptr = c_allocator.create(CTailer) catch return null;
-    tailer_ptr.* = t;
-    return tailer_ptr;
-}
-
-export fn chronicle_tailer_close(tailer: *CTailer) void {
-    tailer.deinit();
-    c_allocator.destroy(tailer);
-}
-
-export fn chronicle_tailer_state(tailer: *CTailer) c_int {
-    return @intFromEnum(tailer.getState());
-}
-
-export fn chronicle_tailer_index(tailer: *CTailer) u64 {
-    return tailer.getIndex();
-}
-
-// ─── Polling ───
-
-export fn chronicle_peek() void {
-    // Poll all known queues — iterate global queue list
-}
-
-export fn chronicle_peek_queue(queue: *CQueue) void {
-    queue.peek();
-}
-
-export fn chronicle_peek_tailer(tailer: *CTailer) c_int {
-    _ = tailer.poll() catch return -1;
-    return @intFromEnum(tailer.getState());
-}
-
-// ─── Collect (blocking read) ───
-
-const Collected = extern struct {
-    msg: ?CObj,
-    sz: usize,
-    index: u64,
-};
-
-export fn chronicle_collect(tailer: *CTailer, result: *Collected) ?CObj {
-    const entry = tailer.collect() catch return null;
-    result.msg = @ptrCast(@constCast(entry.message));
-    result.sz = entry.raw_size;
-    result.index = entry.index;
-    return result.msg;
-}
-
-export fn chronicle_return(tailer: *CTailer, result: *Collected) void {
-    _ = tailer;
-    _ = result;
-    // In the Zig implementation, collected entries borrow from mmap.
-    // No explicit free is needed unless the codec allocates.
-}
-
-// ─── Debug ───
-
-export fn chronicle_debug() void {
-    // Use std.log to print queue state
-}
-
-fn setLastError(err: anyerror) void {
-    chronicle.thread_local_error_message = @errorName(err);
-}
-```
-
-### 4.2 Build Configuration
-
-The `build.zig` should produce both a static library and a shared object:
-
-```zig
-// In build.zig
-const lib = b.addSharedLibrary(.{
-    .name = "chronicle",
-    .root_source_file = b.path("src/c_api.zig"),
-    .target = target,
-    .optimize = optimize,
-});
-// Ensure C ABI symbols are exported
-lib.rdynamic = true;
-b.installArtifact(lib);
-```
-
-### 4.3 Python Binding Compatibility
-
-The existing Python bindings (`bindings/python/libchronicle.py`) use `ctypes` to load
-`libchronicle.so` and call the `chronicle_*` functions. Because the Zig C ABI layer
-exports identical symbol names with identical signatures, the Python bindings work
-**without modification**:
-
-```python
-# Existing Python code — unchanged
-from ctypes import cdll
-cx = cdll.LoadLibrary("libchronicle.so")  # Now built from Zig
-q = cx.chronicle_init(b"/var/chronicle/trades")
-cx.chronicle_set_version(q, 5)
-cx.chronicle_open(q)
-```
-
-The same applies to the kdb+ bindings in `bindings/kdb/shmipc.c` which link against
-`libchronicle.so` at the C level.
-
----
-
-## 5. The Collect API — Iterator and Blocking Patterns
-
-### 5.1 Non-Blocking Iterator (Primary Pattern)
-
-The recommended Zig pattern is the non-blocking `poll()` iterator, which integrates
-naturally with event loops:
-
-```zig
-var t = try queue.tailer(0);
-defer t.deinit();
-
-while (true) {
-    if (try t.poll()) |entry| {
-        std.log.info("index={x} message={s}", .{ entry.index, entry.message });
-    } else {
-        // No data available — do other work, sleep, etc.
-        std.time.sleep(1 * std.time.ns_per_ms);
-    }
-}
-```
-
-### 5.2 Blocking Collect (C API Compatibility)
-
-The `collect()` method provides a blocking interface matching the C `chronicle_collect`
-behavior, with internal exponential backoff:
-
-```zig
-// Blocks until an entry is available
-const entry = try t.collect();
-std.log.info("got: {s}", .{entry.message});
-```
-
-### 5.3 Bounded Iterator for Batch Processing
-
-For processing a known range or draining available entries:
-
-```zig
-/// Read up to `max_entries` currently available entries without blocking.
-pub fn pollBatch(
-    self: *Self,
-    max_entries: usize,
-    results: []Entry,
-) !usize {
-    var count: usize = 0;
-    while (count < max_entries and count < results.len) {
-        if (try self.poll()) |entry| {
-            results[count] = entry;
-            count += 1;
-        } else break;
-    }
-    return count;
-}
-```
-
-### 5.4 Why Not async/await
-
-Zig removed its built-in async/await support after 0.11. The iterator/poll pattern is
-the standard approach in modern Zig. For integration with external event loops (e.g.
-`epoll`/`io_uring`), the non-blocking `poll()` method is the correct primitive — callers
-can wrap it in their own async framework as needed.
-
----
-
-## 6. Debug Output
-
-### 6.1 Replace printf with std.log
-
-The C library uses `printf` throughout for debug output, gated by a global `debug` flag.
-The Zig reimplementation should use `std.log`, which provides:
-
-- Scoped log namespaces (e.g. `.chronicle`, `.wire`, `.tailer`)
-- Compile-time log level filtering (zero cost when disabled)
-- User-overridable log function via `pub const std_options`
-
-```zig
-const log = std.log.scoped(.chronicle);
-
-pub fn peek(self: *Self) void {
-    log.debug("peek: checking modcount, highest_cycle={d}", .{self.highest_cycle});
-    // ...
-    log.info("peek: advanced tailer to cycle={d} seqnum={d}", .{ cycle, seqnum });
-}
-```
-
-### 6.2 Wire Protocol Tracing
-
-The C library has a global `wire_trace` flag. Replace with a scoped logger:
-
-```zig
-const wire_log = std.log.scoped(.chronicle_wire);
-
-pub fn parse(base: []const u8, callbacks: *WireCallbacks) void {
-    wire_log.debug("parsing {d} bytes", .{base.len});
-    // ...
-    wire_log.debug("  event_name: {s}", .{name});
-}
-```
-
-### 6.3 Hex Dump Utility
-
-Port the C `formatbuf` / `printbuf` / `wirepad_dump` functions using `std.fmt`:
-
-```zig
-/// Format a byte slice as a hex dump, matching the C library's output format.
-/// 00000000 e5 68 65 6c 6c 6f 00 00                          .hello..
-pub fn hexDump(writer: anytype, data: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < data.len) {
-        try writer.print("{x:0>8} ", .{offset});
-        const chunk = @min(16, data.len - offset);
-        // hex bytes
-        for (0..16) |i| {
-            if (i == 8) try writer.writeByte(' ');
-            if (i < chunk) {
-                try writer.print("{x:0>2} ", .{data[offset + i]});
-            } else {
-                try writer.writeAll("   ");
-            }
-        }
-        // ASCII
-        for (0..chunk) |i| {
-            const c = data[offset + i];
-            try writer.writeByte(if (c >= 0x20 and c < 0x7f) c else '.');
-        }
-        try writer.writeByte('\n');
-        offset += 16;
-    }
-}
 ```
 
 ---
 
 ## 7. Example Usage
 
-### 7.1 Writing to a Queue
+### 7a. Writing to a queue
 
 ```zig
 const std = @import("std");
-const chronicle = @import("chronicle");
+const brz = @import("brz-queue");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Open a v5 queue with FAST_HOURLY rolling, creating if needed
-    var queue = try chronicle.Queue([]const u8).open(.{
+    var queue = try brz.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
-        .version = .v5,
-        .roll_scheme = .fast_hourly,
         .create = true,
-        .allocator = allocator,
-    }, chronicle.WireTextCodec);
+    }, brz.RawCodec);
     defer queue.deinit();
 
-    // Append some messages
-    const idx1 = try queue.append("hello from zig");
-    const idx2 = try queue.append("second message");
-    const idx3 = try queue.append("a much longer item that will need encoding as variable length text");
-
-    std.log.info("wrote 3 messages: {x}, {x}, {x}", .{ idx1, idx2, idx3 });
+    const index = try queue.append("hello world");
+    std.log.info("wrote message at index 0x{x}", .{index});
 }
 ```
 
-### 7.2 Reading from a Queue (Non-Blocking Poll)
+### 7b. Reading — non-blocking poll
 
 ```zig
 const std = @import("std");
-const chronicle = @import("chronicle");
+const brz = @import("brz-queue");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Open an existing queue (version and roll scheme auto-detected)
-    var queue = try chronicle.Queue([]const u8).open(.{
+    var queue = try brz.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
-        .allocator = allocator,
-    }, chronicle.WireTextCodec);
+    }, brz.RawCodec);
     defer queue.deinit();
 
-    std.log.info("queue version: {}", .{queue.getVersion()});
-
-    // Create a tailer starting from the beginning
     var t = try queue.tailer(0);
     defer t.deinit();
 
-    // Poll for messages in a loop
-    var count: usize = 0;
-    while (count < 100) {
+    while (true) {
         if (try t.poll()) |entry| {
-            std.log.info("[{x}] {s}", .{ entry.index, entry.message });
-            count += 1;
-        } else {
-            // No data — yield briefly, then re-check the directory listing
-            std.time.sleep(500 * std.time.ns_per_ms);
-            queue.peek();
+            std.log.info("[0x{x}] {s}", .{ entry.index, entry.message });
         }
     }
 }
 ```
 
-### 7.3 Reading from a Queue (Blocking Collect)
+### 7c. Reading — blocking with io_uring
 
 ```zig
 const std = @import("std");
-const chronicle = @import("chronicle");
+const brz = @import("brz-queue");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var queue = try chronicle.Queue([]const u8).open(.{
+    var queue = try brz.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
-        .allocator = allocator,
-    }, chronicle.WireTextCodec);
+        .enable_io_uring = true,
+    }, brz.RawCodec);
     defer queue.deinit();
 
     var t = try queue.tailer(0);
     defer t.deinit();
 
-    // Block until each entry is available
     while (true) {
-        const entry = try t.collect();
-        std.log.info("[{x}] {s} ({d} bytes)", .{
-            entry.index,
-            entry.message,
-            entry.raw_size,
-        });
+        const entry = try t.collect(); // blocks until message available
+        std.log.info("[0x{x}] {s}", .{ entry.index, entry.message });
     }
 }
 ```
 
-### 7.4 Structured Messages with Custom Codec
+### 7d. Structured messages with a custom codec
 
 ```zig
 const std = @import("std");
-const chronicle = @import("chronicle");
-const Wire = chronicle.Wire;
+const brz = @import("brz-queue");
 
 const Trade = struct {
-    symbol: []const u8,
+    symbol: [8]u8,
     price: f64,
-    quantity: u64,
+    quantity: u32,
 };
 
-const trade_codec = chronicle.Codec(Trade){
+const trade_codec = brz.Codec(Trade){
     .parse = struct {
-        fn f(data: []const u8) !Trade {
-            var r = Wire.Reader.init(data);
-            return Trade{
-                .symbol = try r.fieldText("symbol"),
-                .price = try r.fieldFloat64("price"),
-                .quantity = try r.fieldUint64("quantity"),
-            };
+        fn f(buf: []const u8) ?Trade {
+            if (buf.len < @sizeOf(Trade)) return null;
+            return std.mem.bytesToValue(Trade, buf[0..@sizeOf(Trade)]);
         }
     }.f,
     .serialized_size = struct {
-        fn f(msg: Trade) usize {
-            return Wire.sizeFieldText("symbol", msg.symbol) +
-                Wire.sizeFieldFloat64("price") +
-                Wire.sizeFieldUint64("quantity");
+        fn f(_: Trade) usize {
+            return @sizeOf(Trade);
         }
     }.f,
     .write = struct {
         fn f(buf: []u8, msg: Trade) void {
-            var w = Wire.Writer.init(buf);
-            w.fieldText("symbol", msg.symbol);
-            w.fieldFloat64("price", msg.price);
-            w.fieldUint64("quantity", msg.quantity);
+            @memcpy(buf[0..@sizeOf(Trade)], std.mem.asBytes(&msg));
         }
     }.f,
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var queue = try chronicle.Queue(Trade).open(.{
+    var queue = try brz.Queue(Trade).open(.{
         .dir = "/tmp/trades",
-        .version = .v5,
-        .roll_scheme = .fast_daily,
         .create = true,
-        .allocator = allocator,
     }, trade_codec);
     defer queue.deinit();
 
-    _ = try queue.append(.{
-        .symbol = "AAPL",
-        .price = 150.25,
+    var sym: [8]u8 = undefined;
+    @memcpy(sym[0..4], "AAPL");
+    @memset(sym[4..], 0);
+
+    const index = try queue.append(.{
+        .symbol = sym,
+        .price = 187.42,
         .quantity = 100,
     });
-
-    var t = try queue.tailer(0);
-    defer t.deinit();
-
-    const entry = try t.collect();
-    std.log.info("trade: {s} @ {d:.2} x {d}", .{
-        entry.message.symbol,
-        entry.message.price,
-        entry.message.quantity,
-    });
+    std.log.info("trade written at 0x{x}", .{index});
 }
 ```
 
-### 7.5 Resuming from a Specific Index
+### 7e. Resuming from a saved index
 
 ```zig
-// Resume reading from a known index (e.g. persisted from a previous run).
-// Index encoding: upper bits = cycle, lower bits = sequence number.
-// For v5 FAST_DAILY: 0x4A0500000003 = cycle 0x4A05 (18949), seqnum 3.
-const resume_index: u64 = 0x4A0500000003;
-var t = try queue.tailer(resume_index);
+// Persist `last_index` to a file or database between runs.
+const saved_index: brz.Index = 0x4A0500000003;
+
+var t = try queue.tailer(saved_index);
 defer t.deinit();
 
 const entry = try t.collect();
-// entry.index == 0x4A0500000003, the 4th entry in cycle 18949
+std.log.info("resumed at [0x{x}] {s}", .{ entry.index, entry.message });
 ```
 
 ---
 
-## 8. API Summary — C vs Zig
+## 8. Error Handling
 
-| C API | Zig API | Notes |
-|---|---|---|
-| `chronicle_init(dir)` | `Queue(T).open(config, codec)` | Config struct replaces multiple set calls |
-| `chronicle_set_version(q, v)` | `config.version = .v5` | Set before open via config |
-| `chronicle_set_roll_scheme(q, s)` | `config.roll_scheme = .fast_daily` | Enum instead of string |
-| `chronicle_set_encoder(q, sf, wf)` | `codec` param to `open()` | Comptime generic codec |
-| `chronicle_set_decoder(q, pf, ff)` | `codec` param to `open()` | Single codec handles both directions |
-| `chronicle_set_create(q, 1)` | `config.create = true` | Bool instead of int |
-| `chronicle_open(q)` | `Queue(T).open(config, codec)` | Combined init + open |
-| `chronicle_cleanup(q)` | `queue.deinit()` | Idiomatic Zig resource cleanup |
-| `chronicle_strerror()` | Error union (`!T`) | Errors are values, not global state |
-| `chronicle_tailer(q, cb, ctx, idx)` | `queue.tailer(idx)` | Returns iterator, no callback needed |
-| `chronicle_tailer_close(t)` | `tailer.deinit()` | — |
-| `chronicle_collect(t, &res)` | `tailer.collect()` | Returns `Entry` struct directly |
-| `chronicle_return(t, &res)` | *(not needed)* | Entries borrow from mmap |
-| `chronicle_peek()` | `queue.peek()` | Per-queue, not global |
-| `chronicle_peek_tailer(t)` | `tailer.poll()` | Returns `?Entry` |
-| `chronicle_append(q, msg)` | `queue.append(msg)` | Type-safe, no void pointer |
-| `chronicle_append_ts(q, msg, ms)` | `queue.appendWithTimestamp(msg, ms)` | — |
-| `chronicle_debug()` | `std.log` scoped logging | Compile-time filtered |
-| `chronicle_get_version(q)` | `queue.getVersion()` | Returns `Version` enum |
-| `chronicle_get_cycle_fn(q, c)` | `queue.getCyclePath(cycle)` | Returns slice, caller frees |
+brz-queue uses Zig error unions throughout.  Every fallible function returns
+`!T` so errors propagate naturally with `try`.
+
+### 8.1 Error set
+
+```zig
+pub const QueueError = error{
+    /// The queue directory does not exist and `create` was not set.
+    DirectoryNotFound,
+    /// metadata.brz is missing or corrupt.
+    MetadataCorrupt,
+    /// On-disk version is not supported by this build.
+    UnsupportedVersion,
+    /// mmap failed (e.g. address space exhaustion).
+    MmapFailed,
+    /// A cycle file could not be extended to the required size.
+    ExtendFailed,
+    /// stat() on a cycle file failed unexpectedly.
+    StatFailed,
+    /// The codec's parse function returned null (corrupt or truncated message).
+    ParseFailed,
+    /// io_uring setup failed (kernel too old, resource limit).
+    IoUringInitFailed,
+    /// Attempted to write when another writer is active (detected via header flag).
+    WriterConflict,
+    /// The requested index is beyond the end of the queue.
+    IndexOutOfRange,
+};
+```
+
+### 8.2 Example: handling errors explicitly
+
+```zig
+const queue = brz.Queue([]const u8).open(.{
+    .dir = "/tmp/my-queue",
+}, brz.RawCodec) catch |err| switch (err) {
+    error.DirectoryNotFound => {
+        std.log.err("queue directory does not exist", .{});
+        return err;
+    },
+    error.MetadataCorrupt => {
+        std.log.err("metadata.brz is corrupt — delete and recreate", .{});
+        return err;
+    },
+    else => return err,
+};
+```
 
 ---
 
-## 9. Design Decisions and Rationale
+## 9. Debug Output
 
-### 9.1 Why Comptime Generics Over Runtime Dispatch
+brz-queue uses `std.log.scoped` for all diagnostic output.  No `printf`,
+no global debug flags.
 
-The C library uses function pointers for serialization (`csizeof_f`, `cappend_f`,
-`cparse_f`). This is runtime dispatch with `void*` — no type safety, easy to mismatch.
+### 9.1 Scoped logger
 
-Zig's `Queue(comptime MessageType)` approach:
-- **Zero-cost**: codec functions are known at compile time and inlined
-- **Type-safe**: impossible to pass a `Trade` to a `Queue([]const u8)`
-- **Self-documenting**: the queue's message type is part of its type signature
-- **Testable**: each `Queue(T)` instantiation is independently testable
+```zig
+const log = std.log.scoped(.brz_queue);
 
-The tradeoff is that each message type creates a separate compiled Queue. This is
-acceptable because in practice each process uses one or two message types.
+pub fn open(config: QueueConfig, codec: anytype) !Self {
+    log.info("opening queue dir={s} version={}", .{ config.dir, @intFromEnum(config.version) });
+    // ...
+}
+```
 
-### 9.2 Memory Ownership Model
+### 9.2 Hex dump utility
 
-The C library has confusing ownership: `cparse_f` allocates, `cparsefree_f` frees,
-and the user must call `chronicle_return()` after `chronicle_collect()`. Missing a
-`chronicle_return` call leaks memory.
+For low-level debugging, a simple hex dump replaces the old wire-tracing
+infrastructure:
 
-The Zig design avoids this:
-- `poll()` returns an `Entry` whose `.message` borrows from the mmap region
-- The borrow is valid until the next `poll()` or `deinit()` call
-- If the codec needs to allocate (deep copy), it uses an arena owned by the tailer
-- The arena is reset on each `poll()`, so no manual free is needed
+```zig
+pub fn hexDump(writer: anytype, label: []const u8, data: []const u8) !void {
+    try writer.print("── {s} ({d} bytes) ──\n", .{ label, data.len });
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const end = @min(offset + 16, data.len);
+        try writer.print("{x:0>8}  ", .{offset});
+        for (data[offset..end]) |b| {
+            try writer.print("{x:0>2} ", .{b});
+        }
+        // padding for short lines
+        for (0..(16 - (end - offset))) |_| {
+            try writer.print("   ", .{});
+        }
+        try writer.print(" |", .{});
+        for (data[offset..end]) |b| {
+            const c: u8 = if (b >= 0x20 and b < 0x7f) b else '.';
+            try writer.print("{c}", .{c});
+        }
+        try writer.print("|\n", .{});
+        offset = end;
+    }
+}
+```
 
-### 9.3 Global State Elimination
+Users can enable or suppress brz-queue log messages at build time using the
+standard Zig log level mechanism:
 
-The C library uses global state:
-- `cerr_msg` — global error string
-- `chronicle_peek()` — iterates a global linked list of all queues
+```zig
+pub const std_options = .{
+    .log_scope_levels = &.{
+        .{ .scope = .brz_queue, .level = .debug },
+    },
+};
+```
 
-The Zig API eliminates all global state:
-- Errors are returned as error unions per-call
-- `peek()` is a method on `Queue`, not a global function
-- The C ABI layer uses `threadlocal` for the error string (for Python compat)
+---
+
+## 10. Design Decisions
+
+### 10.1 Why comptime generics
+
+| Alternative | Downside |
+|---|---|
+| Runtime function pointers (vtable) | Indirect call on every append/poll; cannot inline codec logic |
+| `anytype` without named codec struct | Harder to document, no clear contract |
+| `*anyopaque` + cast | Loses type safety entirely |
+
+With `Queue(comptime MessageType)`, the compiler monomorphises the entire
+read/write path.  The codec's `parse`, `serialized_size`, and `write`
+functions are inlined directly into `append` and `poll`, eliminating all
+function-pointer overhead and enabling the optimiser to reason about the full
+call chain.
+
+### 10.2 Why no C ABI
+
+brz-queue is a **pure Zig** library.  Exposing a C ABI adds constraints
+(stable struct layout, manual memory management, global error state) that
+conflict with idiomatic Zig design.  If C/Python/kdb interop is needed in
+the future, a thin wrapper crate can be written on top without polluting the
+core API.
+
+### 10.3 Memory ownership model
+
+| Resource | Owner | Lifetime |
+|---|---|---|
+| Queue directory metadata | `Queue` instance | `open` → `deinit` |
+| mmap'd cycle files | `Queue` instance | Mapped on demand, unmapped at `deinit` |
+| `Tailer` cursors | Caller | Created via `queue.tailer()`, caller calls `deinit` |
+| `Entry.message` | Borrows from mmap | Valid until next `poll`/`collect` on the same tailer |
+
+The hot path (append and poll) never touches the allocator.  All data flows
+through the mmap'd region.  The allocator is only used during `open` (to
+allocate internal bookkeeping) and `deinit` (to free it).
+
+### 10.4 No global state
+
+Every `Queue` instance is fully self-contained.  There is no process-wide
+registry, no singleton, no thread-local storage.  Multiple independent queues
+can coexist in the same process without interference.
+
+### 10.5 Acquire/release ordering
+
+The writer publishes each message by storing the new sequence number with
+`@atomicStore(.release)`.  Readers observe it with `@atomicLoad(.acquire)`.
+This is the minimum ordering that guarantees the message body is visible before
+the reader sees the updated sequence number, and it avoids the cost of
+sequential consistency (`seq_cst`) fences on x86 and ARM.
+
+---
+
+## 11. Summary
+
+| Aspect | brz-queue approach |
+|---|---|
+| Language | Pure Zig, no C ABI |
+| Generics | `Queue(comptime MessageType)` — comptime monomorphisation |
+| Codec | User-supplied `Codec(T)` struct; built-in `RawCodec`, `TextCodec` |
+| Writer | Single-threaded `append` / `appendWithTimestamp` |
+| Reader | `Tailer.poll` (non-blocking) or `Tailer.collect` (io_uring blocking) |
+| File format | `.brz` cycle files, `metadata.brz` |
+| Error handling | Zig error unions (`!T`) |
+| Allocations | Zero on hot path; allocator used only during open/close |
+| Logging | `std.log.scoped(.brz_queue)` |
+| Atomics | Acquire/release ordering for writer↔reader synchronisation |
+| Global state | None |

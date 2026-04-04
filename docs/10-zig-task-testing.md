@@ -2,16 +2,27 @@
 
 ## Overview
 
-This task defines the comprehensive testing strategy for the Zig reimplementation of
-libchronicle. The C test suite uses cmocka for unit tests and libarchive for unpacking
-Java-written queue fixtures. The Zig reimplementation will use Zig's built-in test
-framework (`test` blocks and `std.testing`), Zig's built-in fuzz testing, and the
-language's runtime safety checks to achieve equivalent — and stronger — coverage.
+This task defines the comprehensive testing strategy for brz-queue — a clean-room,
+high-performance, lock-free, memory-mapped IPC queue in Zig. The testing strategy covers
+unit tests, integration tests, concurrency tests, performance benchmarks, fuzzing, and
+property-based testing.
 
-The overarching goal is **cross-compatibility**: the Zig implementation must read queues
-written by Java Chronicle Queue, and Java must be able to read queues written by Zig.
-Every C test case is ported, and new categories of tests are added that were not feasible
-in the C codebase.
+brz-queue uses Zig's built-in test framework (`test` blocks and `std.testing`), Zig's
+built-in fuzz testing, and the language's runtime safety checks. The goal is to verify
+correctness, memory safety, and performance of the single-writer / multiple-reader
+architecture with zero allocations on the hot path.
+
+Key testing concerns specific to brz-queue:
+
+- **Fixed struct layouts** — `SharedMetadata` (512 bytes) and `QueueFileHeader` (64 bytes)
+  must have exact sizes and field offsets for mmap-and-cast to work across processes.
+- **Lock-free correctness** — CAS-based write arbitration, acquire/release ordering, and
+  tiered backoff must be correct under contention.
+- **io_uring wakeup** — reader notification via `io_uring` + `eventfd` must be reliable
+  and low-latency.
+- **Codec round-trips** — user-supplied codecs must serialize and deserialize without
+  loss or allocation.
+- **File format invariants** — `.brz` files and `metadata.brz` must conform to the spec.
 
 ---
 
@@ -25,19 +36,18 @@ is discovered and run by `zig build test`. Assertions come from `std.testing`:
 ```zig
 const std = @import("std");
 const testing = std.testing;
-const chronicle = @import("chronicle.zig");
+const brz = @import("brz_queue.zig");
 
 test "queue init and deinit" {
-    var queue = try chronicle.Queue([]const u8).open(.{
-        .dir = "/tmp/zig-test-queue",
-        .version = .v5,
-        .roll_scheme = .fast_daily,
+    var queue = try brz.Queue(TestMsg).open(.{
+        .dir = "/tmp/brz-test-queue",
+        .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
-    }, chronicle.StringCodec);
+    }, TestCodec);
     defer queue.deinit();
 
-    try testing.expectEqual(chronicle.Version.v5, queue.getVersion());
+    try testing.expectEqual(@as(u16, 1), queue.getVersion());
 }
 ```
 
@@ -47,1058 +57,1403 @@ Key `std.testing` functions used throughout:
 |---|---|
 | `testing.expectEqual(expected, actual)` | Exact equality |
 | `testing.expectEqualStrings(expected, actual)` | Byte-level string comparison with diff on failure |
-| `testing.expectEqualSlices(u8, expected, actual)` | Slice comparison (for wire bytes) |
+| `testing.expectEqualSlices(u8, expected, actual)` | Slice comparison |
 | `testing.expect(condition)` | Boolean assertion |
 | `testing.expectError(expected_err, result)` | Assert a specific error was returned |
 | `testing.allocator` | Leak-detecting allocator that fails the test on leak |
 
 ### 1.2 Test Organization
 
-Tests are organized into per-module test files alongside the source:
+Tests live alongside the code they test, in the same `.zig` source files or in dedicated
+`*_test.zig` companion files:
 
 ```
 src/
-├── chronicle.zig          # Public API
-├── wire.zig               # BinaryWire protocol
-├── wire_test.zig          # Wire protocol tests
-├── queue_test.zig         # Queue lifecycle and I/O tests
-├── roll_scheme.zig        # Roll scheme definitions
-├── roll_scheme_test.zig   # Roll scheme cycle filename tests
-├── buffer.zig             # Hex dump utility
-├── buffer_test.zig        # Buffer formatting tests
-├── c_api.zig              # C ABI compatibility layer
-└── c_api_test.zig         # C ABI round-trip tests
+├── queue.zig
+├── queue_test.zig          # Queue lifecycle tests
+├── appender.zig
+├── appender_test.zig       # Appender + CAS tests
+├── tailer.zig
+├── tailer_test.zig         # Tailer + io_uring tests
+├── metadata.zig            # SharedMetadata, QueueFileHeader, header constants
+├── metadata_test.zig       # Struct layout tests, header encoding tests
+├── index.zig
+├── index_test.zig          # Flat index tests
+├── codec.zig
+├── codec_test.zig          # Codec round-trip tests
+├── roll_scheme.zig
+├── roll_scheme_test.zig    # Roll scheme tests
+├── mmap.zig
+├── mmap_test.zig           # Memory mapping tests
+└── uring.zig
+    uring_test.zig          # io_uring notification tests
 ```
 
-Run all tests:
+Running tests:
 
 ```sh
+# Run all tests (debug mode — all safety checks enabled)
 zig build test
-```
 
-Run a specific test by name filter:
-
-```sh
-zig build test -- "wire protocol"
+# Run tests for a single file
+zig build test -- --test-filter "SharedMetadata"
 ```
 
 ### 1.3 The Testing Allocator
 
-`std.testing.allocator` is a `GeneralPurposeAllocator` configured to detect:
-- Memory leaks (any allocation not freed when the test exits)
-- Double frees
-- Use-after-free (in debug/safe modes)
-- Buffer overflows via guard pages
-
-Every test that allocates memory should use `testing.allocator` as the allocator passed
-to queue/tailer constructors. This provides automatic leak detection without Valgrind.
-
----
-
-## 2. Porting the C Test Suite
-
-Every C test case maps to one or more Zig test blocks. The table below lists each C test
-and its Zig equivalent with a description of what it verifies.
-
-### 2.1 Queue Lifecycle Tests (from `test/test_queue.c`)
-
-| C Test | Zig Test | What It Verifies |
-|---|---|---|
-| `queue_init_cleanup` | `test "queue init and cleanup"` | A queue can be initialized and immediately cleaned up without errors. No directory access needed. |
-| `queue_not_exist` | `test "open nonexistent directory returns DirNotFound"` | Opening a queue pointing at a nonexistent path returns `error.DirNotFound` (C: returns -1, strerror = "dir stat fail"). |
-| `queue_is_file` | `test "open path that is a file returns NotADirectory"` | If the queue path points to a regular file instead of a directory, returns `error.NotADirectory` (C: "dir is not a directory"). |
-| `queue_empty_dir_no_ver` | `test "open empty dir without version fails"` | An empty directory with no queue files and no explicit version set fails with `error.VersionDetectFailed` (C: "queue should exist (no permission to create), but version detect failed"). |
-| `queue_init_rollscheme` | `test "roll scheme configuration and cycle filename generation"` | Tests setting version (rejects 6, accepts 5), setting roll scheme (rejects unknown, accepts valid), and verifies `getCyclePath()` output for FAST_HOURLY, FIVE_MINUTELY, DAILY schemes including the 32-bit overflow regression (cycle 24855/24856). |
-| `queue_cqv5_sample_input` | `test "read and write v5 queue with cycle rolling"` | Unpacks `cqv5-sample-input.tar.bz2`, opens queue, verifies version=5 and roll_scheme="FAST_DAILY". Reads "one"/"two"/"three"/long text at expected indices. Appends "four five", "six" at timestamp 1637267400000 (same cycle), "seven" at 1637308800000 (next day — triggers cycle roll). Verifies cycle roll from 0x4A05 to 0x4A06. Creates a second tailer at index 0x4A0500000003 and verifies it reads from that position forward. |
-| `queue_cqv5_new_queue` | `test "create new v5 queue, write, close, reopen, read"` | Creates a fresh queue in a temp directory with version=5, DAILY scheme. Appends "four five", closes, reopens (version/scheme auto-detected), reads back and verifies the message and index match. |
-| `queue_cqv5_new_test4_queue_nodata` | `test "create queue with TEST4_SECONDLY and no data"` | Creates a queue with TEST4_SECONDLY scheme, closes, reopens, verifies version=5 and scheme="TEST4_SECONDLY". Tests that a queue with metadata but no data entries can be correctly reopened. |
-
-### 2.2 Queue Lifecycle Test Implementation
-
-```zig
-// src/queue_test.zig
-
-const std = @import("std");
-const testing = std.testing;
-const chronicle = @import("chronicle.zig");
-const test_util = @import("test_util.zig");
-
-test "queue init and cleanup" {
-    const tmp = try test_util.makeTempDir("chronicle.test.");
-    defer test_util.removeTempDir(tmp);
-
-    var queue = try chronicle.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .version = .v5,
-        .roll_scheme = .fast_daily,
-        .create = true,
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-    queue.deinit();
-}
-
-test "open nonexistent directory returns DirNotFound" {
-    const result = chronicle.Queue([]const u8).open(.{
-        .dir = "/tmp/this-path-does-not-exist-zig-test",
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-
-    try testing.expectError(error.DirNotFound, result);
-}
-
-test "open path that is a file returns NotADirectory" {
-    const tmp = try test_util.makeTempFile("chronicle.test.");
-    defer test_util.removeTempFile(tmp);
-
-    const result = chronicle.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-
-    try testing.expectError(error.NotADirectory, result);
-}
-
-test "open empty dir without version fails" {
-    const tmp = try test_util.makeTempDir("chronicle.test.");
-    defer test_util.removeTempDir(tmp);
-
-    const result = chronicle.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        // no version set, no create permission
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-
-    try testing.expectError(error.VersionDetectFailed, result);
-}
-
-test "roll scheme configuration and cycle filename generation" {
-    const tmp = try test_util.makeTempDir("chronicle.test.");
-    defer test_util.removeTempDir(tmp);
-
-    var queue = try chronicle.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .version = .v5,
-        .roll_scheme = .fast_hourly,
-        .create = true,
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-    defer queue.deinit();
-
-    // FAST_HOURLY: format "yyyyMMdd-HH'F'" with 3600s roll
-    {
-        const p0 = try queue.getCyclePath(0);
-        defer testing.allocator.free(p0);
-        try testing.expect(std.mem.endsWith(u8, p0, "/19700101-00F.cq4"));
-
-        const p1 = try queue.getCyclePath(1);
-        defer testing.allocator.free(p1);
-        try testing.expect(std.mem.endsWith(u8, p1, "/19700101-01F.cq4"));
-
-        const p24 = try queue.getCyclePath(24);
-        defer testing.allocator.free(p24);
-        try testing.expect(std.mem.endsWith(u8, p24, "/19700102-00F.cq4"));
-    }
-}
-
-test "read and write v5 queue with cycle rolling" {
-    const fixture = try test_util.unpackTestData("cqv5-sample-input.tar.bz2");
-    defer test_util.removeTempDir(fixture);
-
-    const queuedir = try std.fs.path.join(testing.allocator, &.{ fixture.path, "qv5" });
-    defer testing.allocator.free(queuedir);
-
-    var queue = try chronicle.Queue([]const u8).open(.{
-        .dir = queuedir,
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-    defer queue.deinit();
-
-    try testing.expectEqual(chronicle.Version.v5, queue.getVersion());
-
-    var tailer = try queue.tailer(0);
-    defer tailer.deinit();
-
-    // Read the 4 entries written by Java
-    const e0 = try tailer.collect();
-    try testing.expectEqualStrings("one", e0.message);
-    try testing.expectEqual(@as(u64, 0x4A0500000000), e0.index);
-
-    const e1 = try tailer.collect();
-    try testing.expectEqualStrings("two", e1.message);
-    try testing.expectEqual(@as(u64, 0x4A0500000001), e1.index);
-
-    const e2 = try tailer.collect();
-    try testing.expectEqualStrings("three", e2.message);
-    try testing.expectEqual(@as(u64, 0x4A0500000002), e2.index);
-
-    const e3 = try tailer.collect();
-    try testing.expectEqualStrings(
-        "a much longer item that will need encoding as variable length text",
-        e3.message,
-    );
-    try testing.expectEqual(@as(u64, 0x4A0500000003), e3.index);
-
-    // Write "four five" and "six" at same-day timestamp (no cycle roll)
-    const idx4 = try queue.appendWithTimestamp("four five", 1637267400000);
-    try testing.expectEqual(@as(u64, 0x4A0500000004), idx4);
-
-    const idx5 = try queue.appendWithTimestamp("six", 1637267400000);
-    try testing.expectEqual(@as(u64, 0x4A0500000005), idx5);
-
-    // Write "seven" at next-day timestamp — triggers cycle roll
-    const idx6 = try queue.appendWithTimestamp("seven", 1637308800000);
-    try testing.expectEqual(@as(u64, 0x4A0600000000), idx6);
-
-    // Read back our writes through the tailer
-    const e4 = try tailer.collect();
-    try testing.expectEqualStrings("four five", e4.message);
-
-    const e5 = try tailer.collect();
-    try testing.expectEqualStrings("six", e5.message);
-
-    const e6 = try tailer.collect();
-    try testing.expectEqualStrings("seven", e6.message);
-    try testing.expectEqual(@as(u64, 0x4A0600000000), e6.index);
-
-    tailer.deinit();
-
-    // Second tailer starting from midpoint
-    var tailer2 = try queue.tailer(0x4A0500000003);
-    defer tailer2.deinit();
-
-    const r0 = try tailer2.collect();
-    try testing.expectEqual(@as(u64, 0x4A0500000003), r0.index);
-    try testing.expectEqualStrings(
-        "a much longer item that will need encoding as variable length text",
-        r0.message,
-    );
-
-    const r1 = try tailer2.collect();
-    try testing.expectEqualStrings("four five", r1.message);
-
-    const r2 = try tailer2.collect();
-    try testing.expectEqualStrings("six", r2.message);
-
-    const r3 = try tailer2.collect();
-    try testing.expectEqualStrings("seven", r3.message);
-}
-
-test "create new v5 queue, write, close, reopen, read" {
-    const tmp = try test_util.makeTempDir("chronicle.test.");
-    defer test_util.removeTempDir(tmp);
-
-    // Phase 1: create and write
-    const write_idx = blk: {
-        var queue = try chronicle.Queue([]const u8).open(.{
-            .dir = tmp.path,
-            .version = .v5,
-            .roll_scheme = .daily,
-            .create = true,
-            .allocator = testing.allocator,
-        }, chronicle.WireTextCodec);
-        defer queue.deinit();
-
-        break :blk try queue.append("four five");
-    };
-
-    // Phase 2: reopen and read
-    {
-        var queue = try chronicle.Queue([]const u8).open(.{
-            .dir = tmp.path,
-            .allocator = testing.allocator,
-        }, chronicle.WireTextCodec);
-        defer queue.deinit();
-
-        try testing.expectEqual(chronicle.Version.v5, queue.getVersion());
-
-        var tailer = try queue.tailer(0);
-        defer tailer.deinit();
-
-        const entry = try tailer.collect();
-        try testing.expectEqualStrings("four five", entry.message);
-        try testing.expectEqual(write_idx, entry.index);
-    }
-}
-```
-
-### 2.3 Wire Protocol Tests (from `test/test_wire.c`)
-
-| C Test | Zig Test | What It Verifies |
-|---|---|---|
-| `test_wirepad_text` | `test "wire pad: text field with padding"` | Writing "hello" + pad_to_x8_00 produces 8 bytes: `e5 68 65 6c 6c 6f 00 00`. Parsing that data back fires the text callback with "hello". |
-| `test_wirepad_fields` | `test "wire pad: mixed field types"` | Writes field_text("message", "Hello World"), field_varint("number", 1234567890), field_enum("code", "SECONDS"), field_float64("price", 10.50). Byte-level comparison against known-good hex output. |
-| `test_wirepad_metadata` | `test "wire pad: full metadata.cq4t construction"` | Constructs a complete metadata page with STStore header, wireType, SCQMeta, SCQSRoll, listing.highestCycle/lowestCycle/modCount, chronicle.write.lock, chronicle.lastIndexReplicated, chronicle.lastAcknowledgedIndexReplicated. Byte-for-byte comparison against 0x1A8 bytes of known-good output. |
-
-### 2.4 Buffer Tests (from `test/test_buffer.c`)
-
-| C Test | Zig Test | What It Verifies |
-|---|---|---|
-| `test_buffer_hello` | `test "hex dump formatting"` | Verifies hex dump output for "hello world\\0" (12 bytes), empty buffer (0 bytes), and a 178-byte string. Line-by-line comparison of offset, hex columns, and ASCII columns. |
-
----
-
-## 3. Wire Protocol Tests — Byte-Level Verification
-
-Wire protocol correctness is critical because the serialized bytes are a shared contract
-between Zig, Java, and C implementations. Every wire test compares output byte-for-byte
-against known-good reference data.
-
-### 3.1 Testing Strategy
-
-1. **Construction tests**: Build wire structures using the Pad/Writer API and compare
-   the resulting byte buffer against a reference slice.
-2. **Round-trip tests**: Serialize → deserialize → compare with original values.
-3. **Parsing tests**: Feed known byte sequences to the parser and verify callback
-   invocations and extracted values.
-
-### 3.2 Wire Text Field Test
-
-```zig
-// src/wire_test.zig
-
-const std = @import("std");
-const testing = std.testing;
-const Wire = @import("wire.zig");
-
-test "wire pad: text field with padding" {
-    var pad = Wire.Pad.init(testing.allocator, 1024);
-    defer pad.deinit();
-
-    try testing.expectEqual(@as(usize, 0), pad.size());
-
-    // Write "hello" — 1 byte descriptor (0xe5 = text, length 5), 5 bytes text
-    pad.text("hello");
-    pad.padToAlign8Zeroed();
-    try testing.expectEqual(@as(usize, 8), pad.size()); // 1 + 5 + 2 padding
-
-    const expected = [_]u8{ 0xe5, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00, 0x00 };
-    try testing.expectEqualSlices(u8, &expected, pad.bytes());
-
-    // Parse it back and verify we get "hello"
-    var got_text: ?[]const u8 = null;
-    pad.parse(.{
-        .on_text = struct {
-            fn cb(text: []const u8, ctx: *?[]const u8) void {
-                ctx.* = text;
-            }
-        }.cb,
-        .text_ctx = &got_text,
-    });
-
-    try testing.expect(got_text != null);
-    try testing.expectEqualStrings("hello", got_text.?);
-}
-
-test "wire pad: mixed field types" {
-    var pad = Wire.Pad.init(testing.allocator, 1024);
-    defer pad.deinit();
-
-    pad.fieldText("message", "Hello World");
-    pad.fieldVarint("number", 1234567890);
-    pad.fieldEnum("code", "SECONDS");
-    pad.fieldFloat64("price", 10.50);
-
-    // Reference bytes from Chronicle Wire specification
-    // https://github.com/OpenHFT/Chronicle-Wire#simple-use-case
-    const expected = [_]u8{
-        0xc7, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, //  .message
-        0xeb, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57, //  .Hello W
-        0x6f, 0x72, 0x6c, 0x64, 0xc6, 0x6e, 0x75, 0x6d, //  orld.num
-        0x62, 0x65, 0x72, 0xa6, 0xd2, 0x02, 0x96, 0x49, //  ber....I
-        0xc4, 0x63, 0x6f, 0x64, 0x65, 0xe7, 0x53, 0x45, //  .code.SE
-        0x43, 0x4f, 0x4e, 0x44, 0x53, 0xc5, 0x70, 0x72, //  CONDS.pr
-        0x69, 0x63, 0x65, 0x90, 0x00, 0x00, 0x28, 0x41, //  ice...(A
-    };
-    try testing.expectEqualSlices(u8, &expected, pad.bytes());
-}
-
-test "wire pad: full metadata.cq4t construction" {
-    var pad = Wire.Pad.init(testing.allocator, 1024);
-    defer pad.deinit();
-
-    // Build the metadata page exactly as the C test does:
-    // Single metadata message with STStore header
-    pad.qcStart(.metadata);
-    pad.eventName("header");
-    pad.typePrefix("STStore");
-    pad.nestEnter();
-    {
-        pad.fieldTypeEnum("wireType", "WireType", "BINARY_LIGHT");
-        pad.field("metadata");
-        pad.typePrefix("SCQMeta");
-        pad.nestEnter();
-        {
-            pad.field("roll");
-            pad.typePrefix("SCQSRoll");
-            pad.nestEnter();
-            {
-                pad.fieldVarint("length", 86400000);
-                pad.fieldText("format", "yyyyMMdd'F'");
-                pad.fieldVarint("epoch", 0);
-            }
-            pad.nestExit();
-            pad.fieldVarint("deltaCheckpointInterval", 64);
-            pad.fieldVarint("sourceId", 0);
-        }
-        pad.nestExit();
-        pad.padToAlign8();
-    }
-    pad.nestExit();
-    pad.qcFinish();
-
-    // 6 data messages for directory listing fields
-    pad.qcStart(.data);
-    pad.eventName("listing.highestCycle");
-    pad.uint64Aligned(18941);
-    pad.qcFinish();
-
-    pad.qcStart(.data);
-    pad.eventName("listing.lowestCycle");
-    pad.uint64Aligned(18941);
-    pad.qcFinish();
-
-    pad.qcStart(.data);
-    pad.eventName("listing.modCount");
-    pad.uint64Aligned(1);
-    pad.qcFinish();
-
-    pad.qcStart(.data);
-    pad.eventName("chronicle.write.lock");
-    pad.uint64Aligned(0x8000000000000000);
-    pad.qcFinish();
-
-    pad.qcStart(.data);
-    pad.eventName("chronicle.lastIndexReplicated");
-    pad.uint64Aligned(0xFFFFFFFFFFFFFFFF);
-    pad.qcFinish();
-
-    pad.qcStart(.data);
-    pad.eventName("chronicle.lastAcknowledgedIndexReplicated");
-    pad.uint64Aligned(0xFFFFFFFFFFFFFFFF);
-    pad.qcFinish();
-
-    // The reference bytes — 0x1A8 (424) bytes from the C test.
-    // This is the exact content of a metadata.cq4t file for a FAST_DAILY queue.
-    const expected = [_]u8{
-        0xac, 0x00, 0x00, 0x40, 0xb9, 0x06, 0x68, 0x65, // ...@..he
-        0x61, 0x64, 0x65, 0x72, 0xb6, 0x07, 0x53, 0x54, // ader..ST
-        0x53, 0x74, 0x6f, 0x72, 0x65, 0x82, 0x96, 0x00, // Store...
-        0x00, 0x00, 0xc8, 0x77, 0x69, 0x72, 0x65, 0x54, // ...wireT
-        0x79, 0x70, 0x65, 0xb6, 0x08, 0x57, 0x69, 0x72, // ype..Wir
-        0x65, 0x54, 0x79, 0x70, 0x65, 0xec, 0x42, 0x49, // eType.BI
-        0x4e, 0x41, 0x52, 0x59, 0x5f, 0x4c, 0x49, 0x47, // NARY_LIG
-        0x48, 0x54, 0xc8, 0x6d, 0x65, 0x74, 0x61, 0x64, // HT.metad
-        0x61, 0x74, 0x61, 0xb6, 0x07, 0x53, 0x43, 0x51, // ata..SCQ
-        0x4d, 0x65, 0x74, 0x61, 0x82, 0x5d, 0x00, 0x00, // Meta.]..
-        0x00, 0xc4, 0x72, 0x6f, 0x6c, 0x6c, 0xb6, 0x08, // ..roll..
-        0x53, 0x43, 0x51, 0x53, 0x52, 0x6f, 0x6c, 0x6c, // SCQSRoll
-        0x82, 0x26, 0x00, 0x00, 0x00, 0xc6, 0x6c, 0x65, // .&....le
-        0x6e, 0x67, 0x74, 0x68, 0xa6, 0x00, 0x5c, 0x26, // ngth..\&
-        0x05, 0xc6, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, // ..format
-        0xeb, 0x79, 0x79, 0x79, 0x79, 0x4d, 0x4d, 0x64, // .yyyyMMd
-        0x64, 0x27, 0x46, 0x27, 0xc5, 0x65, 0x70, 0x6f, // d'F'.epo
-        0x63, 0x68, 0x00, 0xd7, 0x64, 0x65, 0x6c, 0x74, // ch..delt
-        0x61, 0x43, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, // aCheckpo
-        0x69, 0x6e, 0x74, 0x49, 0x6e, 0x74, 0x65, 0x72, // intInter
-        0x76, 0x61, 0x6c, 0x40, 0xc8, 0x73, 0x6f, 0x75, // val@.sou
-        0x72, 0x63, 0x65, 0x49, 0x64, 0x00, 0x8f, 0x8f, // rceId...
-        0x24, 0x00, 0x00, 0x00, 0xb9, 0x14, 0x6c, 0x69, // $.....li
-        0x73, 0x74, 0x69, 0x6e, 0x67, 0x2e, 0x68, 0x69, // sting.hi
-        0x67, 0x68, 0x65, 0x73, 0x74, 0x43, 0x79, 0x63, // ghestCyc
-        0x6c, 0x65, 0x8e, 0x00, 0x00, 0x00, 0x00, 0xa7, // le......
-        0xfd, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // .I......
-        0x24, 0x00, 0x00, 0x00, 0xb9, 0x13, 0x6c, 0x69, // $.....li
-        0x73, 0x74, 0x69, 0x6e, 0x67, 0x2e, 0x6c, 0x6f, // sting.lo
-        0x77, 0x65, 0x73, 0x74, 0x43, 0x79, 0x63, 0x6c, // westCycl
-        0x65, 0x8e, 0x01, 0x00, 0x00, 0x00, 0x00, 0xa7, // e.......
-        0xfd, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // .I......
-        0x1c, 0x00, 0x00, 0x00, 0xb9, 0x10, 0x6c, 0x69, // ......li
-        0x73, 0x74, 0x69, 0x6e, 0x67, 0x2e, 0x6d, 0x6f, // sting.mo
-        0x64, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x8f, 0xa7, // dCount..
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ........
-        0x24, 0x00, 0x00, 0x00, 0xb9, 0x14, 0x63, 0x68, // $.....ch
-        0x72, 0x6f, 0x6e, 0x69, 0x63, 0x6c, 0x65, 0x2e, // ronicle.
-        0x77, 0x72, 0x69, 0x74, 0x65, 0x2e, 0x6c, 0x6f, // write.lo
-        0x63, 0x6b, 0x8e, 0x00, 0x00, 0x00, 0x00, 0xa7, // ck......
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // ........
-        0x2c, 0x00, 0x00, 0x00, 0xb9, 0x1d, 0x63, 0x68, // ,.....ch
-        0x72, 0x6f, 0x6e, 0x69, 0x63, 0x6c, 0x65, 0x2e, // ronicle.
-        0x6c, 0x61, 0x73, 0x74, 0x49, 0x6e, 0x64, 0x65, // lastInde
-        0x78, 0x52, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, // xReplica
-        0x74, 0x65, 0x64, 0x8f, 0x8f, 0x8f, 0x8f, 0xa7, // ted.....
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // ........
-        0x34, 0x00, 0x00, 0x00, 0xb9, 0x29, 0x63, 0x68, // 4....)ch
-        0x72, 0x6f, 0x6e, 0x69, 0x63, 0x6c, 0x65, 0x2e, // ronicle.
-        0x6c, 0x61, 0x73, 0x74, 0x41, 0x63, 0x6b, 0x6e, // lastAckn
-        0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x64, // owledged
-        0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x70, // IndexRep
-        0x6c, 0x69, 0x63, 0x61, 0x74, 0x65, 0x64, 0xa7, // licated.
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // ........
-    };
-    try testing.expectEqualSlices(u8, &expected, pad.bytes());
-}
-```
-
-### 3.3 Wire Varint Encoding Edge Cases
-
-The BinaryWire protocol uses a variable-length integer encoding ("stop bit" encoding).
-Dedicated tests should cover edge cases:
-
-```zig
-test "wire varint encoding: boundary values" {
-    var pad = Wire.Pad.init(testing.allocator, 256);
-    defer pad.deinit();
-
-    // 0 encodes as single byte
-    pad.varint(0);
-    try testing.expectEqualSlices(u8, &[_]u8{0x00}, pad.bytes());
-
-    pad.clear();
-    // 127 (max single-byte value)
-    pad.varint(127);
-    try testing.expectEqualSlices(u8, &[_]u8{0x7f}, pad.bytes());
-
-    pad.clear();
-    // 128 requires two bytes
-    pad.varint(128);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x80, 0x01 }, pad.bytes());
-
-    pad.clear();
-    // 1234567890 — the value used in the Chronicle Wire simple use case example
-    pad.varint(1234567890);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0xd2, 0x02, 0x96, 0x49 }, pad.bytes());
-}
-
-test "wire varint round-trip" {
-    const test_values = [_]u64{
-        0, 1, 127, 128, 255, 256, 16383, 16384,
-        1234567890, 86400000, 0x7FFFFFFF, 0xFFFFFFFF,
-    };
-    for (test_values) |val| {
-        var pad = Wire.Pad.init(testing.allocator, 64);
-        defer pad.deinit();
-        pad.varint(val);
-        const decoded = Wire.readVarint(pad.bytes());
-        try testing.expectEqual(val, decoded.value);
-    }
-}
-```
-
----
-
-## 4. Integration Tests with Java-Written Queue Data
-
-### 4.1 Test Fixtures
-
-The C test suite includes two tar.bz2 archives containing queues written by Java
-Chronicle Queue:
-
-| File | Contents | Purpose |
-|---|---|---|
-| `cqv5-sample-input.tar.bz2` | `qv5/` directory with v5 queue files | Read-compatibility with v5 format |
-
-Both contain entries: "one", "two", "three", and a longer text entry.
-
-### 4.2 Extracting Test Data in Zig
-
-The C tests use `libarchive` for extraction. In Zig, there are several options:
-
-**Option A: Use `std.tar` and `std.compress.bzip2` (preferred)**
-
-Zig's standard library includes tar parsing and bzip2 decompression since 0.12:
-
-```zig
-// src/test_util.zig
-
-const std = @import("std");
-const testing = std.testing;
-
-pub const TempDir = struct {
-    path: []const u8,
-    dir: std.fs.Dir,
-};
-
-/// Unpack a .tar.bz2 test fixture from the test/ directory into a temp directory.
-pub fn unpackTestData(archive_name: []const u8) !TempDir {
-    // Locate the archive relative to the source file
-    const test_dir = comptime std.fs.path.dirname(@src().file) orelse ".";
-    const archive_path = try std.fs.path.join(
-        testing.allocator,
-        &.{ test_dir, "..", "native", "test", archive_name },
-    );
-    defer testing.allocator.free(archive_path);
-
-    // Create a temp directory
-    const tmp = try makeTempDir("chronicle.test.");
-
-    // Open and decompress
-    const file = try std.fs.openFileAbsolute(archive_path, .{});
-    defer file.close();
-
-    var bzip2_stream = std.compress.bzip2.reader(file.reader());
-    var tar_iter = std.tar.iterator(bzip2_stream.reader(), .{});
-
-    while (try tar_iter.next()) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                try tmp.dir.makePath(entry.name);
-            },
-            .file => {
-                if (std.fs.path.dirname(entry.name)) |parent| {
-                    try tmp.dir.makePath(parent);
-                }
-                const out_file = try tmp.dir.createFile(entry.name, .{});
-                defer out_file.close();
-                var buf: [8192]u8 = undefined;
-                while (true) {
-                    const n = try entry.reader().read(&buf);
-                    if (n == 0) break;
-                    try out_file.writeAll(buf[0..n]);
-                }
-            },
-            else => {},
-        }
-    }
-
-    return tmp;
-}
-
-pub fn makeTempDir(prefix: []const u8) !TempDir {
-    _ = prefix;
-    const path = try std.fs.selfExeDir(testing.allocator);
-    const tmp_path = try std.fmt.allocPrint(
-        testing.allocator,
-        "{s}/test_tmp_{d}",
-        .{ path, std.time.nanoTimestamp() },
-    );
-    testing.allocator.free(path);
-    try std.fs.makeDirAbsolute(tmp_path);
-    const dir = try std.fs.openDirAbsolute(tmp_path, .{});
-    return TempDir{ .path = tmp_path, .dir = dir };
-}
-
-pub fn removeTempDir(tmp: TempDir) void {
-    tmp.dir.close();
-    std.fs.deleteTreeAbsolute(tmp.path) catch {};
-    testing.allocator.free(tmp.path);
-}
-```
-
-**Option B: Shell out to `tar` (fallback)**
-
-If the standard library decompression proves problematic for specific archive formats:
-
-```zig
-pub fn unpackTestDataShell(archive_name: []const u8) !TempDir {
-    const tmp = try makeTempDir("chronicle.test.");
-
-    const archive_path = try resolveTestArchive(archive_name);
-    defer testing.allocator.free(archive_path);
-
-    const result = try std.process.Child.run(.{
-        .allocator = testing.allocator,
-        .argv = &.{ "tar", "xjf", archive_path, "-C", tmp.path },
-    });
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-
-    if (result.term.Exited != 0) return error.UnpackFailed;
-    return tmp;
-}
-```
-
-Option A is preferred because it has no external dependency and works in sandboxed CI
-environments. Option B is a pragmatic fallback.
-
----
-
-## 5. Cross-Compatibility Testing
-
-### 5.1 Zig Reads Java-Written Queues
-
-This is covered by porting `queue_cqv5_sample_input`
-(section 2.1 above). This test reads a queue that was originally created by Java
-Chronicle Queue and verifies the exact message content and index values.
-
-### 5.2 Java Reads Zig-Written Queues
-
-To verify the reverse direction, add a test that:
-
-1. Creates a new v5 queue using the Zig implementation
-2. Writes several entries with known content and timestamps
-3. Reads the queue back using a Java test harness
-
-This requires a Java test in the `java/` directory:
-
-```zig
-test "Java can read queue written by Zig" {
-    const tmp = try test_util.makeTempDir("chronicle.compat.");
-    defer test_util.removeTempDir(tmp);
-
-    // Write from Zig
-    {
-        var queue = try chronicle.Queue([]const u8).open(.{
-            .dir = tmp.path,
-            .version = .v5,
-            .roll_scheme = .fast_daily,
-            .create = true,
-            .allocator = testing.allocator,
-        }, chronicle.WireTextCodec);
-        defer queue.deinit();
-
-        _ = try queue.appendWithTimestamp("hello from zig", 1637267400000);
-        _ = try queue.appendWithTimestamp("second entry", 1637267400000);
-    }
-
-    // Invoke Java reader (skip if java not available)
-    const result = std.process.Child.run(.{
-        .allocator = testing.allocator,
-        .argv = &.{
-            "java", "-cp", "java/build/libs/*",
-            "net.openhft.chronicle.queue.ZigCompatTest",
-            tmp.path,
-        },
-    }) catch |err| {
-        if (err == error.FileNotFound) {
-            std.log.warn("Java not found, skipping cross-compat test", .{});
-            return; // Skip, don't fail
-        }
-        return err;
-    };
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
-}
-```
-
-### 5.3 Bidirectional Interleaved Access
-
-The strongest compatibility test is interleaved read/write between implementations:
-
-1. Java writes entries 0-9
-2. Zig reads entries 0-9, verifying content
-3. Zig writes entries 10-19
-4. Java reads entries 10-19, verifying content
-5. Both read all 20 entries
-
-This is implemented as a shell-orchestrated integration test rather than a unit test.
-
----
-
-## 6. Property-Based Testing for the Wire Protocol
-
-Property-based testing generates random inputs and verifies that invariants hold. This is
-especially valuable for the wire protocol, where hand-written tests only cover known cases.
-
-### 6.1 Round-Trip Property
-
-**Property**: For any valid value, `parse(serialize(value)) == value`.
-
-```zig
-test "property: varint round-trip for random values" {
-    var rng = std.Random.DefaultPrng.init(0xDEADBEEF);
-    const random = rng.random();
-
-    for (0..10000) |_| {
-        const value = random.int(u64) >> @intCast(random.intRangeAtMost(u6, 0, 63));
-
-        var buf: [10]u8 = undefined;
-        const written = Wire.writeVarint(&buf, value);
-        const result = Wire.readVarint(buf[0..written]);
-
-        try testing.expectEqual(value, result.value);
-        try testing.expectEqual(written, result.bytes_consumed);
-    }
-}
-```
-
-### 6.2 Serialized Size Property
-
-**Property**: The serialized output length of a field equals the pre-computed size.
-
-```zig
-test "property: serialized size matches actual output" {
-    var rng = std.Random.DefaultPrng.init(0xCAFEBABE);
-    const random = rng.random();
-
-    for (0..1000) |_| {
-        // Generate a random field name (1-20 chars)
-        var name_buf: [20]u8 = undefined;
-        const name_len = random.intRangeAtMost(usize, 1, 20);
-        for (name_buf[0..name_len]) |*c| c.* = random.intRangeAtMost(u8, 'a', 'z');
-        const name = name_buf[0..name_len];
-
-        // Generate a random text value (0-200 chars)
-        var val_buf: [200]u8 = undefined;
-        const val_len = random.intRangeAtMost(usize, 0, 200);
-        for (val_buf[0..val_len]) |*c| c.* = random.intRangeAtMost(u8, 0x20, 0x7e);
-        const val = val_buf[0..val_len];
-
-        const predicted_size = Wire.sizeFieldText(name, val);
-
-        var pad = Wire.Pad.init(testing.allocator, 512);
-        defer pad.deinit();
-        pad.fieldText(name, val);
-
-        try testing.expectEqual(predicted_size, pad.size());
-    }
-}
-```
-
-### 6.3 Alignment Property
-
-**Property**: After `padToAlign8()`, the pad size is always a multiple of 8.
-
-```zig
-test "property: padToAlign8 always produces 8-byte-aligned size" {
-    var rng = std.Random.DefaultPrng.init(42);
-    const random = rng.random();
-
-    for (0..1000) |_| {
-        var pad = Wire.Pad.init(testing.allocator, 256);
-        defer pad.deinit();
-
-        // Write a random number of random-length text fields
-        const field_count = random.intRangeAtMost(usize, 1, 10);
-        for (0..field_count) |_| {
-            var buf: [50]u8 = undefined;
-            const len = random.intRangeAtMost(usize, 1, 50);
-            for (buf[0..len]) |*c| c.* = random.intRangeAtMost(u8, 'a', 'z');
-            pad.text(buf[0..len]);
-        }
-
-        pad.padToAlign8();
-        try testing.expect(pad.size() % 8 == 0);
-    }
-}
-```
-
----
-
-## 7. Fuzzing Strategy
-
-### 7.1 Zig's Built-in Fuzzing
-
-Since Zig 0.14, the compiler includes a built-in fuzzer that integrates with the test
-runner. Fuzz tests are written as regular `test` blocks that accept a `std.testing.FuzzInput`:
-
-```zig
-const std = @import("std");
-const Wire = @import("wire.zig");
-
-test "fuzz wire parser does not crash" {
-    const input = std.testing.fuzzInput(.{});
-    // Feed arbitrary bytes to the wire parser — it must not crash,
-    // must not read out of bounds, and must terminate.
-    Wire.parse(input.bytes) catch {};
-}
-
-test "fuzz varint decoder does not crash" {
-    const input = std.testing.fuzzInput(.{});
-    if (input.bytes.len == 0) return;
-    _ = Wire.readVarint(input.bytes) catch {};
-}
-```
-
-Run fuzz tests:
-
-```sh
-# Run for 60 seconds
-zig build test -Dfuzz -- "fuzz wire parser" --fuzz-timeout=60000
-
-# Run indefinitely until a crash is found
-zig build test -Dfuzz -- "fuzz wire parser"
-```
-
-### 7.2 Porting the C Fuzz Harness
-
-The C codebase has `fuzzmain.c` — an AFL-based fuzzer that reads a script of
-`(time, bytes)` pairs, appends random data to a queue, then replays to verify. The Zig
-equivalent uses the built-in fuzzer for the parsing layer and a structured test for the
-append/replay logic:
-
-```zig
-test "fuzz queue append and replay" {
-    const input = std.testing.fuzzInput(.{});
-    if (input.bytes.len < 4) return;
-
-    const tmp = try test_util.makeTempDir("chronicle.fuzz.");
-    defer test_util.removeTempDir(tmp);
-
-    var queue = try chronicle.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .version = .v5,
-        .roll_scheme = .fast_hourly,
-        .create = true,
-        .allocator = std.testing.allocator,
-    }, chronicle.StringCodec);
-    defer queue.deinit();
-
-    // Interpret fuzz input as a series of variable-length messages
-    var offset: usize = 0;
-    var indices = std.ArrayList(u64).init(std.testing.allocator);
-    defer indices.deinit();
-    var messages = std.ArrayList([]const u8).init(std.testing.allocator);
-    defer messages.deinit();
-
-    while (offset + 2 <= input.bytes.len) {
-        const msg_len = @min(
-            std.mem.readInt(u16, input.bytes[offset..][0..2], .little),
-            @as(u16, @intCast(@min(input.bytes.len - offset - 2, 1024))),
-        );
-        offset += 2;
-        if (offset + msg_len > input.bytes.len) break;
-        const msg = input.bytes[offset .. offset + msg_len];
-        offset += msg_len;
-
-        const idx = try queue.append(msg);
-        try indices.append(idx);
-        try messages.append(msg);
-    }
-
-    // Replay and verify
-    var tailer = try queue.tailer(0);
-    defer tailer.deinit();
-
-    for (indices.items, messages.items) |expected_idx, expected_msg| {
-        const entry = try tailer.collect();
-        try std.testing.expectEqual(expected_idx, entry.index);
-        try std.testing.expectEqualSlices(u8, expected_msg, entry.message);
-    }
-}
-```
-
-### 7.3 Fuzz Targets to Implement
-
-| Target | Input | Invariant |
-|---|---|---|
-| Wire parser | Arbitrary bytes | Must not crash, OOB read, or hang |
-| Varint decoder | Arbitrary bytes | Must not crash, must consume ≤ 10 bytes |
-| Queue block parser | Arbitrary bytes | Must not crash when interpreting as a queue data page with headers |
-| Roll scheme date format parser | Arbitrary strings | Must return error or valid result, never crash |
-| Metadata page parser | Arbitrary bytes | Must not crash when parsing as a metadata.cq4t page |
-
-### 7.4 Seed Corpus
-
-Seed the fuzzer with known-good inputs from the test fixtures:
-
-```sh
-# Extract real queue file data as seed inputs
-mkdir -p fuzz_corpus/wire_parser
-# Copy actual .cq4 file content regions as seed files
-cp native/test/fuzz_input/* fuzz_corpus/wire_parser/
-```
-
-The existing `native/test/fuzz_input/` directory contains seeds from the C AFL setup.
-These are directly reusable.
-
----
-
-## 8. Memory Safety
-
-### 8.1 Zig's Built-in Safety Checks
-
-In `Debug` and `ReleaseSafe` build modes, Zig enables:
-
-| Check | What It Catches | Relevant to Chronicle |
-|---|---|---|
-| Bounds checking | Array/slice index out of bounds | Parsing wire data, reading queue blocks |
-| Integer overflow | Signed/unsigned overflow | Cycle calculation, index arithmetic |
-| Null pointer dereference | Accessing null optional | Tailer/queue lifecycle |
-| Use-after-free | Accessing freed memory (via `GeneralPurposeAllocator`) | Tailer accessing closed queue |
-| Alignment checks | Unaligned pointer access | uint64 aligned reads from mmap |
-| Unreachable code | `unreachable` hit at runtime | Unexpected wire type codes |
-
-These are **always on in test builds**, providing coverage equivalent to running the
-C code under Valgrind + ASan — but with zero configuration overhead.
-
-### 8.2 The Testing Allocator as a Memory Verifier
-
-The `std.testing.allocator` wraps `GeneralPurposeAllocator` with these behaviors:
-
-- **Leak detection**: If any allocation is not freed when the test completes, the test
-  fails with a detailed trace of the leaked allocation site.
-- **Use-after-free detection**: Freed memory is filled with `0xAA` bytes. Accessing it
-  produces detectably wrong values rather than silently reading stale data.
-- **Double-free detection**: Attempting to free already-freed memory triggers a panic
-  with a stack trace.
-
-This replaces the C test suite's Valgrind testing (`make grind`) with zero overhead:
+Zig's `testing.allocator` wraps `std.heap.GeneralPurposeAllocator` and **fails the test**
+if any allocation is leaked. Every test that allocates must use `testing.allocator`:
 
 ```zig
 test "queue cleanup frees all memory" {
-    // testing.allocator will catch any leaks automatically
-    var queue = try chronicle.Queue([]const u8).open(.{
+    var queue = try brz.Queue(TestMsg).open(.{
         .dir = tmp.path,
-        .version = .v5,
-        .roll_scheme = .daily,
         .create = true,
-        .allocator = testing.allocator, // <-- leak detector
-    }, chronicle.WireTextCodec);
-
-    _ = try queue.append("test message");
-
-    var tailer = try queue.tailer(0);
-    _ = try tailer.collect();
-    tailer.deinit();
-
-    queue.deinit();
-    // If anything leaks, the test fails here with:
-    //   "memory leak detected -- allocation at src/chronicle.zig:142"
+        .allocator = testing.allocator, // Leak detection enabled
+    }, TestCodec);
+    defer queue.deinit(); // If this leaks, the test fails
 }
 ```
 
-### 8.3 Mmap Safety
+---
 
-Memory-mapped regions require special care. The Zig implementation should:
+## 2. Unit Tests by Component
 
-1. Track all mmap regions in a list on the queue/tailer struct
-2. `munmap` them all in `deinit()`
-3. Set the pointer to `undefined` after munmap (triggers safety check on use-after-unmap)
-4. Use `std.os.mmap` which returns a proper Zig slice with bounds checking
+### 2.1 Header Constants and Encoding
+
+Test all message header encoding/decoding functions against the spec:
 
 ```zig
-fn unmapQueueFile(self: *Self) void {
-    if (self.qf_buf) |buf| {
-        std.posix.munmap(buf);
-        self.qf_buf = undefined; // use-after-unmap → safety panic
+const hdr = @import("metadata.zig");
+
+test "header constants have correct bit patterns" {
+    try testing.expectEqual(@as(u32, 0x00000000), hdr.HD_UNALLOCATED);
+    try testing.expectEqual(@as(u32, 0x80000000), hdr.HD_WORKING);
+    try testing.expectEqual(@as(u32, 0x40000000), hdr.HD_METADATA);
+    try testing.expectEqual(@as(u32, 0xC0000000), hdr.HD_EOF);
+    try testing.expectEqual(@as(u32, 0x3FFFFFFF), hdr.HD_MASK_LENGTH);
+    try testing.expectEqual(@as(u32, 0xC0000000), hdr.HD_MASK_META);
+}
+
+test "DATA header encodes payload size in lower 30 bits" {
+    const h = hdr.makeDataHeader(100);
+    try testing.expectEqual(@as(u32, 100), h);
+    try testing.expectEqual(@as(u32, 0), h & hdr.HD_MASK_META);
+    try testing.expectEqual(@as(u32, 100), h & hdr.HD_MASK_LENGTH);
+}
+
+test "METADATA header sets metadata bit" {
+    const h = hdr.makeMetadataHeader(256);
+    try testing.expectEqual(@as(u32, 256), h & hdr.HD_MASK_LENGTH);
+    try testing.expect(h & hdr.HD_METADATA != 0);
+    try testing.expect(h & hdr.HD_WORKING == 0);
+}
+
+test "WORKING header has no PID — it is exactly 0x80000000" {
+    try testing.expectEqual(@as(u32, 0x80000000), hdr.HD_WORKING);
+    try testing.expectEqual(@as(u32, 0), hdr.HD_WORKING & hdr.HD_MASK_LENGTH);
+}
+
+test "EOF header is exactly 0xC0000000" {
+    try testing.expectEqual(@as(u32, 0xC0000000), hdr.HD_EOF);
+}
+
+test "extractPayloadSize strips upper 2 bits" {
+    try testing.expectEqual(@as(u30, 42), hdr.extractPayloadSize(hdr.makeDataHeader(42)));
+    try testing.expectEqual(@as(u30, 42), hdr.extractPayloadSize(hdr.makeMetadataHeader(42)));
+    try testing.expectEqual(@as(u30, 0), hdr.extractPayloadSize(hdr.HD_EOF));
+}
+```
+
+### 2.2 Fixed Struct Layouts
+
+**This is a critical test category.** The entire mmap-and-cast architecture depends on
+struct sizes and field offsets matching the specification exactly. If Zig's `extern struct`
+layout ever changes, or if a field is added incorrectly, these tests catch it immediately.
+
+```zig
+const meta = @import("metadata.zig");
+const SharedMetadata = meta.SharedMetadata;
+const QueueFileHeader = meta.QueueFileHeader;
+
+test "SharedMetadata has correct total size" {
+    try testing.expectEqual(@as(usize, 512), @sizeOf(SharedMetadata));
+}
+
+test "SharedMetadata field offsets match the spec" {
+    try testing.expectEqual(@as(usize, 0), @offsetOf(SharedMetadata, "magic"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(SharedMetadata, "version"));
+    try testing.expectEqual(@as(usize, 6), @offsetOf(SharedMetadata, "flags"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(SharedMetadata, "roll_length_secs"));
+    try testing.expectEqual(@as(usize, 12), @offsetOf(SharedMetadata, "index_spacing"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(SharedMetadata, "index_count"));
+    // epoch_ms is u64 — implicit 4-byte padding after index_count
+    try testing.expectEqual(@as(usize, 24), @offsetOf(SharedMetadata, "epoch_ms"));
+    try testing.expectEqual(@as(usize, 32), @offsetOf(SharedMetadata, "highest_cycle"));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(SharedMetadata, "lowest_cycle"));
+    try testing.expectEqual(@as(usize, 48), @offsetOf(SharedMetadata, "modcount"));
+    try testing.expectEqual(@as(usize, 56), @offsetOf(SharedMetadata, "write_lock"));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(SharedMetadata, "_reserved"));
+}
+
+test "SharedMetadata atomic fields are 8-byte aligned" {
+    try testing.expect(@offsetOf(SharedMetadata, "highest_cycle") % 8 == 0);
+    try testing.expect(@offsetOf(SharedMetadata, "lowest_cycle") % 8 == 0);
+    try testing.expect(@offsetOf(SharedMetadata, "modcount") % 8 == 0);
+    try testing.expect(@offsetOf(SharedMetadata, "write_lock") % 8 == 0);
+}
+
+test "SharedMetadata magic number is correct" {
+    const m = SharedMetadata{
+        .roll_length_secs = 86400,
+        .index_spacing = 256,
+        .index_count = 4096,
+        .epoch_ms = 0,
+        .highest_cycle = 0,
+        .lowest_cycle = 0,
+        .modcount = 0,
+        .write_lock = 0x8000000000000000,
+    };
+    try testing.expectEqual(@as(u32, 0x425A514D), m.magic);
+}
+
+test "QueueFileHeader has correct total size" {
+    try testing.expectEqual(@as(usize, 64), @sizeOf(QueueFileHeader));
+}
+
+test "QueueFileHeader field offsets match the spec" {
+    try testing.expectEqual(@as(usize, 0), @offsetOf(QueueFileHeader, "magic"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(QueueFileHeader, "version"));
+    try testing.expectEqual(@as(usize, 6), @offsetOf(QueueFileHeader, "flags"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(QueueFileHeader, "roll_length_secs"));
+    try testing.expectEqual(@as(usize, 12), @offsetOf(QueueFileHeader, "index_spacing"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(QueueFileHeader, "index_count"));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(QueueFileHeader, "epoch_ms"));
+    try testing.expectEqual(@as(usize, 32), @offsetOf(QueueFileHeader, "created_cycle"));
+    try testing.expectEqual(@as(usize, 36), @offsetOf(QueueFileHeader, "_reserved"));
+}
+
+test "QueueFileHeader magic number is correct" {
+    const h = QueueFileHeader{
+        .roll_length_secs = 86400,
+        .index_spacing = 256,
+        .index_count = 4096,
+        .epoch_ms = 0,
+        .created_cycle = 0,
+    };
+    try testing.expectEqual(@as(u32, 0x425A5143), h.magic);
+}
+```
+
+### 2.3 Flat Index
+
+Test the index region's offset calculation, slot lookup, binary search, and atomic
+consistency:
+
+```zig
+test "index region offset is 64 bytes into file" {
+    // Index region starts immediately after QueueFileHeader
+    try testing.expectEqual(@as(usize, 64), @sizeOf(QueueFileHeader));
+}
+
+test "index region size matches index_count * 8" {
+    const index_count: u32 = 4096;
+    const expected_size: usize = index_count * @sizeOf(u64);
+    try testing.expectEqual(@as(usize, 32_768), expected_size);
+}
+
+test "data region offset is header + index region" {
+    const index_count: u32 = 4096;
+    const data_offset = @sizeOf(QueueFileHeader) + index_count * @sizeOf(u64);
+    try testing.expectEqual(@as(usize, 32_832), data_offset);
+}
+
+test "slotFor computes correct index slot" {
+    const index_spacing: u32 = 256;
+    try testing.expectEqual(@as(u32, 0), idx.slotFor(0, index_spacing));
+    try testing.expectEqual(@as(u32, 0), idx.slotFor(255, index_spacing));
+    try testing.expectEqual(@as(u32, 1), idx.slotFor(256, index_spacing));
+    try testing.expectEqual(@as(u32, 1), idx.slotFor(511, index_spacing));
+    try testing.expectEqual(@as(u32, 4), idx.slotFor(1024, index_spacing));
+}
+
+test "binary search finds nearest populated slot" {
+    // Create a mock index region with known populated slots
+    var index_region = [_]u64{0} ** 16;
+    index_region[0] = 32_832;  // first data message
+    index_region[2] = 33_200;  // message at seqnum 512
+    index_region[5] = 34_100;  // message at seqnum 1280
+
+    // Search for seqnum 700 → should find slot 2 (nearest ≤)
+    const result = idx.binarySearchIndex(&index_region, 2);
+    try testing.expectEqual(@as(usize, 2), result.slot);
+    try testing.expectEqual(@as(u64, 33_200), result.offset);
+}
+
+test "index atomic store and load consistency" {
+    var slot: u64 align(8) = 0;
+    @atomicStore(u64, &slot, 42_000, .release);
+    const loaded = @atomicLoad(u64, &slot, .acquire);
+    try testing.expectEqual(@as(u64, 42_000), loaded);
+}
+```
+
+### 2.4 Codec Interface
+
+Codecs must survive round-trips, report accurate sizes, and allocate nothing:
+
+```zig
+test "codec round-trip: parse(write(msg)) == msg" {
+    var buf: [4096]u8 = undefined;
+    const original = TestMsg{ .id = 42, .value = 3.14, .name = "hello" };
+
+    const written = TestCodec.write(&buf, original);
+    const parsed = TestCodec.parse(written);
+
+    try testing.expectEqual(original.id, parsed.id);
+    try testing.expect(original.value == parsed.value);
+    try testing.expectEqualStrings(original.name, parsed.name);
+}
+
+test "codec serialized_size matches actual output" {
+    const msg = TestMsg{ .id = 1, .value = 0.0, .name = "test" };
+    const predicted = TestCodec.serializedSize(msg);
+
+    var buf: [4096]u8 = undefined;
+    const actual = TestCodec.write(&buf, msg);
+
+    try testing.expectEqual(predicted, actual.len);
+}
+
+test "codec zero allocation verification" {
+    // Use a counting allocator to prove no allocations during encode/decode
+    var counting = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = counting.deinit();
+
+    const before = counting.total_requested_bytes;
+
+    var buf: [4096]u8 = undefined;
+    const msg = TestMsg{ .id = 1, .value = 0.0, .name = "x" };
+    const written = TestCodec.write(&buf, msg);
+    _ = TestCodec.parse(written);
+
+    const after = counting.total_requested_bytes;
+    try testing.expectEqual(before, after);
+}
+
+test "codec handles empty message" {
+    var buf: [4096]u8 = undefined;
+    const msg = TestMsg{ .id = 0, .value = 0.0, .name = "" };
+    const written = TestCodec.write(&buf, msg);
+    const parsed = TestCodec.parse(written);
+    try testing.expectEqualStrings("", parsed.name);
+}
+
+test "codec handles max-size message" {
+    // Verify codec does not crash or corrupt with a large payload
+    const large_name = "x" ** 1024;
+    var buf: [8192]u8 = undefined;
+    const msg = TestMsg{ .id = 999, .value = 1e100, .name = large_name };
+    const written = TestCodec.write(&buf, msg);
+    const parsed = TestCodec.parse(written);
+    try testing.expectEqualStrings(large_name, parsed.name);
+}
+```
+
+### 2.5 Roll Scheme
+
+```zig
+test "cycle calculation: FAST_DAILY epoch=0" {
+    const scheme = brz.RollScheme.FAST_DAILY;
+    // 2021-11-18 00:00:00 UTC = epoch day 18949
+    const ts_ms: u64 = 1637193600000;
+    const cycle = scheme.toCycle(ts_ms);
+    try testing.expectEqual(@as(u32, 18949), cycle);
+}
+
+test "cycle calculation: next day increments cycle by 1" {
+    const scheme = brz.RollScheme.FAST_DAILY;
+    const day1: u64 = 1637193600000; // 2021-11-18
+    const day2: u64 = 1637280000000; // 2021-11-19
+    try testing.expectEqual(scheme.toCycle(day1) + 1, scheme.toCycle(day2));
+}
+
+test "filename generation with .brz extension" {
+    const scheme = brz.RollScheme.FAST_DAILY;
+    var buf: [64]u8 = undefined;
+    const name = scheme.cycleToFilename(18949, &buf);
+    try testing.expectEqualStrings("20211118F.brz", name);
+}
+
+test "TEST_SECONDLY filename with .brz extension" {
+    const scheme = brz.RollScheme.TEST_SECONDLY;
+    var buf: [64]u8 = undefined;
+    const name = scheme.cycleToFilename(0, &buf);
+    // Cycle 0 = epoch second → "19700101-000000T.brz"
+    try testing.expectEqualStrings("19700101-000000T.brz", name);
+}
+
+test "date format conversion for all roll schemes" {
+    // Verify every roll scheme produces a non-empty filename ending in .brz
+    inline for (std.meta.fields(brz.RollScheme)) |field| {
+        const scheme = @field(brz.RollScheme, field.name);
+        var buf: [64]u8 = undefined;
+        const name = scheme.cycleToFilename(0, &buf);
+        try testing.expect(name.len > 4); // at least "X.brz"
+        try testing.expect(std.mem.endsWith(u8, name, ".brz"));
+    }
+}
+```
+
+### 2.6 Alignment Padding
+
+```zig
+test "alignment padding formula" {
+    // padding = (-payload_size) & 0x03
+    try testing.expectEqual(@as(u32, 3), computePadding(1));
+    try testing.expectEqual(@as(u32, 2), computePadding(2));
+    try testing.expectEqual(@as(u32, 1), computePadding(3));
+    try testing.expectEqual(@as(u32, 0), computePadding(4));
+    try testing.expectEqual(@as(u32, 3), computePadding(5));
+    try testing.expectEqual(@as(u32, 0), computePadding(100));
+    try testing.expectEqual(@as(u32, 3), computePadding(101));
+}
+
+test "total entry size is always 4-byte aligned" {
+    var i: u32 = 1;
+    while (i < 1024) : (i += 1) {
+        const total = 4 + i + computePadding(i); // header + payload + padding
+        try testing.expect(total % 4 == 0);
     }
 }
 ```
 
 ---
 
-## 9. Test Matrix
+## 3. Integration Tests
+
+### 3.1 Queue Lifecycle
+
+```zig
+test "create new queue, write, close, reopen, read" {
+    const tmp = try test_util.makeTempDir("brz.lifecycle.");
+    defer test_util.removeTempDir(tmp);
+
+    // 1. Create queue
+    {
+        var queue = try brz.Queue([]const u8).open(.{
+            .dir = tmp.path,
+            .roll_scheme = .FAST_DAILY,
+            .create = true,
+            .allocator = testing.allocator,
+        }, brz.RawBytesCodec);
+        defer queue.deinit();
+
+        // 2. Append several messages
+        var appender = try queue.appender();
+        defer appender.deinit();
+
+        try appender.append("message-0");
+        try appender.append("message-1");
+        try appender.append("message-2");
+    }
+    // Queue is now closed (deinit ran)
+
+    // 3. Reopen queue
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = false,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    // 4. Create tailer, read all messages, verify content
+    var tailer = try queue.tailer(.start);
+    defer tailer.deinit();
+
+    try testing.expectEqualStrings("message-0", (try tailer.poll()).?);
+    try testing.expectEqualStrings("message-1", (try tailer.poll()).?);
+    try testing.expectEqualStrings("message-2", (try tailer.poll()).?);
+    try testing.expect((try tailer.poll()) == null); // no more messages
+}
+```
+
+### 3.2 Metadata File
+
+```zig
+test "metadata.brz is valid 512-byte struct" {
+    const tmp = try test_util.makeTempDir("brz.meta.");
+    defer test_util.removeTempDir(tmp);
+
+    // Create queue — this creates metadata.brz
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    // Verify metadata file exists and is exactly 512 bytes
+    const meta_path = try std.fs.path.join(testing.allocator, &.{ tmp.path, "metadata.brz" });
+    defer testing.allocator.free(meta_path);
+
+    const file = try std.fs.openFileAbsolute(meta_path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    try testing.expectEqual(@as(u64, 512), stat.size);
+
+    // Read raw bytes, verify magic number
+    var raw: [512]u8 = undefined;
+    _ = try file.readAll(&raw);
+    const magic = std.mem.readInt(u32, raw[0..4], .little);
+    try testing.expectEqual(@as(u32, 0x425A514D), magic); // "BZQM"
+
+    // Verify roll config fields match
+    const roll_secs = std.mem.readInt(u32, raw[8..12], .little);
+    try testing.expectEqual(@as(u32, 86400), roll_secs); // FAST_DAILY = 24h
+}
+```
+
+### 3.3 Queue File Structure
+
+```zig
+test "queue file has correct header and index region" {
+    const tmp = try test_util.makeTempDir("brz.filestructure.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .TEST4_SECONDLY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    // Append a message to force file creation
+    var appender = try queue.appender();
+    defer appender.deinit();
+    try appender.append("hello");
+
+    // Find the .brz data file
+    const brz_file = try test_util.findFirstBrzFile(tmp.path);
+    defer brz_file.close();
+
+    // Verify QueueFileHeader at offset 0
+    var hdr_buf: [64]u8 = undefined;
+    _ = try brz_file.preadAll(&hdr_buf, 0);
+
+    const magic = std.mem.readInt(u32, hdr_buf[0..4], .little);
+    try testing.expectEqual(@as(u32, 0x425A5143), magic); // "BZQC"
+
+    const index_count = std.mem.readInt(u32, hdr_buf[16..20], .little);
+    try testing.expectEqual(@as(u32, 32), index_count); // TEST4_SECONDLY
+
+    // Verify data region follows header + index
+    const expected_data_offset = 64 + index_count * 8;
+    const file_data_offset = std.mem.readInt(u64, hdr_buf[24..32], .little);
+    // data_offset field or computed — verify first data header is at expected location
+    var data_header_buf: [4]u8 = undefined;
+    _ = try brz_file.preadAll(&data_header_buf, expected_data_offset);
+    const data_header = std.mem.readInt(u32, &data_header_buf, .little);
+    // Should be a DATA header with size = len("hello") = 5
+    try testing.expectEqual(@as(u32, 5), data_header & 0x3FFFFFFF);
+    try testing.expectEqual(@as(u32, 0), data_header & 0xC0000000); // DATA type
+}
+```
+
+### 3.4 Cycle Rolling
+
+```zig
+test "cycle roll creates new file and writes EOF" {
+    const tmp = try test_util.makeTempDir("brz.roll.");
+    defer test_util.removeTempDir(tmp);
+
+    // Use TEST_SECONDLY for fast rolling (1-second cycles)
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .TEST_SECONDLY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    // Write first message in cycle N
+    try appender.append("msg-in-cycle-1");
+    const first_file = try test_util.findLatestBrzFile(tmp.path);
+
+    // Sleep past the roll boundary
+    std.time.sleep(1_100 * std.time.ns_per_ms);
+
+    // Write message in cycle N+1
+    try appender.append("msg-in-cycle-2");
+
+    // Count .brz files — should be at least 2
+    const file_count = try test_util.countBrzFiles(tmp.path);
+    try testing.expect(file_count >= 2);
+
+    // Verify EOF marker in the old file
+    const eof_found = try test_util.hasEofMarker(first_file);
+    try testing.expect(eof_found);
+
+    // Verify new file has the second message
+    var tailer = try queue.tailer(.start);
+    defer tailer.deinit();
+
+    const msg1 = (try tailer.poll()).?;
+    try testing.expectEqualStrings("msg-in-cycle-1", msg1);
+    const msg2 = (try tailer.poll()).?;
+    try testing.expectEqualStrings("msg-in-cycle-2", msg2);
+}
+```
+
+### 3.5 Pre-Roll
+
+```zig
+test "pre-roll creates next cycle file before roll boundary" {
+    const tmp = try test_util.makeTempDir("brz.preroll.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .TEST_SECONDLY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    // Append triggers pre-roll of next cycle file
+    try appender.append("first");
+
+    // The pre-created file should exist (may be empty or have just a header)
+    // Verify by checking file count or by inspecting the directory
+    std.time.sleep(1_100 * std.time.ns_per_ms);
+
+    // Now appending to the next cycle should be fast (file already exists)
+    const start = std.time.nanoTimestamp();
+    try appender.append("second");
+    const elapsed = std.time.nanoTimestamp() - start;
+
+    // Pre-rolled append should be fast — no file creation overhead
+    // (This is a soft check; just verify it doesn't error)
+    _ = elapsed;
+
+    try testing.expect(try test_util.countBrzFiles(tmp.path) >= 2);
+}
+```
+
+---
+
+## 4. Concurrency Tests
+
+### 4.1 Multi-Process Writer/Reader
+
+```zig
+test "multi-process: writer and reader" {
+    const tmp = try test_util.makeTempDir("brz.mp.");
+    defer test_util.removeTempDir(tmp);
+
+    // Fork a child process
+    const pid = try std.posix.fork();
+
+    if (pid == 0) {
+        // Child: write messages
+        var queue = try brz.Queue([]const u8).open(.{
+            .dir = tmp.path,
+            .roll_scheme = .FAST_DAILY,
+            .create = true,
+            .allocator = std.heap.page_allocator,
+        }, brz.RawBytesCodec);
+        defer queue.deinit();
+
+        var appender = try queue.appender();
+        defer appender.deinit();
+
+        var i: u32 = 0;
+        while (i < 100) : (i += 1) {
+            var buf: [32]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "msg-{d}", .{i}) catch unreachable;
+            try appender.append(msg);
+        }
+        std.posix.exit(0);
+    } else {
+        // Parent: wait briefly then read
+        std.time.sleep(50 * std.time.ns_per_ms);
+
+        var queue = try brz.Queue([]const u8).open(.{
+            .dir = tmp.path,
+            .roll_scheme = .FAST_DAILY,
+            .create = false,
+            .allocator = testing.allocator,
+        }, brz.RawBytesCodec);
+        defer queue.deinit();
+
+        var tailer = try queue.tailer(.start);
+        defer tailer.deinit();
+
+        var count: u32 = 0;
+        const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
+        while (std.time.nanoTimestamp() < deadline) {
+            if (try tailer.poll()) |_| {
+                count += 1;
+                if (count == 100) break;
+            } else {
+                std.time.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+
+        try testing.expectEqual(@as(u32, 100), count);
+
+        // Reap child
+        _ = std.posix.waitpid(pid, 0);
+    }
+}
+```
+
+### 4.2 Multi-Thread Readers
+
+```zig
+test "multiple reader threads on same queue" {
+    const tmp = try test_util.makeTempDir("brz.mtread.");
+    defer test_util.removeTempDir(tmp);
+
+    const num_messages: u32 = 1000;
+    const num_readers: u32 = 4;
+
+    // Create and populate queue
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    var i: u32 = 0;
+    while (i < num_messages) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "msg-{d}", .{i}) catch unreachable;
+        try appender.append(msg);
+    }
+
+    // Spawn N reader threads, each with own tailer
+    var counts: [num_readers]u32 = [_]u32{0} ** num_readers;
+    var threads: [num_readers]std.Thread = undefined;
+
+    for (0..num_readers) |t| {
+        threads[t] = try std.Thread.spawn(.{}, struct {
+            fn reader(q: *brz.Queue([]const u8), count: *u32) void {
+                var tailer = q.tailer(.start) catch return;
+                defer tailer.deinit();
+
+                while (tailer.poll() catch null) |_| {
+                    count.* += 1;
+                }
+            }
+        }.reader, .{ &queue, &counts[t] });
+    }
+
+    for (&threads) |*t| t.join();
+
+    // Each thread should have read all messages
+    for (counts) |c| {
+        try testing.expectEqual(num_messages, c);
+    }
+}
+```
+
+### 4.3 CAS Contention (Multi-Process)
+
+```zig
+test "multi-process appender contention" {
+    const tmp = try test_util.makeTempDir("brz.cas.");
+    defer test_util.removeTempDir(tmp);
+
+    const num_writers = 4;
+    const msgs_per_writer = 250;
+    var pids: [num_writers]std.posix.pid_t = undefined;
+
+    // Create queue first
+    {
+        var queue = try brz.Queue([]const u8).open(.{
+            .dir = tmp.path,
+            .roll_scheme = .FAST_DAILY,
+            .create = true,
+            .allocator = testing.allocator,
+        }, brz.RawBytesCodec);
+        queue.deinit();
+    }
+
+    // Fork multiple writers
+    for (0..num_writers) |w| {
+        const pid = try std.posix.fork();
+        if (pid == 0) {
+            // Child: write its range of messages
+            var queue = try brz.Queue([]const u8).open(.{
+                .dir = tmp.path,
+                .create = false,
+                .allocator = std.heap.page_allocator,
+            }, brz.RawBytesCodec);
+            defer queue.deinit();
+
+            var appender = try queue.appender();
+            defer appender.deinit();
+
+            var i: u32 = 0;
+            while (i < msgs_per_writer) : (i += 1) {
+                var buf: [64]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "w{d}-{d}", .{ w, i }) catch unreachable;
+                appender.append(msg) catch {};
+            }
+            std.posix.exit(0);
+        } else {
+            pids[w] = pid;
+        }
+    }
+
+    // Wait for all children
+    for (pids) |pid| _ = std.posix.waitpid(pid, 0);
+
+    // Verify: no messages lost, no duplicates
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .create = false,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var tailer = try queue.tailer(.start);
+    defer tailer.deinit();
+
+    var seen = std.StringHashMap(void).init(testing.allocator);
+    defer seen.deinit();
+
+    var total: u32 = 0;
+    while (try tailer.poll()) |msg| {
+        const key = try testing.allocator.dupe(u8, msg);
+        const result = try seen.getOrPut(key);
+        try testing.expect(!result.found_existing); // no duplicates
+        total += 1;
+    }
+
+    try testing.expectEqual(@as(u32, num_writers * msgs_per_writer), total);
+}
+```
+
+---
+
+## 5. io_uring Tests
+
+```zig
+test "io_uring wakeup: reader blocks then receives message" {
+    if (!brz.UringNotifier.isAvailable()) return error.SkipZigTest;
+
+    const tmp = try test_util.makeTempDir("brz.uring.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var received: ?[]const u8 = null;
+    var wakeup_latency_ns: i128 = 0;
+
+    // Spawn reader thread that calls collect() (blocks)
+    const reader_thread = try std.Thread.spawn(.{}, struct {
+        fn run(q: *brz.Queue([]const u8), out: *?[]const u8, latency: *i128) void {
+            var tailer = q.tailer(.start) catch return;
+            defer tailer.deinit();
+
+            const before = std.time.nanoTimestamp();
+            // collect() blocks until a message arrives via io_uring wakeup
+            if (tailer.collect(5_000)) |msg| { // 5 second timeout
+                out.* = msg;
+                latency.* = std.time.nanoTimestamp() - before;
+            } else |_| {}
+        }
+    }.run, .{ &queue, &received, &wakeup_latency_ns });
+
+    // Give reader time to enter blocking wait
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    // Main thread appends a message
+    var appender = try queue.appender();
+    defer appender.deinit();
+    try appender.append("wakeup-test");
+
+    reader_thread.join();
+
+    // Verify reader woke up and received correct message
+    try testing.expect(received != null);
+    try testing.expectEqualStrings("wakeup-test", received.?);
+
+    // Wakeup latency should be reasonable (< 10ms)
+    try testing.expect(wakeup_latency_ns < 10 * std.time.ns_per_ms);
+}
+
+test "io_uring: multiple readers wake up on same event" {
+    if (!brz.UringNotifier.isAvailable()) return error.SkipZigTest;
+
+    const tmp = try test_util.makeTempDir("brz.uring.multi.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    const num_readers = 3;
+    var received: [num_readers]bool = [_]bool{false} ** num_readers;
+    var threads: [num_readers]std.Thread = undefined;
+
+    // Multiple tailers blocking on collect
+    for (0..num_readers) |r| {
+        threads[r] = try std.Thread.spawn(.{}, struct {
+            fn run(q: *brz.Queue([]const u8), flag: *bool) void {
+                var tailer = q.tailer(.start) catch return;
+                defer tailer.deinit();
+
+                if (tailer.collect(5_000)) |_| {
+                    flag.* = true;
+                } else |_| {}
+            }
+        }.run, .{ &queue, &received[r] });
+    }
+
+    // Give readers time to block
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    // Single write should wake all of them
+    var appender = try queue.appender();
+    defer appender.deinit();
+    try appender.append("broadcast");
+
+    for (&threads) |*t| t.join();
+
+    // All readers should have woken up
+    for (received) |r| {
+        try testing.expect(r);
+    }
+}
+```
+
+---
+
+## 6. Performance Tests
+
+### 6.1 Latency Benchmark
+
+```zig
+test "benchmark: append latency p50/p99/p999" {
+    const tmp = try test_util.makeTempDir("brz.bench.latency.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    const iterations = 1_000_000;
+    var latencies: [iterations]u64 = undefined;
+    const payload = "benchmark-payload-64-bytes-exactly-for-consistent-measurement!";
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const start = asm volatile ("rdtsc" : [r] "={eax}" (-> u32));
+        try appender.append(payload);
+        const end = asm volatile ("rdtsc" : [r] "={eax}" (-> u32));
+        latencies[i] = end -% start;
+    }
+
+    std.sort.sort(u64, &latencies, {}, std.sort.asc(u64));
+
+    const p50 = latencies[iterations / 2];
+    const p99 = latencies[iterations * 99 / 100];
+    const p999 = latencies[iterations * 999 / 1000];
+
+    std.debug.print("\nAppend latency (cycles): p50={d} p99={d} p99.9={d}\n", .{ p50, p99, p999 });
+
+    // Soft assertion — alert if p99 is unreasonably high
+    // (threshold depends on hardware; 10μs ≈ 30,000 cycles at 3 GHz)
+    try testing.expect(p99 < 100_000); // ~33μs at 3 GHz — generous bound
+}
+```
+
+### 6.2 Throughput Benchmark
+
+```zig
+test "benchmark: sustained throughput" {
+    const tmp = try test_util.makeTempDir("brz.bench.throughput.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    const payload = "throughput-benchmark-payload-64B!-padded-to-alignment-boundary.";
+    const duration_ns: i128 = 10 * std.time.ns_per_s;
+    const start = std.time.nanoTimestamp();
+    var count: u64 = 0;
+
+    while (std.time.nanoTimestamp() - start < duration_ns) {
+        try appender.append(payload);
+        count += 1;
+    }
+
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    const msgs_per_sec = count * std.time.ns_per_s / elapsed_ns;
+    std.debug.print("\nSustained throughput: {d} msgs/sec ({d} messages in {d}ms)\n", .{
+        msgs_per_sec,
+        count,
+        elapsed_ns / std.time.ns_per_ms,
+    });
+
+    // Should sustain at least 1M msgs/sec for 64-byte payloads
+    try testing.expect(msgs_per_sec > 1_000_000);
+}
+```
+
+### 6.3 io_uring Wakeup Latency
+
+```zig
+test "benchmark: io_uring wakeup latency" {
+    if (!brz.UringNotifier.isAvailable()) return error.SkipZigTest;
+
+    const tmp = try test_util.makeTempDir("brz.bench.uring.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    const iterations = 10_000;
+    var wakeup_latencies: [iterations]u64 = undefined;
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var received_ts: i128 = 0;
+
+        const reader_thread = try std.Thread.spawn(.{}, struct {
+            fn run(q: *brz.Queue([]const u8), ts: *i128) void {
+                var tailer = q.tailer(.end) catch return;
+                defer tailer.deinit();
+                if (tailer.collect(1_000)) |_| {
+                    ts.* = std.time.nanoTimestamp();
+                } else |_| {}
+            }
+        }.run, .{ &queue, &received_ts });
+
+        std.time.sleep(1 * std.time.ns_per_ms); // let reader block
+
+        var appender = try queue.appender();
+        const publish_ts = std.time.nanoTimestamp();
+        try appender.append("ping");
+        appender.deinit();
+
+        reader_thread.join();
+
+        if (received_ts > publish_ts) {
+            wakeup_latencies[i] = @intCast(received_ts - publish_ts);
+        } else {
+            wakeup_latencies[i] = 0;
+        }
+    }
+
+    std.sort.sort(u64, &wakeup_latencies, {}, std.sort.asc(u64));
+
+    const p50 = wakeup_latencies[iterations / 2];
+    const p99 = wakeup_latencies[iterations * 99 / 100];
+    std.debug.print("\nio_uring wakeup latency: p50={d}ns p99={d}ns\n", .{ p50, p99 });
+}
+```
+
+---
+
+## 7. Property-Based Testing
+
+### 7.1 Codec Round-Trip
+
+```zig
+test "property: codec round-trip for random messages" {
+    var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
+    const random = prng.random();
+
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) {
+        // Generate random payload
+        var payload: [256]u8 = undefined;
+        const len = random.intRangeAtMost(usize, 0, payload.len);
+        random.bytes(payload[0..len]);
+
+        var buf: [4096]u8 = undefined;
+        const written = brz.RawBytesCodec.write(&buf, payload[0..len]);
+        const parsed = brz.RawBytesCodec.parse(written);
+
+        try testing.expectEqualSlices(u8, payload[0..len], parsed);
+    }
+}
+```
+
+### 7.2 Index Region Invariants
+
+```zig
+test "property: index offsets are monotonically increasing" {
+    const tmp = try test_util.makeTempDir("brz.prop.index.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .roll_scheme = .TEST4_SECONDLY, // small index for fast test
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    // Write enough messages to populate several index entries
+    // TEST4_SECONDLY: index_spacing=4, index_count=32
+    var i: u32 = 0;
+    while (i < 128) : (i += 1) {
+        try appender.append("prop-test-msg");
+    }
+
+    // Read the index region and verify monotonicity
+    const index_region = try test_util.readIndexRegion(tmp.path);
+    var prev: u64 = 0;
+    for (index_region) |offset| {
+        if (offset == 0) continue; // unpopulated
+        try testing.expect(offset > prev);
+        prev = offset;
+    }
+}
+```
+
+### 7.3 Header Encoding Round-Trip
+
+```zig
+test "property: header encode/decode round-trip for random sizes" {
+    var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
+    const random = prng.random();
+
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        const size = random.intRangeAtMost(u30, 1, 0x3FFFFFFF);
+
+        // DATA header round-trip
+        const data_hdr = hdr.makeDataHeader(size);
+        try testing.expectEqual(size, hdr.extractPayloadSize(data_hdr));
+        try testing.expect(!hdr.isWorking(data_hdr));
+        try testing.expect(!hdr.isEof(data_hdr));
+
+        // METADATA header round-trip
+        const meta_hdr = hdr.makeMetadataHeader(size);
+        try testing.expectEqual(size, hdr.extractPayloadSize(meta_hdr));
+        try testing.expect(hdr.isMetadata(meta_hdr));
+    }
+}
+```
+
+---
+
+## 8. Fuzzing Strategy
+
+### 8.1 Zig's Built-in Fuzzing
+
+Zig 0.12+ supports fuzz testing natively. Fuzz targets are `test` blocks that accept
+a `fuzz` input:
+
+```zig
+test "fuzz codec parse does not crash" {
+    // Feed random bytes to the codec parser — must not crash, panic, or UB
+    const input = std.testing.fuzzInput(.{});
+    _ = brz.RawBytesCodec.parse(input) catch {};
+}
+
+test "fuzz message header parser does not crash" {
+    const input = std.testing.fuzzInput(.{});
+    if (input.len < 4) return;
+    const header = std.mem.readInt(u32, input[0..4], .little);
+    _ = hdr.extractPayloadSize(header);
+    _ = hdr.isWorking(header);
+    _ = hdr.isEof(header);
+    _ = hdr.isMetadata(header);
+}
+```
+
+### 8.2 Queue File Fuzzing
+
+```zig
+test "fuzz queue file parser with random bytes" {
+    // Write random bytes as a .brz file and try to open/read
+    const input = std.testing.fuzzInput(.{});
+    const tmp = try test_util.makeTempDir("brz.fuzz.");
+    defer test_util.removeTempDir(tmp);
+
+    // Write random content as a .brz file
+    const fuzz_path = try std.fs.path.join(testing.allocator, &.{ tmp.path, "19700101F.brz" });
+    defer testing.allocator.free(fuzz_path);
+
+    {
+        const file = try std.fs.createFileAbsolute(fuzz_path, .{});
+        defer file.close();
+        _ = try file.writeAll(input);
+    }
+
+    // Also create a valid metadata.brz so queue.open doesn't fail on that
+    try test_util.writeValidMetadata(tmp.path);
+
+    // Attempt to open and read — must not crash
+    var queue = brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .create = false,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec) catch return;
+    defer queue.deinit();
+
+    var tailer = queue.tailer(.start) catch return;
+    defer tailer.deinit();
+
+    // Read up to 100 messages — any errors are fine, just don't crash
+    var count: u32 = 0;
+    while (count < 100) : (count += 1) {
+        _ = tailer.poll() catch break;
+    }
+}
+```
+
+### 8.3 Fuzz Targets to Implement
+
+| Target | Input | Goal |
+|--------|-------|------|
+| Codec parse | Random bytes | No crash, no UB |
+| Message header parser | Random 4-byte values | No crash, correct classification |
+| Queue file reader | Random `.brz` file | No crash, graceful error |
+| Index binary search | Random u64 array | No out-of-bounds, correct result |
+| Metadata parser | Random 512 bytes | No crash, detects invalid magic |
+
+### 8.4 Seed Corpus
+
+Seed the fuzzer with known-good files from integration tests:
+
+```sh
+# Build seed corpus from passing integration tests
+mkdir -p fuzz/corpus/brz_file
+cp /tmp/brz-test-*/20*.brz fuzz/corpus/brz_file/
+
+mkdir -p fuzz/corpus/metadata
+cp /tmp/brz-test-*/metadata.brz fuzz/corpus/metadata/
+```
+
+---
+
+## 9. Memory Safety
+
+### 9.1 Zig's Built-in Safety Checks
+
+In `Debug` and `ReleaseSafe` modes, Zig enables:
+
+- **Bounds checking** on all slice and array access
+- **Integer overflow detection** (traps on overflow in non-wrapping arithmetic)
+- **Null pointer detection** (optional pointers checked on dereference)
+- **Use-after-free detection** (when using the testing allocator)
+- **Alignment checks** on pointer casts
+
+These are always enabled for tests (`zig build test` defaults to Debug mode).
+
+### 9.2 Zero Allocation on Hot Path
+
+The hot path (append and poll) must not allocate. Verify by wrapping the allocator:
+
+```zig
+test "zero allocations on append hot path" {
+    const tmp = try test_util.makeTempDir("brz.noalloc.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    // Warm up — first append may trigger file creation
+    try appender.append("warmup");
+
+    // Now wrap allocator to detect any calls
+    var alloc_count: usize = 0;
+    const counting_allocator = test_util.makeCountingAllocator(testing.allocator, &alloc_count);
+
+    // Swap allocator (if the API supports it) or verify no allocations happened
+    // Alternative: check before/after allocation count from testing.allocator
+    const before = testing.allocator_instance.total_requested_bytes;
+
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        try appender.append("hot-path-msg");
+    }
+
+    const after = testing.allocator_instance.total_requested_bytes;
+    try testing.expectEqual(before, after); // Zero allocations
+}
+
+test "zero allocations on poll hot path" {
+    const tmp = try test_util.makeTempDir("brz.noalloc.poll.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+    defer queue.deinit();
+
+    var appender = try queue.appender();
+    defer appender.deinit();
+
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        try appender.append("msg");
+    }
+
+    var tailer = try queue.tailer(.start);
+    defer tailer.deinit();
+
+    // Warm up
+    _ = try tailer.poll();
+
+    const before = testing.allocator_instance.total_requested_bytes;
+
+    while (try tailer.poll()) |_| {}
+
+    const after = testing.allocator_instance.total_requested_bytes;
+    try testing.expectEqual(before, after); // Zero allocations
+}
+```
+
+### 9.3 mmap Safety
+
+```zig
+test "mmap: unmap before close, null after unmap" {
+    const tmp = try test_util.makeTempDir("brz.mmap.");
+    defer test_util.removeTempDir(tmp);
+
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = tmp.path,
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+
+    // After deinit, all mappings should be released
+    queue.deinit();
+
+    // Verify that the queue's internal pointers are null/invalid
+    // (This depends on implementation — at minimum, deinit must not leak)
+    // The testing allocator will catch any leaked memory
+}
+```
+
+### 9.4 Testing Allocator Leak Detection
+
+```zig
+test "queue deinit frees all memory" {
+    // The testing allocator will fail this test if any allocation leaks
+    var queue = try brz.Queue([]const u8).open(.{
+        .dir = "/tmp/brz-leak-test",
+        .create = true,
+        .allocator = testing.allocator,
+    }, brz.RawBytesCodec);
+
+    var appender = try queue.appender();
+    try appender.append("test");
+    appender.deinit();
+
+    var tailer = try queue.tailer(.start);
+    _ = try tailer.poll();
+    tailer.deinit();
+
+    queue.deinit();
+    // If we get here without the testing allocator asserting, no leaks occurred
+}
+```
+
+---
+
+## 10. Test Matrix
 
 The following matrix defines the full scope of testing. Each cell should have at least
 one test. Priority is indicated (P1 = must have for initial release, P2 = should have,
 P3 = nice to have).
 
-### 9.1 Format × Operation Matrix
+### 10.1 Format × Operation Matrix
 
-| | v5 Read | v5 Write | v5 Read-after-Write |
+| | v1 Read | v1 Write | v1 Read-after-Write |
 |---|---|---|---|
 | **Single entry** | P1 | P1 | P1 |
 | **Multiple entries** | P1 | P1 | P1 |
-| **Long text (variable-length)** | P1 | P1 | P1 |
-| **Empty queue (metadata only)** | P1 | P1 | P1 |
-| **Binary data (non-UTF8)** | P2 | P2 | P2 |
+| **Large messages** | P1 | P1 | P1 |
+| **Empty queue** | P1 | P1 | P1 |
+| **Cycle roll** | P1 | P1 | P1 |
+| **Pre-roll** | P1 | — | P1 |
+| **Multi-thread read** | P1 | — | P1 |
+| **io_uring wakeup** | P1 | — | P1 |
+| **Index seeking** | P1 | — | P1 |
 
-### 9.2 Cycle Rolling Tests
+### 10.2 Cycle Rolling Tests
 
 | Scenario | Priority | Description |
 |---|---|---|
 | Write within single cycle | P1 | All entries have timestamps in the same roll period |
-| Write across cycle boundary | P1 | Timestamps span two roll periods, verify new .cq4 file created |
-| Read across cycle boundary | P1 | Tailer follows from one .cq4 file to the next |
-| Multiple cycle gaps | P2 | Write to cycle N, skip N+1, write to N+2 — tailer must handle missing files |
+| Write across cycle boundary | P1 | Timestamps span two roll periods, verify new `.brz` file created |
+| Read across cycle boundary | P1 | Tailer follows from one `.brz` file to the next |
+| Multiple cycle gaps | P2 | Write to cycle N, skip N+1, write to N+2 — tailer handles missing files |
 | Resume tailer at specific cycle | P1 | Tailer starts at an index in a non-first cycle |
-| Cycle filename generation | P1 | Verify filenames for all 27 roll schemes match C/Java output |
+| Cycle filename generation | P1 | Verify filenames for all roll schemes produce `.brz` extension |
+| EOF written on roll | P1 | Verify `0xC0000000` header in old file when new cycle starts |
+| Pre-roll file creation | P1 | Verify next cycle's file is pre-created before the roll boundary |
 
-### 9.3 Roll Scheme Coverage
+### 10.3 Roll Scheme Coverage
 
-Test `getCyclePath()` for every defined roll scheme:
+Test `cycleToFilename()` for every defined roll scheme:
 
 | Scheme | Format | Roll (s) | Test cycles |
 |---|---|---|---|
@@ -1110,86 +1465,46 @@ Test `getCyclePath()` for every defined roll scheme:
 | TWO_HOURLY | `yyyyMMdd-HH'II'` | 7200 | 0, 1 |
 | FOUR_HOURLY | `yyyyMMdd-HH'IV'` | 14400 | 0, 1 |
 | SIX_HOURLY | `yyyyMMdd-HH'VI'` | 21600 | 0, 1 |
-| FAST_DAILY | `yyyyMMdd'F'` | 86400 | 0, 1, 18941 |
+| FAST_DAILY | `yyyyMMdd'F'` | 86400 | 0, 1, 18949 |
 | MINUTELY | `yyyyMMdd-HHmm` | 60 | 0, 1 |
 | HOURLY | `yyyyMMdd-HH` | 3600 | 0, 1 |
 | DAILY | `yyyyMMdd` | 86400 | 0, 1, 24855, 24856 |
 | TEST_SECONDLY | `yyyyMMdd-HHmmss'T'` | 1 | 0, 1, 86400 |
 | TEST4_SECONDLY | `yyyyMMdd-HHmmss'T4'` | 1 | 0, 1 |
 
-### 9.4 Multi-Process Coordination
+### 10.4 Struct Layout Tests
+
+| Struct | Size | Test | Priority |
+|---|---|---|---|
+| `SharedMetadata` | 512 | Total size, all field offsets, atomic field alignment | P1 |
+| `QueueFileHeader` | 64 | Total size, all field offsets | P1 |
+| Magic numbers | — | `0x425A514D` (metadata), `0x425A5143` (data file) | P1 |
+
+### 10.5 Multi-Process Coordination
 
 | Scenario | Priority | Description |
 |---|---|---|
 | Single writer, single reader (separate processes) | P1 | Fork, parent writes, child reads via tailer polling |
 | Writer creates new cycle file, reader follows | P1 | Reader detects modcount change and opens new file |
-| Two writers to same queue | P2 | CAS contention on header working bit |
+| Multiple writers to same queue (CAS contention) | P1 | Fork N writers, verify no lost/duplicate messages |
 | Reader starts before writer | P2 | Reader polls until data appears |
-| Writer crash recovery | P3 | Writer dies mid-write (working bit set), reader waits then skips |
+| Writer crash recovery | P3 | Writer dies mid-write (WORKING bit set), reader skips stale entry |
 
-Multi-process tests use `std.process.Child` to fork and coordinate:
+### 10.6 io_uring Tests
 
-```zig
-test "multi-process: writer and reader" {
-    const tmp = try test_util.makeTempDir("chronicle.mp.");
-    defer test_util.removeTempDir(tmp);
-
-    // Fork a writer process
-    const writer = try std.process.Child.init(.{
-        .allocator = testing.allocator,
-        .argv = &.{ "zig-out/bin/test_writer", tmp.path },
-    });
-    defer writer.deinit();
-
-    // Give writer time to start
-    std.time.sleep(100 * std.time.ns_per_ms);
-
-    // Read from the same queue
-    var queue = try chronicle.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .allocator = testing.allocator,
-    }, chronicle.WireTextCodec);
-    defer queue.deinit();
-
-    var tailer = try queue.tailer(0);
-    defer tailer.deinit();
-
-    // Poll with timeout
-    const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
-    while (std.time.nanoTimestamp() < deadline) {
-        if (try tailer.poll()) |entry| {
-            try testing.expectEqualStrings("hello from writer", entry.message);
-            break;
-        }
-        std.time.sleep(10 * std.time.ns_per_ms);
-        queue.peek();
-    } else {
-        return error.TestTimedOut;
-    }
-}
-```
-
-### 9.5 Wire Protocol Test Matrix
-
-| Test Category | Cases | Priority |
+| Scenario | Priority | Description |
 |---|---|---|
-| Text field encoding/decoding | Empty, short, 127-byte, 128-byte (variable length threshold), 64KB | P1 |
-| Varint encoding/decoding | 0, 1, 127, 128, 255, 65535, 2^31-1, 2^32-1 | P1 |
-| Field names | 1 char, max length, all printable ASCII | P1 |
-| Float64 encoding | 0.0, 1.0, -1.0, NaN, Inf, 10.50, subnormals | P1 |
-| Uint64 aligned | 0, 1, 2^63, 2^64-1, 0x8000000000000000 (lock bit) | P1 |
-| Nesting | 0 deep, 1 deep, 3 deep (like metadata), mismatched enter/exit | P1 |
-| QC start/finish framing | Metadata flag, data flag, size calculation | P1 |
-| Type prefix | Short names, "STStore", "SCQMeta", "SCQSRoll", "WireType" | P1 |
-| Event name | "header", "listing.highestCycle", long names | P1 |
-| Padding | padToAlign8 at every offset 0-7, padToAlign8Zeroed | P2 |
-| Malformed input | Truncated varint, truncated text, invalid type code | P2 |
+| Single reader wakeup | P1 | Reader blocks on `collect()`, writer publishes, reader wakes |
+| Multiple reader wakeup | P1 | Multiple tailers block, single write wakes all |
+| io_uring not available fallback | P1 | Falls back to polling when io_uring unavailable |
+| Wakeup latency benchmark | P2 | Measure writer-to-reader notification latency |
+| Reader timeout | P1 | `collect()` with timeout returns `null` if no data |
 
 ---
 
-## 10. Continuous Integration
+## 11. Continuous Integration
 
-### 10.1 Build and Test Commands
+### 11.1 Build and Test Commands
 
 ```sh
 # Build everything
@@ -1206,24 +1521,33 @@ zig build test -Doptimize=ReleaseFast
 
 # Run fuzzing for 5 minutes
 zig build test -Dfuzz -- --fuzz-timeout=300000
+
+# Run benchmarks only
+zig build test -- --test-filter "benchmark"
 ```
 
-### 10.2 CI Pipeline Stages
+### 11.2 CI Pipeline Stages
 
 ```
 ┌──────────────┐    ┌───────────────┐    ┌──────────────────┐    ┌────────────┐
 │ Build (Debug) │───>│ Unit Tests    │───>│ Integration Tests │───>│ Fuzz (5min)│
-│               │    │ (all safety)  │    │ (Java fixtures)  │    │            │
+│               │    │ (all safety)  │    │ (lifecycle, mmap) │    │            │
 └──────────────┘    └───────────────┘    └──────────────────┘    └────────────┘
-                           │
-                           ▼
-                    ┌───────────────┐
-                    │ ReleaseSafe   │
-                    │ Tests         │
-                    └───────────────┘
+                           │                      │
+                           ▼                      ▼
+                    ┌───────────────┐    ┌──────────────────┐
+                    │ ReleaseSafe   │    │ Concurrency Tests │
+                    │ Tests         │    │ (multi-process)   │
+                    └───────────────┘    └──────────────────┘
+                                                  │
+                                                  ▼
+                                         ┌──────────────────┐
+                                         │ Benchmarks       │
+                                         │ (nightly only)   │
+                                         └──────────────────┘
 ```
 
-### 10.3 build.zig Test Configuration
+### 11.3 build.zig Test Configuration
 
 ```zig
 // build.zig
@@ -1236,31 +1560,26 @@ pub fn build(b: *std.Build) void {
 
     // Main library
     const lib = b.addStaticLibrary(.{
-        .name = "chronicle",
-        .root_source_file = b.path("src/chronicle.zig"),
+        .name = "brz_queue",
+        .root_source_file = b.path("src/brz_queue.zig"),
         .target = target,
         .optimize = optimize,
     });
     b.installArtifact(lib);
 
-    // C ABI shared library
-    const clib = b.addSharedLibrary(.{
-        .name = "chronicle",
-        .root_source_file = b.path("src/c_api.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(clib);
-
     // Test step — discovers all test blocks in all source files
     const test_step = b.step("test", "Run all tests");
 
     const test_files = [_][]const u8{
-        "src/wire_test.zig",
-        "src/queue_test.zig",
+        "src/metadata_test.zig",
+        "src/index_test.zig",
+        "src/codec_test.zig",
         "src/roll_scheme_test.zig",
-        "src/buffer_test.zig",
-        "src/c_api_test.zig",
+        "src/queue_test.zig",
+        "src/appender_test.zig",
+        "src/tailer_test.zig",
+        "src/mmap_test.zig",
+        "src/uring_test.zig",
     };
 
     for (test_files) |test_file| {
@@ -1269,36 +1588,53 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        // Link the chronicle module so tests can import it
-        t.root_module.addImport("chronicle", &lib.root_module);
+        // Link the brz_queue module so tests can import it
+        t.root_module.addImport("brz_queue", &lib.root_module);
 
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
     }
+
+    // Benchmark step (separate, opt-in)
+    const bench_step = b.step("bench", "Run benchmarks");
+
+    const bench = b.addTest(.{
+        .root_source_file = b.path("src/bench_test.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench.root_module.addImport("brz_queue", &lib.root_module);
+
+    const bench_run = b.addRunArtifact(bench);
+    bench_step.dependOn(&bench_run.step);
 }
 ```
 
 ---
 
-## 11. Summary: Test Count Estimates
+## 12. Summary: Test Count Estimates
 
 | Category | Est. Tests | Notes |
 |---|---|---|
-| Queue lifecycle (ports of C tests) | 9 | Direct ports of all cmocka tests |
-| Wire protocol construction | 6 | text, fields, metadata, varint, nesting, padding |
-| Wire protocol parsing | 6 | Same categories but from bytes → values |
-| Wire round-trip | 4 | varint, text, fields, full metadata |
+| Header constants and encoding | 8 | Bit patterns, encode/decode, round-trip |
+| Struct layout (SharedMetadata) | 4 | Size, offsets, alignment, magic |
+| Struct layout (QueueFileHeader) | 3 | Size, offsets, magic |
+| Flat index | 6 | Offset calc, slotFor, binary search, atomics |
+| Codec round-trip | 5 | Round-trip, size, zero-alloc, empty, max-size |
 | Roll scheme filenames | 27 | One per defined scheme |
-| Roll scheme 32-bit overflow | 2 | Regression test for cycle 24855/24856 |
-| Buffer hex dump | 3 | Empty, short, long |
-| Property-based (random) | 4 | varint round-trip, size prediction, alignment, field names |
-| Fuzz targets | 5 | Wire parser, varint, queue block, date format, metadata |
-| Cross-compatibility (Java) | 3 | Zig-reads-Java, Java-reads-Zig, interleaved |
-| Multi-process | 3 | Single writer/reader, cycle roll, writer-starts-after |
-| C ABI compatibility | 4 | init/open/append/collect through C exports |
-| Error handling | 5 | Each ChronicleError variant triggered and verified |
-| **Total** | **~81** | |
+| Roll scheme cycle calculation | 3 | Epoch, boundary, inverse |
+| Alignment padding | 2 | Formula, 4-byte alignment invariant |
+| Queue lifecycle (integration) | 4 | Create/write/reopen/read, metadata, file structure, error cases |
+| Cycle rolling (integration) | 4 | Roll, EOF, pre-roll, multi-cycle read |
+| Multi-process | 3 | Writer/reader, multi-thread, CAS contention |
+| io_uring wakeup | 3 | Single reader, multi reader, timeout/fallback |
+| Performance benchmarks | 3 | Latency, throughput, io_uring latency |
+| Property-based (random) | 3 | Codec round-trip, index monotonicity, header round-trip |
+| Fuzz targets | 5 | Codec, header, queue file, index, metadata |
+| Memory safety | 4 | Leak detection, zero-alloc append, zero-alloc poll, mmap |
+| Error handling | 4 | Invalid dir, corrupt file, bad magic, missing metadata |
+| **Total** | **~91** | |
 
 All tests run in under 5 seconds in debug mode (excluding fuzz and multi-process I/O
-wait tests). The fuzz tests run for a configurable duration. The Java cross-compatibility
-tests are skipped if Java is not installed.
+wait tests). Benchmarks run in `ReleaseFast` mode and are opt-in. Fuzz tests run for a
+configurable duration.

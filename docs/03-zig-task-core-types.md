@@ -3,48 +3,67 @@
 ## Overview
 
 This document specifies the core types, constants, and foundational data structures
-required to reimplement **libchronicle** in Zig. It covers the 4-byte header protocol,
-tailer state machine, roll scheme table, and the two primary structs (`Queue` and `Tailer`).
-All designs follow idiomatic Zig patterns: error unions, optional types, slices, and
-explicit allocator passing.
+for **brz-queue** — a clean-room, high-performance, lock-free, memory-mapped IPC queue
+in Zig. It covers the 4-byte header protocol, tailer state machine, fixed-layout
+`extern struct` file headers, flat inline index, io_uring integration, roll scheme
+table, and the primary structs (`Queue`, `Tailer`, `IoUringContext`).
+
+All designs follow idiomatic Zig patterns: error unions, optional types, slices,
+explicit allocator passing, and comptime generics. No wire protocol (BinaryWire) is
+used — all structures are fixed-layout `extern struct` types that map directly onto
+mmap'd memory with zero parsing overhead.
+
+**Key architectural principles:**
+
+- Single writer, multiple readers. The appender is **not** thread-safe. Tailers are independently thread-safe (no shared mutable state between tailers).
+- Acquire/release atomic ordering (not SeqCst) on all shared fields.
+- Tiered CAS backoff: spin → yield → exponential sleep (capped at 1 ms).
+- Zero allocations on the hot path.
+- File extensions: `.brz` for data files, `metadata.brz` for shared metadata.
+- Pre-roll file creation with `fallocate` for pre-allocation.
 
 ---
 
 ## 1. Header Constants
 
-The Chronicle Queue protocol uses a 4-byte (32-bit) header word before every entry
+The brz-queue protocol uses a 4-byte (32-bit) header word before every entry
 (data or metadata). The top two bits encode the entry type, and the lower 30 bits
-encode a length or PID.
+encode a length.
 
 ### Bit Layout
 
 ```
 bits [29:0]   bit 30    bit 31    meaning
 ─────────────────────────────────────────────────────────
-  0            0         0        HD_UNALLOCATED (0x00000000)
+  0            0         0        UNALLOCATED  (0x00000000)
   size         0         0        data payload (size in bytes)
-  size         1         0        HD_METADATA  (0x40000000)
-  pid          0         1        HD_WORKING   (0x80000000)
-  0            1         1        HD_EOF       (0xC0000000)
+  size         1         0        METADATA     (0x40000000)
+  0            0         1        WORKING      (0x80000000) — lock flag only, no PID
+  0            1         1        EOF          (0xC0000000)
 ```
+
+> **Change from previous design:** `WORKING` is now a simple lock flag. It does
+> not encode a PID in the lower 30 bits. The `workingHeader()` helper takes no
+> arguments.
 
 ### Zig Implementation
 
 ```zig
-// src/chronicle/header.zig
+// src/brz/header.zig
 
-/// The 4-byte Chronicle Queue header constants.
+/// The 4-byte brz-queue header constants.
+/// This struct serves as a namespace — it is never instantiated.
 pub const Header = struct {
     pub const UNALLOCATED: u32 = 0x00000000;
-    pub const WORKING: u32 = 0x80000000;
+    pub const WORKING: u32 = 0x80000000;     // Lock flag only — no PID
     pub const METADATA: u32 = 0x40000000;
     pub const EOF: u32 = 0xC0000000;
 
-    /// Mask to extract the 30-bit length/pid field.
-    pub const MASK_LENGTH: u32 = 0x3FFFFFFF;
+    /// Mask to extract the 30-bit length field.
+    pub const SIZE_MASK: u32 = 0x3FFFFFFF;
 
-    /// Mask to extract the 2-bit meta field (top two bits). Same numeric value as EOF.
-    pub const MASK_META: u32 = 0xC0000000;
+    /// Mask to extract the 2-bit meta field (top two bits).
+    pub const META_MASK: u32 = 0xC0000000;
 
     /// Returns true if the header word represents unallocated space.
     pub inline fn isUnallocated(h: u32) bool {
@@ -53,12 +72,12 @@ pub const Header = struct {
 
     /// Returns the meta-type bits (top 2 bits).
     pub inline fn metaType(h: u32) u32 {
-        return h & MASK_META;
+        return h & META_MASK;
     }
 
-    /// Returns the 30-bit length field.
+    /// Returns the 30-bit data length field.
     pub inline fn dataLength(h: u32) u30 {
-        return @truncate(h & MASK_LENGTH);
+        return @truncate(h & SIZE_MASK);
     }
 
     /// Returns true if this header indicates a writer is actively working.
@@ -86,9 +105,9 @@ pub const Header = struct {
         return METADATA | @as(u32, size);
     }
 
-    /// Build a WORKING header stamped with the given PID (lower 30 bits).
-    pub inline fn workingHeader(pid: u30) u32 {
-        return WORKING | @as(u32, pid);
+    /// Build a WORKING header. No PID — just the lock flag.
+    pub inline fn workingHeader() u32 {
+        return WORKING;
     }
 };
 ```
@@ -99,33 +118,20 @@ pub const Header = struct {
   passes a value that would collide with the meta bits.
 - All functions are `inline` since they are trivial bit operations used in hot paths.
 - The `Header` struct serves as a namespace — it is never instantiated.
+- `workingHeader()` takes no arguments. The old PID-encoded design added complexity
+  without benefit in a single-writer model.
 
 ---
 
 ## 2. Tailer State Enum
 
-In the C implementation, `tailstate_t` is an enum encoding the result of each
-peek/poll cycle. The Zig version uses a proper tagged enum.
-
-### C Reference
-
-```c
-typedef enum {
-    TS_AWAITING_ENTRY,     // 0 — awaiting next entry
-    TS_BUSY,               // 1 — hit working header
-    TS_AWAITING_QUEUEFILE, // 2 — queue file missing, awaiting creation
-    TS_E_STAT,             // 3 — fstat failed
-    TS_E_MMAP,             // 4 — mmap failed (probably fatal)
-    TS_PEEK,               // 5 — not yet polled
-    TS_EXTEND_FAIL,        // 6 — queue file needs extending
-    TS_COLLECTED,          // 7 — a value was collected
-} tailstate_t;
-```
+The tailer state enum encodes the result of each peek/poll cycle. Tailers transition
+between these states as they scan the queue.
 
 ### Zig Implementation
 
 ```zig
-// src/chronicle/tailer.zig
+// src/brz/tailer.zig
 
 /// The state of a tailer after a peek/poll operation.
 pub const TailerState = enum(u8) {
@@ -153,13 +159,19 @@ pub const TailerState = enum(u8) {
             .awaiting_queue_file => "AWAITING_QUEUEFILE",
             .err_stat => "E_STAT",
             .err_mmap => "E_MMAP",
-            .not_yet_polled => "PEEK?",
-            .extend_needed => "EXTEND_FAIL",
+            .not_yet_polled => "NOT_YET_POLLED",
+            .extend_needed => "EXTEND_NEEDED",
             .collected => "COLLECTED",
         };
     }
 };
 ```
+
+> **io_uring integration note:** When a tailer is in `awaiting_entry` state and
+> io_uring is enabled, the tailer registers an `IORING_OP_POLL_ADD` on its eventfd
+> rather than busy-spinning. The `IoUringContext` (see section 13) manages this
+> wakeup mechanism. When the appender writes a new entry, it signals the eventfd,
+> causing all waiting tailers to wake and re-poll.
 
 ### Parse Queue Block State
 
@@ -187,8 +199,8 @@ pub const ParseBlockState = enum(u8) {
 
 ## 3. Collected Value Struct
 
-The `collected_t` struct is used by the synchronous `chronicle_collect` API to
-return a parsed message, its size, and its 64-bit index.
+The `Collected` struct is used by the synchronous read API to return a parsed
+message, its size, and its 64-bit index.
 
 ### Zig Implementation
 
@@ -198,14 +210,14 @@ pub fn Collected(comptime T: type) type {
     return struct {
         /// The deserialized message object.
         msg: ?T = null,
-        /// The raw size of the wire payload in bytes.
+        /// The raw size of the payload in bytes.
         size: usize = 0,
-        /// The 64-bit chronicle index (upper 32 = cycle, lower 32 = seqnum).
+        /// The 64-bit index (upper 32 = cycle, lower 32 = seqnum).
         index: u64 = 0,
     };
 }
 
-/// When using opaque/untyped messages (equivalent to C's `void* msg`):
+/// When using opaque/untyped messages (raw byte-slice access):
 pub const RawCollected = struct {
     msg: ?[]const u8 = null,
     size: usize = 0,
@@ -218,31 +230,21 @@ pub const RawCollected = struct {
 - The generic `Collected(T)` pattern allows type-safe collection when the message
   type is known at compile time.
 - `RawCollected` is the untyped equivalent for raw byte-slice access.
+- In the common zero-copy case, `msg` points directly into the mmap buffer.
 
 ---
 
-## 4. Function Pointer Types (Codec Interface)
+## 4. Codec Interface (Comptime Generics)
 
-The C library uses five function pointer typedefs to plug in custom serialization:
-
-| C typedef     | Purpose                                      |
-|---------------|----------------------------------------------|
-| `cparse_f`    | Deserialize bytes → user object              |
-| `cparsefree_f`| Free a deserialized object                   |
-| `csizeof_f`   | Return serialized size of user object        |
-| `cappend_f`   | Serialize user object into byte buffer       |
-| `cdispatch_f` | Deliver (index, object) to application code  |
+The codec defines how to serialize and deserialize messages. No wire protocol is
+used — the codec works directly on raw byte slices from the mmap buffer.
 
 ### Zig Approach: Comptime Interface
 
-Rather than using raw function pointers, Zig's idiomatic pattern is a comptime
-interface (sometimes called a "duck-typed generic" or vtable pattern). This gives
-us type safety and potential inlining.
-
 ```zig
-// src/chronicle/codec.zig
+// src/brz/codec.zig
 
-/// A Codec defines how to serialize and deserialize messages for a Chronicle Queue.
+/// A Codec defines how to serialize and deserialize messages for brz-queue.
 /// Implement this interface on your message type.
 ///
 /// Example:
@@ -265,7 +267,6 @@ pub fn Codec(comptime T: type) type {
 }
 
 /// A Dispatcher receives decoded messages from a tailer.
-/// Equivalent to C's cdispatch_f + DISPATCH_CTX.
 pub fn Dispatcher(comptime MessageType: type) type {
     return struct {
         pub const DispatchFn = *const fn (ctx: *anyopaque, index: u64, msg: MessageType) DispatchAction;
@@ -288,13 +289,36 @@ pub const DispatchAction = enum {
 };
 ```
 
+### Default Raw Codec
+
+A built-in codec that treats payloads as opaque byte slices with zero-copy semantics:
+
+```zig
+pub const DefaultRawCodec = struct {
+    pub const Message = []const u8;
+
+    /// Zero-copy parse: returns a slice directly into the mmap buffer.
+    pub fn parse(data: []const u8) ?Message {
+        return data;
+    }
+
+    pub fn encodedSize(msg: Message) usize {
+        return msg.len;
+    }
+
+    pub fn write(buf: []u8, msg: Message) void {
+        @memcpy(buf[0..msg.len], msg);
+    }
+};
+```
+
 ### Alternative: Runtime Vtable
 
 If runtime polymorphism is needed (e.g., swapping codecs without recompilation),
 use a vtable struct with function pointers:
 
 ```zig
-/// Runtime-polymorphic codec using function pointers (mirrors the C design).
+/// Runtime-polymorphic codec using function pointers.
 pub const RuntimeCodec = struct {
     parse_fn: *const fn (data: [*]const u8, len: usize) ?*anyopaque,
     free_fn: ?*const fn (obj: *anyopaque) void,
@@ -319,52 +343,18 @@ pub const RuntimeCodec = struct {
 };
 ```
 
-### Default Text Codec
-
-The C library provides a default codec that treats payloads as opaque bytes (or
-extracts text via wire parsing). Provide a built-in equivalent:
-
-```zig
-pub const DefaultTextCodec = struct {
-    pub const Message = []const u8;
-
-    pub fn parse(data: []const u8) ?Message {
-        return data;
-    }
-
-    pub fn encodedSize(msg: Message) usize {
-        return msg.len;
-    }
-
-    pub fn write(buf: []u8, msg: Message) void {
-        @memcpy(buf[0..msg.len], msg);
-    }
-};
-```
-
 ---
 
 ## 5. Roll Scheme Table
 
-Chronicle Queue rolls (rotates) its data files on a schedule. Each roll scheme
-defines: a name, a Java date format string, a roll period, and index parameters.
-
-### C Reference (27 schemes)
-
-```c
-struct ROLL_SCHEME {
-    char*    name;
-    char*    formatstr;       // Java SimpleDateFormat pattern
-    uint32_t roll_length_secs;
-    uint32_t entries;         // index_count
-    uint32_t index;           // index_spacing
-};
-```
+brz-queue rolls (rotates) its data files on a schedule. Each roll scheme defines:
+a name, a Java date format string (used for filename generation), a roll period,
+and index parameters.
 
 ### Zig Implementation
 
 ```zig
-// src/chronicle/roll.zig
+// src/brz/roll.zig
 
 pub const RollScheme = struct {
     name: []const u8,
@@ -372,9 +362,9 @@ pub const RollScheme = struct {
     format_str: []const u8,
     /// Roll period in seconds.
     roll_length_secs: u32,
-    /// Number of entries per index page (index_count).
+    /// Number of index entries per queue file.
     index_count: u32,
-    /// Spacing between indexed entries (index_spacing).
+    /// Spacing between indexed entries (every Nth entry is indexed).
     index_spacing: u32,
 
     /// Roll period in milliseconds (what the queue stores internally).
@@ -383,10 +373,9 @@ pub const RollScheme = struct {
     }
 };
 
-/// Complete table of known roll schemes.
-/// Order matches the C implementation for compatibility.
+/// Complete table of known roll schemes (27 entries).
 pub const roll_schemes = [_]RollScheme{
-    // ── In use by cq5 ──────────────────────────────────────────────────────────
+    // ── Sub-hourly ──────────────────────────────────────────────────────────
     .{ .name = "FIVE_MINUTELY",          .format_str = "yyyyMMdd-HHmm'V'",     .roll_length_secs = 5 * 60,       .index_count = 2048,   .index_spacing = 256 },
     .{ .name = "TEN_MINUTELY",           .format_str = "yyyyMMdd-HHmm'X'",     .roll_length_secs = 10 * 60,      .index_count = 2048,   .index_spacing = 256 },
     .{ .name = "TWENTY_MINUTELY",        .format_str = "yyyyMMdd-HHmm'XX'",    .roll_length_secs = 20 * 60,      .index_count = 2048,   .index_spacing = 256 },
@@ -396,21 +385,21 @@ pub const roll_schemes = [_]RollScheme{
     .{ .name = "FOUR_HOURLY",            .format_str = "yyyyMMdd-HH'IV'",      .roll_length_secs = 4 * 3600,     .index_count = 4096,   .index_spacing = 256 },
     .{ .name = "SIX_HOURLY",             .format_str = "yyyyMMdd-HH'VI'",      .roll_length_secs = 6 * 3600,     .index_count = 4096,   .index_spacing = 256 },
     .{ .name = "FAST_DAILY",             .format_str = "yyyyMMdd'F'",           .roll_length_secs = 86400,        .index_count = 4096,   .index_spacing = 256 },
-    // ── Historical cq4 ─────────────────────────────────────────────────────────
+    // ── Standard ────────────────────────────────────────────────────────────
     .{ .name = "MINUTELY",               .format_str = "yyyyMMdd-HHmm",        .roll_length_secs = 60,           .index_count = 2048,   .index_spacing = 16 },
     .{ .name = "HOURLY",                 .format_str = "yyyyMMdd-HH",          .roll_length_secs = 3600,         .index_count = 4096,   .index_spacing = 16 },
     .{ .name = "DAILY",                  .format_str = "yyyyMMdd",             .roll_length_secs = 86400,        .index_count = 8192,   .index_spacing = 64 },
-    // ── Large / minimal roll ────────────────────────────────────────────────────
+    // ── Large / minimal roll ────────────────────────────────────────────────
     .{ .name = "LARGE_HOURLY",           .format_str = "yyyyMMdd-HH'L'",       .roll_length_secs = 3600,         .index_count = 8192,   .index_spacing = 64 },
     .{ .name = "LARGE_DAILY",            .format_str = "yyyyMMdd'L'",           .roll_length_secs = 86400,        .index_count = 32768,  .index_spacing = 128 },
     .{ .name = "XLARGE_DAILY",           .format_str = "yyyyMMdd'X'",           .roll_length_secs = 86400,        .index_count = 32768,  .index_spacing = 256 },
     .{ .name = "HUGE_DAILY",             .format_str = "yyyyMMdd'H'",           .roll_length_secs = 86400,        .index_count = 32768,  .index_spacing = 1024 },
-    // ── Small / test ────────────────────────────────────────────────────────────
+    // ── Small / sparse ──────────────────────────────────────────────────────
     .{ .name = "SMALL_DAILY",            .format_str = "yyyyMMdd'S'",           .roll_length_secs = 86400,        .index_count = 8192,   .index_spacing = 8 },
     .{ .name = "LARGE_HOURLY_SPARSE",    .format_str = "yyyyMMdd-HH'LS'",      .roll_length_secs = 3600,         .index_count = 4096,   .index_spacing = 1024 },
     .{ .name = "LARGE_HOURLY_XSPARSE",   .format_str = "yyyyMMdd-HH'LX'",     .roll_length_secs = 3600,         .index_count = 2048,   .index_spacing = 1048576 },
     .{ .name = "HUGE_DAILY_XSPARSE",     .format_str = "yyyyMMdd'HX'",         .roll_length_secs = 86400,        .index_count = 16384,  .index_spacing = 1048576 },
-    // ── Test / benchmark ────────────────────────────────────────────────────────
+    // ── Test / benchmark ────────────────────────────────────────────────────
     .{ .name = "TEST_SECONDLY",          .format_str = "yyyyMMdd-HHmmss'T'",   .roll_length_secs = 1,            .index_count = 32768,  .index_spacing = 4 },
     .{ .name = "TEST4_SECONDLY",         .format_str = "yyyyMMdd-HHmmss'T4'",  .roll_length_secs = 1,            .index_count = 32,     .index_spacing = 4 },
     .{ .name = "TEST_HOURLY",            .format_str = "yyyyMMdd-HH'T'",       .roll_length_secs = 3600,         .index_count = 16,     .index_spacing = 4 },
@@ -437,18 +426,14 @@ pub fn findSchemeByFormat(format_str: []const u8) ?RollScheme {
 }
 ```
 
-> **Note on C values:** The C code uses expressions like `2<<10` which equals 2048
-> (not 1024). This is `2 * (1 << 10)` = `2 * 1024`. The Zig table uses the
-> evaluated constants for clarity.
-
 ---
 
 ## 6. Java Date Format → strftime Conversion
 
-Chronicle Queue stores Java `SimpleDateFormat` patterns like `"yyyyMMdd-HH'F'"`.
-These must be converted to C `strftime` patterns for filename generation. The C
-function `chronicle_apply_roll_scheme` does this conversion, and also strips
-single-quoted literals.
+brz-queue uses Java `SimpleDateFormat` patterns (e.g. `"yyyyMMdd-HH'F'"`) from
+the roll scheme table for filename generation. These must be converted to
+`strftime` patterns. Since all format strings are comptime-known constants, the
+conversion can happen entirely at comptime.
 
 ### Conversion Table
 
@@ -465,12 +450,8 @@ single-quoted literals.
 
 ### Zig Implementation
 
-The C code converts at runtime into a heap-allocated string. In Zig, since all
-format strings are comptime-known constants from the roll scheme table, we can
-do this conversion at comptime and avoid any allocation:
-
 ```zig
-// src/chronicle/roll.zig (continued)
+// src/brz/roll.zig (continued)
 
 pub const ConversionError = error{
     UnrecognizedToken,
@@ -496,7 +477,6 @@ pub fn javaFormatToStrftime(
 
     while (fi < java_fmt.len) {
         if (in_quote and java_fmt[fi] != '\'') {
-            // Inside quoted literal — copy verbatim to both outputs
             if (si >= strftime_buf.len or ci >= clean_buf.len) return ConversionError.BufferOverflow;
             strftime_buf[si] = java_fmt[fi];
             si += 1;
@@ -575,7 +555,7 @@ pub fn javaFormatToStrftime(
 }
 
 /// Comptime version: returns a struct with the two format strings as comptime slices.
-/// Use this when the Java format is a comptime-known constant.
+/// Use this when the Java format is a comptime-known constant (i.e. from the roll table).
 pub fn comptimeJavaToStrftime(comptime java_fmt: []const u8) struct {
     strftime_fmt: []const u8,
     clean_fmt: []const u8,
@@ -586,7 +566,6 @@ pub fn comptimeJavaToStrftime(comptime java_fmt: []const u8) struct {
         const result = javaFormatToStrftime(java_fmt, &strftime_buf, &clean_buf) catch |err| {
             @compileError(@tagName(err) ++ " in format: " ++ java_fmt);
         };
-        // Copy to comptime-persistent arrays
         const sf = result.strftime;
         const cl = result.clean;
         return .{
@@ -599,11 +578,11 @@ pub fn comptimeJavaToStrftime(comptime java_fmt: []const u8) struct {
 
 ### Filename Generation
 
-The C function `chronicle_get_cycle_fn` converts a cycle number to a filename:
+Generate the `.brz` filename for a given cycle number:
 
 ```zig
-/// Generate the .cq4 filename for a given cycle number.
-/// cycle * roll_length_ms / 1000 = seconds since epoch → format with strftime.
+/// Generate the .brz filename for a given cycle number.
+/// cycle * roll_length_ms / 1000 = seconds since epoch → format with strftime pattern.
 pub fn getCycleFn(
     allocator: std.mem.Allocator,
     dirname: []const u8,
@@ -618,14 +597,10 @@ pub fn getCycleFn(
     const month_day = year_day.calculateMonthDay();
     const day_secs = epoch_seconds.getDaySeconds();
 
-    // Use std.fmt to build "dirname/FORMATTED_DATE.cq4"
-    // For strftime interop, we may need to call the C strftime via @cImport
-    // or reimplement the limited subset we need.
-    //
-    // A practical approach: since we only need %Y %m %d %H %M %S and literals,
-    // we can build the string directly:
+    // Since we only need %Y %m %d %H %M %S and literals,
+    // build the string directly without calling libc strftime.
     var date_buf: [64]u8 = undefined;
-    const date_str = formatChronicleDate(
+    const date_str = formatDate(
         &date_buf,
         strftime_pattern,
         year_day.year,
@@ -636,7 +611,7 @@ pub fn getCycleFn(
         day_secs.getSecondsIntoMinute(),
     );
 
-    return std.fmt.allocPrint(allocator, "{s}/{s}.cq4", .{ dirname, date_str });
+    return std.fmt.allocPrint(allocator, "{s}/{s}.brz", .{ dirname, date_str });
 }
 ```
 
@@ -673,14 +648,14 @@ test "java format conversion" {
 
 ## 7. 64-Bit Index Layout
 
-Chronicle indices are 64-bit values with the cycle in the upper bits and the
-sequence number in the lower bits.
+Indices are 64-bit values with the cycle in the upper 32 bits and the
+sequence number in the lower 32 bits.
 
 ```zig
-// src/chronicle/index.zig
+// src/brz/index.zig
 
 pub const Index = struct {
-    /// Number of bits to shift for the cycle. Always 32 in current implementations.
+    /// Number of bits to shift for the cycle. Always 32.
     pub const cycle_shift: u6 = 32;
 
     /// Mask to extract the sequence number (lower 32 bits).
@@ -715,44 +690,219 @@ pub const Index = struct {
 
 ---
 
-## 8. Queue Struct
+## 8. Fixed-Layout File Structures
 
-The `queue_t` struct is the central handle for a Chronicle Queue instance.
+This is a key architectural element of brz-queue. Instead of a wire protocol that
+requires parsing, all file headers are **fixed-layout `extern struct` types** that
+map directly onto mmap'd memory. To read a field, cast the mmap pointer to the
+struct type and access the field — zero parsing, zero allocation.
 
-### C Reference (abbreviated)
+### SharedMetadata (512 bytes)
 
-The C struct contains: dirname, blocksize, version, create flag, directory listing
-mmap state, glob of queue files, cycle tracking, roll config, index config,
-codec function pointers, tailer linked list, appender, and a global next pointer.
+The shared metadata file (`metadata.brz`) is memory-mapped and shared between the
+writer and all readers. Atomic fields are accessed with acquire/release ordering.
+
+```zig
+// src/brz/metadata.zig
+
+pub const SharedMetadata = extern struct {
+    /// Magic number: "BZQM" (0x425A514D).
+    magic: u32 = 0x425A514D,
+    /// Format version.
+    version: u16 = 1,
+    /// Reserved flags.
+    flags: u16 = 0,
+    /// Roll period in seconds (from roll scheme).
+    roll_length_secs: u32,
+    /// Index spacing (from roll scheme).
+    index_spacing: u32,
+    /// Index count per queue file (from roll scheme).
+    index_count: u32,
+    /// Roll epoch in milliseconds since Unix epoch (usually 0).
+    epoch_ms: u64,
+    /// Highest cycle number written. Accessed atomically (acquire/release).
+    highest_cycle: u64 align(8),
+    /// Lowest cycle number still available. Accessed atomically (acquire/release).
+    lowest_cycle: u64 align(8),
+    /// Monotonically increasing modification counter. Accessed atomically.
+    modcount: u64 align(8),
+    /// Write lock (0 = unlocked, non-zero = locked). CAS with tiered backoff.
+    write_lock: u64 align(8),
+    /// Reserved for future use. Pads struct to exactly 512 bytes.
+    _reserved: [448]u8 = [_]u8{0} ** 448,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SharedMetadata) == 512);
+}
+```
+
+**Usage pattern:**
+
+```zig
+// Map the metadata file
+const meta_mmap = try std.posix.mmap(null, 512, PROT.READ | PROT.WRITE, .{ .TYPE = .SHARED }, meta_fd, 0);
+const metadata: *SharedMetadata = @ptrCast(@alignCast(meta_mmap.ptr));
+
+// Read highest cycle with acquire ordering
+const hc = @atomicLoad(u64, &metadata.highest_cycle, .acquire);
+
+// Update highest cycle with release ordering
+@atomicStore(u64, &metadata.highest_cycle, new_cycle, .release);
+
+// Increment modcount with atomic RMW
+_ = @atomicRmw(u64, &metadata.modcount, .Add, 1, .release);
+```
+
+### QueueFileHeader (64 bytes)
+
+Each `.brz` data file starts with a 64-byte fixed header, followed by the index
+region, followed by the data region.
+
+```zig
+// src/brz/metadata.zig (continued)
+
+pub const QueueFileHeader = extern struct {
+    /// Magic number: "BZQC" (0x425A5143).
+    magic: u32 = 0x425A5143,
+    /// Format version.
+    version: u16 = 1,
+    /// Reserved flags.
+    flags: u16 = 0,
+    /// Roll period in seconds (redundant with metadata, for standalone validation).
+    roll_length_secs: u32,
+    /// Index spacing.
+    index_spacing: u32,
+    /// Index count (number of u64 slots in the index region).
+    index_count: u32,
+    /// Roll epoch in milliseconds since Unix epoch.
+    epoch_ms: u64,
+    /// Cycle number this file represents.
+    created_cycle: u32,
+    /// Reserved for future use. Pads struct to exactly 64 bytes.
+    _reserved: [28]u8 = [_]u8{0} ** 28,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(QueueFileHeader) == 64);
+}
+```
+
+**File layout:**
+
+```
+Offset 0                    → QueueFileHeader (64 bytes)
+Offset 64                   → Index region (index_count × 8 bytes)
+Offset 64 + index_count × 8 → Data region (entries with 4-byte headers)
+```
+
+### How Fixed Layouts Eliminate Parsing
+
+In a traditional wire-protocol design, reading a header requires:
+1. Read tag bytes to identify the field
+2. Read length prefix
+3. Decode the value
+4. Repeat for each field
+
+With `extern struct`, the layout is fixed at compile time. The compiler knows the
+exact byte offset of every field. Reading `metadata.highest_cycle` compiles down
+to a single memory load at a known offset — no branching, no parsing, no allocation.
+
+---
+
+## 9. Flat Index Region Types
+
+The index region is a flat array of `u64` entries embedded directly in the queue
+file, between the `QueueFileHeader` and the data region. Each index slot maps
+to a sequence number range and stores the byte offset of the corresponding entry
+in the data region.
+
+```zig
+// src/brz/index.zig (continued)
+
+pub const IndexRegion = struct {
+    /// Pointer to the base of the index array in the mmap'd file.
+    entries: [*]align(8) volatile u64,
+    /// Number of index slots.
+    count: u32,
+    /// Every Nth entry is indexed (index_spacing from roll scheme).
+    spacing: u32,
+
+    /// Compute which index slot a given sequence number maps to.
+    /// Returns null if the seqnum doesn't align to a slot boundary
+    /// or exceeds the index capacity.
+    pub inline fn slotFor(self: IndexRegion, seqnum: u32) ?u32 {
+        if (self.spacing == 0) return null;
+        const slot = seqnum / self.spacing;
+        if (slot >= self.count) return null;
+        // Only exact multiples of spacing get indexed
+        if (seqnum % self.spacing != 0) return null;
+        return slot;
+    }
+
+    /// Look up the data-region byte offset stored in the given index slot.
+    /// Returns null if the slot contains 0 (not yet written).
+    pub inline fn lookup(self: IndexRegion, slot: u32) ?u64 {
+        if (slot >= self.count) return null;
+        const val = @atomicLoad(u64, &self.entries[slot], .acquire);
+        if (val == 0) return null;
+        return val;
+    }
+
+    /// Store a data-region byte offset into the given index slot.
+    pub inline fn store(self: IndexRegion, slot: u32, offset: u64) void {
+        if (slot >= self.count) return;
+        @atomicStore(u64, &self.entries[slot], offset, .release);
+    }
+
+    /// Compute the byte offset where the data region starts (after the index).
+    /// This is relative to the start of the file.
+    pub inline fn dataRegionOffset(self: IndexRegion) u64 {
+        return @sizeOf(QueueFileHeader) + @as(u64, self.count) * @sizeOf(u64);
+    }
+
+    /// Initialize an IndexRegion from a mapped queue file.
+    pub fn fromMmap(mmap_base: [*]align(std.mem.page_size) u8, header: *const QueueFileHeader) IndexRegion {
+        const index_base = mmap_base + @sizeOf(QueueFileHeader);
+        return .{
+            .entries = @ptrCast(@alignCast(index_base)),
+            .count = header.index_count,
+            .spacing = header.index_spacing,
+        };
+    }
+};
+```
+
+**Advantages of the flat index:**
+
+- No separate index file — the index is inline in the data file.
+- Trivial to mmap alongside the data region.
+- Lock-free reads via atomic loads.
+- Cache-friendly linear layout.
+
+---
+
+## 10. Queue Struct
+
+The `Queue` struct is the central handle for a brz-queue instance.
 
 ### Zig Implementation
 
 ```zig
-// src/chronicle/queue.zig
+// src/brz/queue.zig
 
 const std = @import("std");
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const Header = @import("header.zig").Header;
 const Index = @import("index.zig").Index;
+const IndexRegion = @import("index.zig").IndexRegion;
 const TailerState = @import("tailer.zig").TailerState;
 const RollScheme = @import("roll.zig").RollScheme;
-
-/// Pointers into the memory-mapped directory listing for live-updated fields.
-pub const DirlistFields = struct {
-    /// Pointer to the 8-byte highest_cycle value in the mmap.
-    highest_cycle: ?[*]align(1) volatile u64 = null,
-    /// Pointer to the 8-byte lowest_cycle value in the mmap.
-    lowest_cycle: ?[*]align(1) volatile u64 = null,
-    /// Pointer to the 8-byte modcount value in the mmap (atomically incremented).
-    modcount: ?[*]align(1) volatile u64 = null,
-};
-
-/// Queue version (v5 format).
-pub const QueueVersion = enum(u8) {
-    unset = 0,
-    v5 = 5,
-};
+const SharedMetadata = @import("metadata.zig").SharedMetadata;
+const QueueFileHeader = @import("metadata.zig").QueueFileHeader;
+const IoUringContext = @import("uring.zig").IoUringContext;
 
 pub const Queue = struct {
     allocator: Allocator,
@@ -764,29 +914,18 @@ pub const Queue = struct {
     // ── Configuration ───────────────────────────────────────────────────────
     /// Block size for mmap windows. Must be a power of two. Default: 1 MiB.
     blocksize: u32 = 1024 * 1024,
-    /// Queue format version.
-    version: QueueVersion = .unset,
     /// Whether this queue has permission to create new files.
     create: bool = false,
 
-    // ── Directory Listing ───────────────────────────────────────────────────
-    /// Filename of the directory listing file.
-    /// Filename is "metadata.cq4t".
-    dirlist_name: ?[]const u8 = null,
-    /// File descriptor for the directory listing.
-    dirlist_fd: ?std.posix.fd_t = null,
-    /// Size of the directory listing file (from fstat).
-    dirlist_file_size: u64 = 0,
-    /// Memory-mapped buffer for the directory listing.
-    dirlist_mmap: ?[]align(std.mem.page_size) u8 = null,
-    /// Pointers into the mmap for live-updated fields.
-    dirlist_fields: DirlistFields = .{},
+    // ── Shared Metadata (replaces dirlist_* fields) ─────────────────────────
+    /// File descriptor for metadata.brz.
+    metadata_fd: ?posix.fd_t = null,
+    /// Memory-mapped region for metadata.brz (512 bytes).
+    metadata_mmap: ?[]align(std.mem.page_size) u8 = null,
+    /// Typed pointer into the mmap — cast of metadata_mmap. Zero-cost access.
+    metadata: ?*SharedMetadata = null,
 
-    // ── Queue file tracking ─────────────────────────────────────────────────
-    /// Glob pattern for finding .cq4 files.
-    queuefile_pattern: ?[]const u8 = null,
-
-    // ── Cycle tracking (observed from directory listing) ────────────────────
+    // ── Cycle tracking (cache of metadata atomics) ──────────────────────────
     highest_cycle: u64 = 0,
     lowest_cycle: u64 = 0,
     modcount: u64 = 0,
@@ -813,10 +952,20 @@ pub const Queue = struct {
     /// Always 0x00000000FFFFFFFF.
     seqnum_mask: u64 = Index.seqnum_mask,
 
+    // ── Pre-roll (next-cycle file pre-creation) ─────────────────────────────
+    /// File descriptor for the pre-rolled next-cycle file (or null).
+    preroll_fd: ?posix.fd_t = null,
+    /// Memory-mapped buffer for the pre-rolled file (or null).
+    preroll_mmap: ?[]align(std.mem.page_size) u8 = null,
+
+    // ── io_uring ────────────────────────────────────────────────────────────
+    /// io_uring context for tailer wakeup notifications.
+    uring_ctx: ?*IoUringContext = null,
+
     // ── Tailers ─────────────────────────────────────────────────────────────
     /// All reader tailers attached to this queue.
     tailers: std.ArrayList(*Tailer),
-    /// The shared appender tailer (created lazily on first append).
+    /// The appender (created lazily on first append). NOT thread-safe.
     appender: ?*Tailer = null,
 
     // ── Error state ─────────────────────────────────────────────────────────
@@ -836,7 +985,6 @@ pub const Queue = struct {
 
     /// Apply a roll scheme to this queue.
     pub fn setRollScheme(self: *Queue, scheme: RollScheme) !void {
-        // Free old strings if any
         if (self.roll_name) |n| self.allocator.free(n);
         if (self.roll_format) |f| self.allocator.free(f);
         if (self.roll_strftime) |s| self.allocator.free(s);
@@ -871,8 +1019,7 @@ pub const Queue = struct {
 
     /// Get current wall-clock time in milliseconds since Unix epoch.
     pub fn clockMs(_: *const Queue) i64 {
-        const ts = std.time.milliTimestamp();
-        return ts;
+        return std.time.milliTimestamp();
     }
 
     /// Release all resources.
@@ -891,17 +1038,30 @@ pub const Queue = struct {
             self.appender = null;
         }
 
-        // Unmap directory listing
-        if (self.dirlist_mmap) |m| {
-            std.posix.munmap(m);
+        // Tear down io_uring context
+        if (self.uring_ctx) |ctx| {
+            ctx.deinit();
+            self.allocator.destroy(ctx);
+            self.uring_ctx = null;
         }
-        if (self.dirlist_fd) |fd| {
-            std.posix.close(fd);
+
+        // Unmap and close pre-roll file
+        if (self.preroll_mmap) |m| {
+            posix.munmap(m);
+        }
+        if (self.preroll_fd) |fd| {
+            posix.close(fd);
+        }
+
+        // Unmap and close shared metadata
+        if (self.metadata_mmap) |m| {
+            posix.munmap(m);
+        }
+        if (self.metadata_fd) |fd| {
+            posix.close(fd);
         }
 
         // Free strings
-        if (self.dirlist_name) |n| self.allocator.free(n);
-        if (self.queuefile_pattern) |p| self.allocator.free(p);
         if (self.roll_format) |f| self.allocator.free(f);
         if (self.roll_name) |n| self.allocator.free(n);
         if (self.roll_strftime) |s| self.allocator.free(s);
@@ -912,32 +1072,34 @@ pub const Queue = struct {
 };
 ```
 
-### Key Differences from C
+### Key Design Decisions
 
-| C pattern | Zig pattern |
-|-----------|-------------|
-| `char*` strings with `strdup`/`free` | `[]const u8` slices with `allocator.dupe`/`allocator.free` |
-| `NULL` pointers | Optional types (`?[]const u8`, `?*Tailer`) |
-| `bzero` + `malloc` | `allocator.create` + struct literal with defaults |
-| Global `queue_head` linked list | Not needed — see section 10 below |
-| `glob_t` for file discovery | `std.fs.Dir.iterate()` or `std.fs.Dir.openDir` |
-| `int fd` (0 is valid) | `std.posix.fd_t` wrapped in optional |
-| `struct stat` | `std.posix.Stat` or just store the size field |
+| Aspect | Design |
+|--------|--------|
+| Shared metadata | Single `*SharedMetadata` pointer cast from mmap — replaces `DirlistFields` and all `dirlist_*` fields |
+| Pre-roll | `preroll_fd` + `preroll_mmap` for the next-cycle file, created ahead of time via `fallocate` |
+| io_uring | `uring_ctx` field for tailer wakeup — optional, set to null when not using io_uring |
+| Writer model | Single writer — appender is NOT thread-safe, no lock needed for append path |
+| Reader model | Multiple readers — each tailer is independently thread-safe, no shared mutable state between tailers |
+| String storage | `[]const u8` slices with `allocator.dupe`/`allocator.free` |
+| Optional types | `?[]const u8`, `?*Tailer`, `?posix.fd_t` instead of sentinel values |
 
 ---
 
-## 9. Tailer Struct
+## 11. Tailer Struct
 
-The `tailer_t` struct tracks the state of a single reader (or the appender) as it
+The `Tailer` struct tracks the state of a single reader (or the appender) as it
 scans through queue files.
 
 ### Zig Implementation
 
 ```zig
-// src/chronicle/tailer.zig (continued)
+// src/brz/tailer.zig (continued)
 
 const std = @import("std");
+const posix = std.posix;
 const Queue = @import("queue.zig").Queue;
+const IoUringContext = @import("uring.zig").IoUringContext;
 
 pub const MmapProtection = enum {
     read_only,
@@ -966,14 +1128,14 @@ pub const Tailer = struct {
     /// Filename of the currently open queue file.
     qf_filename: ?[]const u8 = null,
     /// File descriptor of the currently open queue file.
-    qf_fd: ?std.posix.fd_t = null,
+    qf_fd: ?posix.fd_t = null,
     /// Cached file size from fstat.
     qf_file_size: u64 = 0,
 
     // ── Position tracking ───────────────────────────────────────────────────
     /// Byte offset of the next header to read (from start of file).
     qf_tip: u64 = 0,
-    /// Sequence-number portion of the next entry at qf_tip.
+    /// 64-bit index of the next entry at qf_tip.
     qf_index: u64 = 0,
 
     // ── mmap window ─────────────────────────────────────────────────────────
@@ -984,24 +1146,50 @@ pub const Tailer = struct {
     /// Size of the current mmap window.
     qf_mmapsz: u64 = 0,
 
+    // ── io_uring wakeup ─────────────────────────────────────────────────────
+    /// Per-tailer eventfd for io_uring wakeup (or null if polling).
+    wakeup_eventfd: ?posix.fd_t = null,
+    /// Whether this tailer is currently registered for io_uring wakeup.
+    uring_registered: bool = false,
+
     // ── Parent ──────────────────────────────────────────────────────────────
     /// Back-pointer to the owning queue.
     queue: *Queue,
 
-    /// Clean up this tailer's resources (close fd, unmap).
+    /// Clean up this tailer's resources (close fd, unmap, deregister io_uring).
     pub fn deinit(self: *Tailer) void {
+        // Deregister from io_uring if active
+        if (self.uring_registered) {
+            if (self.queue.uring_ctx) |ctx| {
+                ctx.deregisterTailer(self);
+            }
+            self.uring_registered = false;
+        }
+
+        // Close wakeup eventfd
+        if (self.wakeup_eventfd) |efd| {
+            posix.close(efd);
+            self.wakeup_eventfd = null;
+        }
+
+        // Unmap queue file
         if (self.qf_buf) |buf| {
-            std.posix.munmap(buf);
+            posix.munmap(buf);
             self.qf_buf = null;
         }
+
+        // Close queue file fd
         if (self.qf_fd) |fd| {
-            std.posix.close(fd);
+            posix.close(fd);
             self.qf_fd = null;
         }
+
+        // Free filename
         if (self.qf_filename) |fn_slice| {
             self.queue.allocator.free(fn_slice);
             self.qf_filename = null;
         }
+
         self.queue.allocator.destroy(self);
     }
 
@@ -1017,119 +1205,177 @@ pub const Tailer = struct {
 };
 ```
 
-### Key Differences from C
+### Thread Safety Notes
 
-| C pattern | Zig pattern |
-|-----------|-------------|
-| Doubly-linked list (`next`/`prev`) | `std.ArrayList(*Tailer)` on the Queue |
-| `PROT_READ` / `PROT_READ\|PROT_WRITE` | `MmapProtection` enum |
-| `int qf_fd` with 0 = closed | `?std.posix.fd_t` (null = closed) |
-| `unsigned char* qf_buf` | `?[]align(page_size) u8` |
-| `struct stat qf_statbuf` | Store just `qf_file_size: u64` |
+- **Appender (write tailer):** NOT thread-safe. Only one thread may append at a time.
+  The single-writer model eliminates the need for CAS on the write path except for
+  the 4-byte header transition (UNALLOCATED → WORKING → data header).
+- **Reader tailers:** Each tailer is independently thread-safe — it has its own mmap
+  window, tip, index, and state. No mutable state is shared between tailers. Multiple
+  tailers can read the same queue concurrently from different threads.
+- **Shared metadata access:** Tailers read `highest_cycle` and `modcount` from the
+  shared metadata file using atomic loads with `.acquire` ordering.
 
 ---
 
-## 10. Global Queue Registry
+## 12. io_uring Context
 
-The C code uses a global singly-linked list (`queue_head → queue.next → ...`) to
-track all open queues, enabling `chronicle_peek()` to iterate all of them. Zig has
-no implicit globals, so this must be handled explicitly.
-
-### Recommended Approach
-
-Use a module-level `QueueRegistry` that the caller manages:
+The `IoUringContext` provides low-latency wakeup for tailers using Linux's io_uring
+interface. Instead of busy-spinning or sleeping when waiting for new entries, tailers
+can register for eventfd-based notifications.
 
 ```zig
-// src/chronicle/registry.zig
+// src/brz/uring.zig
 
 const std = @import("std");
-const Queue = @import("queue.zig").Queue;
+const posix = std.posix;
+const linux = std.os.linux;
 
-/// Global registry of all open queues. Replaces the C `queue_head` linked list.
-/// The caller is responsible for creating and passing this around.
-pub const QueueRegistry = struct {
-    queues: std.ArrayList(*Queue),
+pub const IoUringContext = struct {
+    /// The io_uring instance.
+    ring: linux.IoUring,
+    /// Shared eventfd signaled by the appender when new entries are written.
+    eventfd: posix.fd_t,
 
-    pub fn init(allocator: std.mem.Allocator) QueueRegistry {
+    /// Initialize the io_uring context with the given queue depth.
+    pub fn init(queue_depth: u13) !IoUringContext {
+        const efd = try posix.eventfd(0, .{ .NONBLOCK = true });
+        errdefer posix.close(efd);
+
+        var ring = try linux.IoUring.init(queue_depth, 0);
+        errdefer ring.deinit();
+
         return .{
-            .queues = std.ArrayList(*Queue).init(allocator),
+            .ring = ring,
+            .eventfd = efd,
         };
     }
 
-    pub fn deinit(self: *QueueRegistry) void {
-        // Note: does NOT deinit the queues themselves — caller is responsible.
-        self.queues.deinit();
+    /// Signal all waiting tailers that new data is available.
+    /// Called by the appender after writing an entry.
+    pub fn signal(self: *IoUringContext) void {
+        const val: u64 = 1;
+        _ = posix.write(self.eventfd, std.mem.asBytes(&val)) catch {};
     }
 
-    pub fn register(self: *QueueRegistry, queue: *Queue) !void {
-        try self.queues.append(queue);
+    /// Register a tailer for wakeup via IORING_OP_POLL_ADD on its eventfd.
+    pub fn registerTailer(self: *IoUringContext, tailer: *@import("tailer.zig").Tailer) !void {
+        if (tailer.wakeup_eventfd == null) {
+            tailer.wakeup_eventfd = try posix.eventfd(0, .{ .NONBLOCK = true });
+        }
+        // Submit a poll request on the tailer's eventfd
+        _ = try self.ring.poll_add(
+            @intFromPtr(tailer),  // user_data for completion identification
+            tailer.wakeup_eventfd.?,
+            linux.POLL.IN,
+        );
+        try self.ring.submit();
+        tailer.uring_registered = true;
     }
 
-    pub fn unregister(self: *QueueRegistry, queue: *Queue) void {
-        for (self.queues.items, 0..) |q, i| {
-            if (q == queue) {
-                _ = self.queues.swapRemove(i);
-                return;
-            }
+    /// Deregister a tailer from io_uring wakeup.
+    pub fn deregisterTailer(self: *IoUringContext, tailer: *@import("tailer.zig").Tailer) void {
+        _ = self;
+        tailer.uring_registered = false;
+    }
+
+    /// Wait for completions (blocking). Returns the number of completions reaped.
+    pub fn waitForCompletions(self: *IoUringContext, timeout_ns: ?u64) !u32 {
+        if (timeout_ns) |ns| {
+            const ts = linux.kernel_timespec{
+                .tv_sec = @intCast(ns / std.time.ns_per_s),
+                .tv_nsec = @intCast(ns % std.time.ns_per_s),
+            };
+            return try self.ring.wait_cqes_timeout(1, &ts);
+        } else {
+            return try self.ring.wait_cqes(1);
         }
     }
 
-    /// Poll all registered queues (equivalent to C's chronicle_peek()).
-    pub fn peekAll(self: *QueueRegistry) void {
-        for (self.queues.items) |queue| {
-            queue.peek();
-        }
+    /// Clean up the io_uring instance and eventfd.
+    pub fn deinit(self: *IoUringContext) void {
+        self.ring.deinit();
+        posix.close(self.eventfd);
     }
 };
 ```
 
-If you prefer the simplicity of a process-global, you can use a `var` at module
-scope, but this is discouraged in Zig:
+### Wakeup Flow
+
+1. Tailer enters `awaiting_entry` state.
+2. Tailer calls `uring_ctx.registerTailer(self)` to register for wakeup.
+3. Tailer blocks on `uring_ctx.waitForCompletions(timeout_ns)`.
+4. Appender writes a new entry and calls `uring_ctx.signal()`.
+5. io_uring completes the poll operation, waking the tailer.
+6. Tailer re-reads the header at `qf_tip` and finds the new entry.
+
+This eliminates busy-spin CPU waste while maintaining sub-microsecond wakeup latency.
+
+---
+
+## 13. Behaviour Constants and Defaults
 
 ```zig
-// Less idiomatic, but simpler for porting:
-var global_registry: ?QueueRegistry = null;
+// src/brz/config.zig
 
-pub fn getGlobalRegistry(allocator: std.mem.Allocator) *QueueRegistry {
-    if (global_registry == null) {
-        global_registry = QueueRegistry.init(allocator);
-    }
-    return &global_registry.?;
-}
+/// Shared metadata filename (replaces the old directory listing file).
+pub const metadata_filename = "metadata.brz";
+
+/// Queue data file extension.
+pub const queue_file_extension = ".brz";
+
+/// Number of cycles to look back when patching missing EOF markers.
+/// An appender starts seeking from (highest_cycle - patch_cycles).
+pub const patch_cycles: u32 = 3;
+
+/// Default initial size for new queue files on disk (bytes).
+/// Used with fallocate for pre-allocation.
+pub const default_qf_disk_size: u64 = 83_754_496;
+
+/// Default mmap block size (1 MiB). Must be a power of two.
+pub const default_blocksize: u32 = 1024 * 1024;
+
+/// Maximum payload size for a single entry (bytes).
+pub const max_data_size: usize = 1000;
+
+/// How far ahead (in milliseconds) to pre-create the next-cycle file.
+/// The appender creates the next roll file this many ms before the roll boundary.
+pub const default_preroll_ms: u64 = 1000;
+
+/// Maximum backoff sleep duration for tiered CAS backoff (nanoseconds).
+/// Backoff strategy: spin → yield → exponential sleep (capped at this value).
+pub const max_cas_backoff_ns: u64 = 1_000_000; // 1 ms
 ```
 
 ---
 
-## 11. Error Handling Strategy
-
-The C library uses a global `cerr_msg` string and returns `-1` or `NULL` on error.
-Zig has first-class error unions, which are far more expressive and safe.
-
-### Error Set Definition
+## 14. Error Set
 
 ```zig
-// src/chronicle/errors.zig
+// src/brz/errors.zig
 
-pub const ChronicleError = error{
+pub const BrzError = error{
     // ── File I/O ────────────────────────────────────────────────────
     DirStatFailed,
     NotADirectory,
     OpenFailed,
     StatFailed,
     MmapFailed,
+    MunmapFailed,
     SeekFailed,
     WriteFailed,
     RenameFailed,
-    GlobFailed,
+    FallocateFailed,
 
     // ── Queue state ─────────────────────────────────────────────────
     QueueIsNull,
-    VersionDetectFailed,
-    VersionMismatch,
+    MetadataMagicMismatch,
+    MetadataVersionMismatch,
+    QueueFileMagicMismatch,
+    QueueFileVersionMismatch,
     CreateNotPermitted,
-    CreateRequiresVersion,
-    CreateRequiresEmptyDir,
     CreateRequiresRollScheme,
+    CreateRequiresEmptyDir,
 
     // ── Roll / format ───────────────────────────────────────────────
     RollFormatNotRecognized,
@@ -1139,14 +1385,28 @@ pub const ChronicleError = error{
     UnrecognizedFormatToken,
     UnterminatedQuote,
 
-    // ── Directory listing ───────────────────────────────────────────
-    DirlistParseFailed,
-    DirlistFieldsMissing,
-    DirlistReopenFailed,
+    // ── Metadata ────────────────────────────────────────────────────
+    MetadataParseFailed,
+    MetadataFieldsMissing,
+    MetadataReopenFailed,
 
     // ── Data ────────────────────────────────────────────────────────
     MessageTooLarge,
     WriteConflict,
+
+    // ── Index ───────────────────────────────────────────────────────
+    IndexSlotOutOfBounds,
+    IndexRegionCorrupted,
+
+    // ── io_uring ────────────────────────────────────────────────────
+    IoUringSetupFailed,
+    IoUringSubmitFailed,
+    IoUringCompletionError,
+    EventfdCreateFailed,
+
+    // ── Pre-roll ────────────────────────────────────────────────────
+    PrerollCreateFailed,
+    PrerollFallocateFailed,
 
     // ── Memory ──────────────────────────────────────────────────────
     OutOfMemory,
@@ -1156,9 +1416,8 @@ pub const ChronicleError = error{
 ### Usage Pattern
 
 ```zig
-pub fn open(self: *Queue) ChronicleError!void {
-    // ...
-    const stat = std.posix.fstat(fd) catch return ChronicleError.StatFailed;
+pub fn open(self: *Queue) BrzError!void {
+    const stat = std.posix.fstat(fd) catch return BrzError.StatFailed;
     // ...
 }
 
@@ -1169,76 +1428,45 @@ queue.open() catch |err| {
 };
 ```
 
-Functions that can fail return `ChronicleError!ReturnType`. Functions that cannot
-fail return the value directly. This replaces the C pattern of checking `-1` and
-calling `chronicle_strerror()`.
-
 ---
 
-## 12. Behaviour Constants and Defaults
-
-The C implementation has several tuning constants defined as global variables or
-inline values. Define these as named constants:
-
-```zig
-// src/chronicle/config.zig
-
-/// Number of cycles to look back when patching missing EOF markers.
-/// An appender starts seeking from (highest_cycle - patch_cycles).
-pub const patch_cycles: u32 = 3;
-
-/// Default initial size for new queue files on disk (bytes).
-pub const default_qf_disk_size: u64 = 83_754_496;
-
-/// Default mmap block size (1 MiB). Must be a power of two.
-pub const default_blocksize: u32 = 1024 * 1024;
-
-/// Maximum data size constant from the C header.
-pub const max_data_size: usize = 1000;
-
-/// Directory listing filename for v5 queues.
-pub const v5_dirlist_name = "metadata.cq4t";
-
-/// Queue data file extension.
-pub const queue_file_extension = ".cq4";
-```
-
----
-
-## 13. Suggested File Layout
+## 15. Suggested File Layout
 
 ```
 src/
-└── chronicle/
+└── brz/
     ├── header.zig       — Header constants and bit manipulation
-    ├── index.zig        — 64-bit index layout (cycle/seqnum)
+    ├── index.zig        — 64-bit index layout (cycle/seqnum), IndexRegion
+    ├── metadata.zig     — SharedMetadata, QueueFileHeader (extern structs)
     ├── roll.zig         — RollScheme, roll_schemes table, format conversion
     ├── tailer.zig       — TailerState enum, Tailer struct, ParseBlockState
-    ├── queue.zig        — Queue struct, DirlistFields, QueueVersion
-    ├── codec.zig        — Codec interface, Dispatcher, DefaultTextCodec
+    ├── queue.zig        — Queue struct
+    ├── codec.zig        — Codec interface, Dispatcher, DefaultRawCodec
     ├── config.zig       — Constants and tuning parameters
-    ├── errors.zig       — ChronicleError error set
-    ├── registry.zig     — QueueRegistry (replaces global linked list)
+    ├── errors.zig       — BrzError error set
+    ├── uring.zig        — IoUringContext for tailer wakeup
     └── root.zig         — pub usingnamespace or re-exports
 ```
 
 ---
 
-## 14. Summary Checklist
+## 16. Summary Checklist
 
-| Component | C source | Zig module | Status |
-|-----------|----------|------------|--------|
-| Header constants | `libchronicle.h` | `header.zig` | ☐ |
-| TailerState enum | `libchronicle.h` | `tailer.zig` | ☐ |
-| ParseBlockState enum | `libchronicle.c:188` | `tailer.zig` | ☐ |
-| collected_t | `libchronicle.h` | `tailer.zig` | ☐ |
-| Function pointer types | `libchronicle.h` | `codec.zig` | ☐ |
-| ROLL_SCHEME + table | `libchronicle.c:436` | `roll.zig` | ☐ |
-| Java→strftime conversion | `libchronicle.c:471-535` | `roll.zig` | ☐ |
-| queue_t struct | `libchronicle.c:140-185` | `queue.zig` | ☐ |
-| tailer_t struct | `libchronicle.c:110-138` | `tailer.zig` | ☐ |
-| dirlist_fields_t | `libchronicle.c:104-108` | `queue.zig` | ☐ |
-| Global queue list | `libchronicle.c:200` | `registry.zig` | ☐ |
-| Error handling | `libchronicle.c:85-98` | `errors.zig` | ☐ |
-| Config constants | scattered | `config.zig` | ☐ |
-| 64-bit index helpers | `libchronicle.c:170-171` | `index.zig` | ☐ |
+| Component | Zig module | Status |
+|-----------|------------|--------|
+| Header constants | `header.zig` | ☐ |
+| TailerState enum | `tailer.zig` | ☐ |
+| ParseBlockState enum | `tailer.zig` | ☐ |
+| Collected struct | `tailer.zig` | ☐ |
+| Codec interface | `codec.zig` | ☐ |
+| RollScheme + table (27 schemes) | `roll.zig` | ☐ |
+| Java→strftime conversion | `roll.zig` | ☐ |
+| 64-bit index helpers | `index.zig` | ☐ |
+| SharedMetadata (512-byte extern struct) | `metadata.zig` | ☐ |
+| QueueFileHeader (64-byte extern struct) | `metadata.zig` | ☐ |
+| IndexRegion (flat u64 array) | `index.zig` | ☐ |
+| Queue struct | `queue.zig` | ☐ |
+| Tailer struct | `tailer.zig` | ☐ |
+| IoUringContext | `uring.zig` | ☐ |
+| Behaviour constants | `config.zig` | ☐ |
+| Error set | `errors.zig` | ☐ |

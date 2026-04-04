@@ -1,61 +1,52 @@
 # Task 4: Queue Lifecycle Management
 
-This document covers the Zig reimplementation of the Chronicle Queue lifecycle:
-initialising a queue handle, opening an existing queue (or creating a new one),
-and cleaning up all resources on close. It maps every relevant C function in
-`libchronicle.c` to its idiomatic Zig equivalent.
-
----
-
 ## Table of Contents
 
 1. [Overview](#1-overview)
 2. [Queue Struct Design](#2-queue-struct-design)
-3. [Queue Initialisation (`chronicle_init`)](#3-queue-initialisation)
-4. [Configuration Setters](#4-configuration-setters)
-5. [Version Detection](#5-version-detection)
-6. [Opening a Queue (`chronicle_open`)](#6-opening-a-queue)
-7. [Directory Listing Init (`directory_listing_init`)](#7-directory-listing-init)
-8. [Directory Listing Reopen (`directory_listing_reopen`)](#8-directory-listing-reopen)
-9. [Queue File Init (`queuefile_init`)](#9-queue-file-init)
-10. [Queue Cleanup (`chronicle_cleanup`)](#10-queue-cleanup)
-11. [Global Queue Registry](#11-global-queue-registry)
-12. [Error Handling Strategy](#12-error-handling-strategy)
-13. [Roll Scheme Table](#13-roll-scheme-table)
-14. [Testing Notes](#14-testing-notes)
+3. [Version Detection](#3-version-detection)
+4. [Queue Opening](#4-queue-opening)
+5. [Metadata File Creation](#5-metadata-file-creation)
+6. [Queue File Creation](#6-queue-file-creation)
+7. [Pre-Roll File Creation](#7-pre-roll-file-creation)
+8. [io_uring Setup](#8-io_uring-setup)
+9. [Queue File Enumeration](#9-queue-file-enumeration)
+10. [Configuration](#10-configuration)
+11. [Queue Cleanup (deinit)](#11-queue-cleanup-deinit)
+12. [Error Handling](#12-error-handling)
+13. [Testing Strategy](#13-testing-strategy)
 
 ---
 
 ## 1. Overview
 
-In the C implementation, `chronicle_init` allocates a `queue_t`, wires up
-defaults, and prepends it to a global singly-linked list (`queue_head`).
-`chronicle_open` then detects the queue version, globs `.cq4` files, reads
-roll configuration, and validates everything. `chronicle_cleanup` tears down
-the entire queue — tailers, appender, mmaps, file descriptors, heap memory.
+Queue lifecycle covers the full sequence of operations from creating or opening
+a queue through to tearing it down:
 
-The Zig port replaces:
+- **Initialization** — allocate the `Queue` struct, set defaults
+- **Version detection** — probe for `metadata.brz` to determine format version
+- **Metadata file creation/reading** — create or mmap the fixed 512-byte
+  `SharedMetadata` extern struct (zero parsing — direct pointer cast)
+- **Queue file management** — create `.brz` data files with `fallocate(2)`
+  pre-allocation, write the 64-byte `QueueFileHeader`
+- **Roll scheme configuration** — set roll period, index count, index spacing
+- **Pre-roll file preparation** — pre-create the next cycle's `.brz` file
+  within a configurable `preroll_ms` window so the hot-path roll is a pointer
+  swap with zero syscalls
+- **io_uring setup** — initialize an io_uring context and eventfd for
+  writer→reader notification
+- **Cleanup** — tear down all mappings, fds, and io_uring state in reverse
+  order
 
-| C pattern | Zig pattern |
-|---|---|
-| `malloc` + `bzero` | `allocator.create(Queue)` with field defaults |
-| Global linked list `queue_head` | `ArrayList(*Queue)` owned by a registry or by user code |
-| `chronicle_err()` setting global string | Error unions (`error{...}`) with optional payloads |
-| `free()` scattered across cleanup | `defer` / `errdefer` for deterministic cleanup |
-| `strdup` | `allocator.dupe(u8, slice)` |
-| `glob()` | `std.fs.Dir.iterate()` or a custom glob over the directory |
-| `asprintf` | `std.fmt.allocPrint(allocator, ...)` |
+The design is **single writer, multiple readers**. All metadata is accessed
+through mmap'd `extern struct` pointers — there is no wire format, no parsing,
+no serialization layer. Atomic fields use acquire/release ordering.
 
 ---
 
 ## 2. Queue Struct Design
 
-The C `struct queue` (lines 140-185 of `libchronicle.c`) contains ~25 fields
-covering directory state, mmap'd directory listing, glob results, roll
-configuration, index configuration, codec function pointers, a tailer linked
-list, an appender pointer, and a next pointer for the global queue list.
-
-### Zig struct sketch
+### Queue struct
 
 ```zig
 const std = @import("std");
@@ -64,374 +55,540 @@ const posix = std.posix;
 pub const Queue = struct {
     const Self = @This();
 
+    // --- Allocator ---
     allocator: std.mem.Allocator,
 
-    // ── Identity ──────────────────────────────────────────────
+    // --- Directory ---
     dirname: []const u8,
 
-    // ── Tunables ──────────────────────────────────────────────
-    blocksize: u32 = 1 << 20, // 1 MiB, must be power-of-two
+    // --- Core config ---
+    blocksize: u64 = 2 * 1024 * 1024, // 2 MiB default
     version: Version = .unknown,
     create_permitted: bool = false,
 
-    // ── Directory listing mmap ────────────────────────────────
-    dirlist_name: ?[]const u8 = null,
-    dirlist_fd: ?posix.fd_t = null,
-    dirlist_map: ?[]align(std.mem.page_size) u8 = null,
-    dirlist_fields: DirlistFields = .{},
+    // --- Shared metadata (mmap'd extern struct, direct pointer cast) ---
+    metadata: ?*SharedMetadata = null,
+    metadata_fd: ?posix.fd_t = null,
+    metadata_mmap: ?[]align(std.mem.page_size) u8 = null,
 
-    // ── Globbed queue files ───────────────────────────────────
-    /// Sorted list of .cq4 paths discovered in the directory.
+    // --- Queue data files ---
     queuefile_paths: std.ArrayList([]const u8),
-
-    // ── Cycle tracking (local copies from dirlist mmap) ──────
     highest_cycle: u64 = 0,
     lowest_cycle: u64 = 0,
     modcount: u64 = 0,
 
-    // ── Roll configuration ────────────────────────────────────
-    roll_length_ms: i32 = 0,
-    roll_epoch: i32 = -1,
-    roll_format: ?[]const u8 = null,   // Java date format e.g. "yyyyMMdd-HH'F'"
-    roll_name: ?[]const u8 = null,     // scheme name e.g. "FAST_HOURLY"
-    roll_strftime: ?[]const u8 = null, // C strftime equivalent e.g. "%Y%m%d-%H"
+    // --- Roll configuration (copied from metadata on open) ---
+    roll_length_ms: u64 = 86_400_000, // 24 hours default
+    roll_length_secs: u32 = 86_400,
+    roll_epoch: u64 = 0,
+    roll_format: []const u8 = "yyyyMMdd'F'",
+    roll_name: []const u8 = "FAST_DAILY",
+    roll_strftime: []const u8 = "%Y%m%dF",
 
-    // ── Index configuration ───────────────────────────────────
-    index_count: i32 = 0,
-    index_spacing: i32 = 0,
+    // --- Index config ---
+    index_count: u32 = 4096,
+    index_spacing: u32 = 256,
 
-    // ── Derived constants ─────────────────────────────────────
-    cycle_shift: u6 = 32,
-    seqnum_mask: u64 = 0x0000_0000_FFFF_FFFF,
+    // --- Cycle / seqnum bit layout ---
+    cycle_shift: u6 = 40,
+    seqnum_mask: u64 = 0xFF_FFFF_FFFF,
 
-    // ── Codec function pointers ───────────────────────────────
-    parser: ?*const fn ([]const u8) ?[]const u8 = null,
-    parser_free: ?*const fn ([]const u8) void = null,
-    append_sizeof: ?*const fn (*const anyopaque) usize = null,
-    append_write: ?*const fn ([*]u8, *const anyopaque, usize) void = null,
+    // --- Pre-roll state (NEW) ---
+    preroll_fd: ?posix.fd_t = null,
+    preroll_mmap: ?[]align(std.mem.page_size) u8 = null,
+    preroll_cycle: ?u32 = null,
+    preroll_ms: u64 = 500, // pre-roll window: 500 ms before cycle end
 
-    // ── Tailers ───────────────────────────────────────────────
-    tailers: std.DoublyLinkedList(TailerNode) = .{},
-    appender: ?*Tailer = null,
+    // --- io_uring (NEW) ---
+    uring_ctx: ?IoUringContext = null,
+    eventfd: ?posix.fd_t = null,
 
-    // ── Constants ─────────────────────────────────────────────
-    pub const qf_disk_sz: u64 = 83_754_496;
-    pub const patch_cycles: u64 = 3;
+    // --- Huge page config (NEW) ---
+    use_huge_pages: bool = false,
+
+    // --- Active components ---
+    tailers: std.ArrayList(*Tailer),
+    appender: ?*Appender = null,
+
+    // --- Constants ---
+    pub const qf_disk_sz: u64 = 83_754_496; // ~79.9 MiB pre-allocation
+    pub const metadata_file_sz: u64 = 512;   // one disk sector
 };
+```
 
+### Design notes
+
+The metadata pointer gives zero-cost field access — no parsing, no
+deserialization, no offset calculations:
+
+```zig
+// Direct struct field access through mmap'd pointer
+const cycle = @atomicLoad(u64, &self.metadata.?.highest_cycle, .acquire);
+```
+
+### Version enum
+
+```zig
 pub const Version = enum(u8) {
     unknown = 0,
-    v5 = 5,
-};
-
-pub const DirlistFields = struct {
-    highest_cycle: ?*align(1) u64 = null,
-    lowest_cycle: ?*align(1) u64 = null,
-    modcount: ?*align(1) u64 = null,
+    v1 = 1, // brz-queue native format (.brz files, extern struct metadata)
 };
 ```
 
-Key design decisions:
-
-- **`blocksize` is `u32`** — the C code uses `uint` and only ever holds
-  powers of two up to ~64 MiB. A `u32` suffices and allows the mask
-  computation `~(blocksize - 1)` to be done cleanly.
-- **`version` is an enum** — catches invalid values at compile time.
-- **`queuefile_paths` uses `ArrayList`** — replaces the C `glob_t`. We
-  populate it by iterating the directory ourselves (see §6).
-- **Codec pointers are nullable** — set via configuration; validated at open
-  time.
-- **Tailer list is `std.DoublyLinkedList`** — replaces hand-rolled
-  `next`/`prev` pointers.
+Only two variants. `unknown` means no queue detected at the directory path.
+`v1` is the brz-queue native format.
 
 ---
 
-## 3. Queue Initialisation
+## 3. Version Detection
 
-The C `chronicle_init` (lines 259-287) allocates, zeroes, sets defaults, and
-prepends to the global list. The Zig equivalent is `Queue.init`:
-
-```zig
-pub fn init(allocator: std.mem.Allocator, dirname: []const u8) !*Queue {
-    const queue = try allocator.create(Queue);
-    errdefer allocator.destroy(queue);
-
-    const owned_dirname = try allocator.dupe(u8, dirname);
-    errdefer allocator.free(owned_dirname);
-
-    queue.* = Queue{
-        .allocator = allocator,
-        .dirname = owned_dirname,
-        .queuefile_paths = std.ArrayList([]const u8).init(allocator),
-        // All other fields use their declared defaults (blocksize = 1MiB, etc.)
-    };
-
-    return queue;
-}
-```
-
-**What changed from C:**
-
-| C | Zig |
-|---|---|
-| `malloc` + `bzero` | `allocator.create` (zero-init via defaults) |
-| `strdup(dir)` | `allocator.dupe(u8, dirname)` |
-| `queue->roll_epoch = -1` | Field default in struct declaration |
-| `queue->next = queue_head; queue_head = queue;` | Handled by external `QueueRegistry` (see §11) |
-| `getenv("SHMIPC_DEBUG")` | `std.posix.getenv("SHMIPC_DEBUG")` or `std.process.getEnvMap()`, stored in a config struct |
-
-The `errdefer` on `owned_dirname` ensures that if any subsequent allocation
-fails, we don't leak the string.
-
----
-
-## 4. Configuration Setters
-
-In C, these are simple setters that mutate the queue struct between `init`
-and `open`. In Zig, they become methods on `Queue`:
-
-```zig
-pub fn setVersion(self: *Queue, ver: Version) void {
-    self.version = ver;
-}
-
-pub fn setCreate(self: *Queue, create: bool) void {
-    self.create_permitted = create;
-}
-
-pub fn setEncoder(
-    self: *Queue,
-    sizeof_fn: *const fn (*const anyopaque) usize,
-    write_fn: *const fn ([*]u8, *const anyopaque, usize) void,
-) void {
-    self.append_sizeof = sizeof_fn;
-    self.append_write = write_fn;
-}
-
-pub fn setDecoder(
-    self: *Queue,
-    parse_fn: *const fn ([]const u8) ?[]const u8,
-    free_fn: ?*const fn ([]const u8) void,
-) void {
-    self.parser = parse_fn;
-    self.parser_free = free_fn;
-}
-```
-
-### `setRollScheme`
-
-This looks up a name in the roll scheme table (see §13) and applies it.
-The C version (lines 537-545) iterates the table with `strcmp`. In Zig we
-use a `std.StaticStringMap` or a simple linear scan:
-
-```zig
-pub fn setRollScheme(self: *Queue, name: []const u8) !void {
-    for (roll_schemes) |scheme| {
-        if (std.mem.eql(u8, name, scheme.name)) {
-            try self.applyRollScheme(scheme);
-            return;
-        }
-    }
-    return error.UnknownRollScheme;
-}
-```
-
-### `applyRollScheme` — Java date format conversion
-
-The C function `chronicle_apply_roll_scheme` (lines 471-535) converts a Java
-date format string like `"yyyyMMdd-HH'F'"` into a strftime pattern like
-`"%Y%m%d-%HF"`. It does this character-by-character, toggling an `inquote`
-flag on apostrophes and replacing Java tokens with `%`-codes.
-
-In Zig we replicate this conversion but allocate cleanly:
-
-```zig
-fn applyRollScheme(self: *Queue, scheme: RollScheme) !void {
-    // Free previous strings if set
-    if (self.roll_name) |old| self.allocator.free(old);
-    if (self.roll_format) |old| self.allocator.free(old);
-    if (self.roll_strftime) |old| self.allocator.free(old);
-
-    self.roll_name = try self.allocator.dupe(u8, scheme.name);
-    self.roll_format = try self.allocator.dupe(u8, scheme.format);
-    self.roll_length_ms = @as(i32, @intCast(scheme.roll_length_secs)) * 1000;
-
-    // Build the strftime-compatible pattern
-    self.roll_strftime = try convertJavaDateFormat(self.allocator, scheme.format);
-}
-
-/// Convert Java SimpleDateFormat → POSIX strftime pattern.
-///   yyyy → %Y   MM → %m   dd → %d   HH → %H   mm → %M   ss → %S
-///   Single quotes toggle literal mode. Dashes are literal.
-fn convertJavaDateFormat(allocator: std.mem.Allocator, java_fmt: []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
-
-    var i: usize = 0;
-    var in_quote = false;
-    while (i < java_fmt.len) {
-        const c = java_fmt[i];
-        if (in_quote and c != '\'') {
-            try buf.append(c);
-            i += 1;
-        } else if (c == '\'') {
-            in_quote = !in_quote;
-            i += 1;
-        } else if (c == '-') {
-            try buf.append('-');
-            i += 1;
-        } else if (i + 4 <= java_fmt.len and std.mem.eql(u8, java_fmt[i..][0..4], "yyyy")) {
-            try buf.appendSlice("%Y");
-            i += 4;
-        } else if (i + 2 <= java_fmt.len and std.mem.eql(u8, java_fmt[i..][0..2], "MM")) {
-            try buf.appendSlice("%m");
-            i += 2;
-        } else if (i + 2 <= java_fmt.len and std.mem.eql(u8, java_fmt[i..][0..2], "dd")) {
-            try buf.appendSlice("%d");
-            i += 2;
-        } else if (i + 2 <= java_fmt.len and std.mem.eql(u8, java_fmt[i..][0..2], "HH")) {
-            try buf.appendSlice("%H");
-            i += 2;
-        } else if (i + 2 <= java_fmt.len and std.mem.eql(u8, java_fmt[i..][0..2], "mm")) {
-            try buf.appendSlice("%M");
-            i += 2;
-        } else if (i + 2 <= java_fmt.len and std.mem.eql(u8, java_fmt[i..][0..2], "ss")) {
-            try buf.appendSlice("%S");
-            i += 2;
-        } else {
-            return error.InvalidDateFormat;
-        }
-    }
-    return try buf.toOwnedSlice();
-}
-```
-
----
-
-## 5. Version Detection
-
-The C `chronicle_version_detect` (lines 304-308) probes for two filenames:
-
-```c
-if (chronicle_readable(queue->dirname, "metadata.cq4t")) return 5;
-return 0;
-```
-
-In Zig we use `std.fs.Dir` to attempt opening these files:
+Version detection probes the queue directory for the `metadata.brz` file. If
+present, optionally validate the magic number to confirm it is a valid
+brz-queue metadata file.
 
 ```zig
 fn detectVersion(dirname: []const u8) !Version {
     var dir = try std.fs.cwd().openDir(dirname, .{});
     defer dir.close();
 
-    // Try v5 marker
-    if (dir.openFile("metadata.cq4t", .{})) |f| {
-        f.close();
-        return .v5;
+    if (dir.openFile("metadata.brz", .{})) |f| {
+        defer f.close();
+
+        // Optionally read and validate magic number
+        var magic_buf: [4]u8 = undefined;
+        const bytes_read = try f.readAll(&magic_buf);
+        if (bytes_read == 4) {
+            const magic = std.mem.readInt(u32, &magic_buf, .little);
+            if (magic == 0x425A514D) return .v1;
+        }
+        return .unknown; // file exists but magic doesn't match
     } else |_| {}
 
     return .unknown;
 }
 ```
 
-This avoids the C pattern of `open()` + `close()` with raw fd checks and
-replaces it with Zig's `openFile` which returns an error union. We silently
-discard the error (file not found) and try the next probe.
+If `metadata.brz` does not exist, the directory is not a brz-queue.
 
 ---
 
-## 6. Opening a Queue
+## 4. Queue Opening
 
-`chronicle_open` (lines 310-421) is the most complex lifecycle function. It:
+Opening an existing queue reads and validates the metadata file, scans for
+existing data files, and initializes io_uring.
 
-1. Validates the directory exists (`stat`)
-2. Auto-detects the version
-3. Globs `.cq4` files
-4. Handles create-mode vs open-mode validation
-5. Builds the dirlist filename
-6. Optionally creates the directory listing (`directory_listing_init`)
-7. Opens and parses the directory listing (`directory_listing_reopen`)
-8. Validates roll settings
-9. Sets `cycle_shift = 32` and `seqnum_mask = 0xFFFFFFFF`
-10. Does an initial `peek_queue` to populate cycle values
+### Steps
+
+1. Validate directory exists
+2. Detect version from `metadata.brz`
+3. Open and mmap `metadata.brz` → cast to `*SharedMetadata`
+4. Validate magic number (`0x425A514D`)
+5. Read roll config directly from struct fields (zero parsing!)
+6. Scan directory for existing `.brz` data files
+7. Initialize io_uring context and eventfd
+8. Set up pre-roll state
+9. Validate configuration consistency
 
 ### Zig implementation sketch
 
 ```zig
-pub fn open(self: *Queue) !void {
-    // 1. Validate directory
-    const dir_stat = std.fs.cwd().statFile(self.dirname) catch
-        return error.DirStatFailed;
-    if (dir_stat.kind != .directory)
-        return error.NotADirectory;
+pub fn open(self: *Self) !void {
+    // 1. Validate directory exists
+    var dir = std.fs.cwd().openDir(self.dirname, .{}) catch |err| {
+        if (err == error.FileNotFound and self.create_permitted) {
+            try std.fs.cwd().makePath(self.dirname);
+            return try self.createNew();
+        }
+        return err;
+    };
+    defer dir.close();
 
-    // 2. Auto-detect version
-    const auto_version = try detectVersion(self.dirname);
+    // 2. Detect version
+    self.version = try detectVersion(self.dirname);
 
-    // 3. Glob .cq4 files
-    try self.refreshQueueFiles();
-
-    // 4. Validate version / create-mode constraints
-    if (auto_version == .unknown) {
-        if (!self.create_permitted)
-            return error.QueueNotFoundNoCreate;
-        if (self.version == .unknown)
-            return error.VersionRequired;
-        if (self.queuefile_paths.items.len != 0)
-            return error.CreateRequiresEmptyDir;
-        if (self.roll_name == null)
-            return error.RollSchemeRequired;
-    } else {
-        if (self.version != .unknown and self.version != auto_version)
-            return error.VersionMismatch;
-        self.version = auto_version;
+    if (self.version == .unknown) {
+        if (self.create_permitted) {
+            return try self.createNew();
+        }
+        return error.QueueNotFound;
     }
 
-    // 5. Build dirlist filename
-    self.dirlist_name = try std.fmt.allocPrint(
-        self.allocator,
-        "{s}/{s}",
-        .{
-            self.dirname,
-            "metadata.cq4t",
-        },
+    // 3. Open and mmap metadata.brz
+    const meta_path = try std.fs.path.join(self.allocator, &.{ self.dirname, "metadata.brz" });
+    defer self.allocator.free(meta_path);
+
+    self.metadata_fd = try std.posix.open(
+        meta_path,
+        .{ .ACCMODE = .RDWR },
+        0,
+    );
+    self.metadata_mmap = try mapFile(
+        self.metadata_fd.?,
+        0,
+        @intCast(Queue.metadata_file_sz),
+        .read_write,
+        .{ .TYPE = .SHARED },
     );
 
-    // 6. Create directory listing if needed
-    if (self.create_permitted and auto_version == .unknown) {
-        const cycle = self.cycleFromMs(self.clockMs());
-        try self.directoryListingInit(cycle);
+    // Cast to *SharedMetadata — zero parsing
+    self.metadata = @ptrCast(@alignCast(self.metadata_mmap.?.ptr));
+
+    // 4. Validate magic
+    if (self.metadata.?.magic != 0x425A514D) {
+        return error.InvalidMagic;
     }
 
-    // 7. Open + parse directory listing (read-only initially)
-    try self.directoryListingReopen(.read_only);
+    // 5. Read roll config directly from struct fields
+    self.roll_length_secs = self.metadata.?.roll_length_secs;
+    self.roll_length_ms = @as(u64, self.roll_length_secs) * 1000;
+    self.index_count = self.metadata.?.index_count;
+    self.index_spacing = self.metadata.?.index_spacing;
+    self.roll_epoch = self.metadata.?.epoch_ms;
 
-    // 8. Validate roll settings
-    if (self.roll_format == null) return error.MissingRollFormat;
-    if (self.roll_length_ms == 0) return error.MissingRollLength;
-    if (self.roll_epoch == -1) return error.MissingRollEpoch;
+    // Read atomic fields
+    self.highest_cycle = @atomicLoad(u64, &self.metadata.?.highest_cycle, .acquire);
+    self.lowest_cycle = @atomicLoad(u64, &self.metadata.?.lowest_cycle, .acquire);
+    self.modcount = @atomicLoad(u64, &self.metadata.?.modcount, .acquire);
 
-    // Cross-check detected format against known schemes
-    _ = try self.setRollDateFormat(self.roll_format.?);
+    // 6. Scan directory for existing .brz data files
+    try self.refreshQueueFiles();
 
-    // 10. Derived constants
-    self.cycle_shift = 32;
-    self.seqnum_mask = 0x0000_0000_FFFF_FFFF;
+    // 7. Initialize io_uring context and eventfd
+    try self.initIoUring();
 
-    // 11. Initial poll
-    self.peekQueueModcount();
+    // 8. Pre-roll state starts empty — will be filled by maybePreroll()
+    self.preroll_fd = null;
+    self.preroll_mmap = null;
+    self.preroll_cycle = null;
+
+    // 9. Validate configuration
+    if (self.roll_length_secs == 0) return error.InvalidRollConfig;
+    if (self.index_count == 0) return error.InvalidRollConfig;
 }
 ```
 
-### `refreshQueueFiles` — replacing `glob()`
+The entire open sequence is: mmap → pointer cast → read struct fields. No
+parsing, no deserialization, no offset scanning.
 
-POSIX `glob()` is not available in `std.posix`. We iterate the directory and
-filter for `.cq4` suffixes:
+---
+
+## 5. Metadata File Creation
+
+When creating a new queue, the metadata file is a single 512-byte file with
+all fields at known offsets.
+
+### Steps
+
+1. Create `metadata.brz` file
+2. `fallocate` 512 bytes (one disk sector)
+3. mmap it read-write
+4. Cast to `*SharedMetadata`, fill in fields
+5. `msync` to flush
+
+### Zig implementation sketch
 
 ```zig
-fn refreshQueueFiles(self: *Queue) !void {
+fn metadataInit(self: *Self) !void {
+    const meta_path = try std.fs.path.join(
+        self.allocator,
+        &.{ self.dirname, "metadata.brz" },
+    );
+    defer self.allocator.free(meta_path);
+
+    // 1. Create the file
+    const fd = try std.posix.open(
+        meta_path,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true },
+        0o644,
+    );
+    errdefer std.posix.close(fd);
+
+    // 2. Pre-allocate 512 bytes with fallocate(2)
+    //    This reserves real disk blocks — no sparse file tricks
+    try std.posix.fallocate(fd, .{}, 0, Queue.metadata_file_sz);
+
+    // 3. mmap read-write
+    const mmap_buf = try mapFile(
+        fd,
+        0,
+        @intCast(Queue.metadata_file_sz),
+        .read_write,
+        .{ .TYPE = .SHARED },
+    );
+
+    // 4. Cast to *SharedMetadata and fill in fields
+    const meta: *SharedMetadata = @ptrCast(@alignCast(mmap_buf.ptr));
+    meta.magic = 0x425A514D;
+    meta.version = 1;
+    meta.flags = 0;
+    meta.roll_length_secs = self.roll_length_secs;
+    meta.index_spacing = self.index_spacing;
+    meta.index_count = self.index_count;
+    meta.epoch_ms = self.roll_epoch;
+
+    // Atomic fields — use release stores so readers see consistent state
+    @atomicStore(u64, &meta.highest_cycle, 0, .release);
+    @atomicStore(u64, &meta.lowest_cycle, 0, .release);
+    @atomicStore(u64, &meta.modcount, 0, .release);
+    @atomicStore(u64, &meta.write_lock, 0x8000000000000000, .release); // unlocked
+
+    // Zero the reserved region (fallocate already zeroed, but be explicit)
+    @memset(&meta._reserved, 0);
+
+    // 5. msync to flush to disk
+    try std.posix.msync(@alignCast(mmap_buf), .{ .SYNC = true });
+
+    // Store in Queue struct
+    self.metadata_fd = fd;
+    self.metadata_mmap = mmap_buf;
+    self.metadata = meta;
+}
+```
+
+### Design properties
+
+- **512 bytes, fixed layout** — one extern struct, one disk sector
+- **No encoding step** — just write struct fields directly
+- **No alignment calculations** — the compiler handles it via `align(8)`
+- **Atomic-ready** — fields are at known, aligned offsets from the start
+
+---
+
+## 6. Queue File Creation
+
+Each `.brz` data file stores messages for one cycle. The file layout is:
+
+```
+[QueueFileHeader: 64 bytes] [Index: index_count × 8 bytes] [Data region...]
+```
+
+### Steps
+
+1. Create the file
+2. `fallocate(fd, 0, 0, qf_disk_sz)` — pre-allocate disk blocks
+3. mmap the first block
+4. Cast offset 0 to `*QueueFileHeader`, fill in fields
+5. Zero-initialize the index region
+6. Data region starts after the index
+
+### Zig implementation sketch
+
+```zig
+fn queuefileInit(self: *Self, path: []const u8, cycle: u32) !posix.fd_t {
+    // 1. Create the file
+    const fd = try std.posix.open(
+        path,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true },
+        0o644,
+    );
+    errdefer std.posix.close(fd);
+
+    // 2. Pre-allocate with fallocate(2) — reserves real disk blocks
+    try std.posix.fallocate(fd, .{}, 0, Queue.qf_disk_sz);
+
+    // 3. mmap the header + index region
+    const header_plus_index_sz = 64 + @as(u64, self.index_count) * 8;
+    const map_sz = std.mem.alignForward(u64, header_plus_index_sz, std.mem.page_size);
+    const buf = try mapFile(fd, 0, @intCast(map_sz), .read_write, .{ .TYPE = .SHARED });
+
+    // 4. Cast to *QueueFileHeader and fill in fields
+    const hdr: *QueueFileHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.magic = 0x425A5143;     // "BZQC"
+    hdr.version = 1;
+    hdr.flags = 0;
+    hdr.roll_length_secs = self.roll_length_secs;
+    hdr.index_spacing = self.index_spacing;
+    hdr.index_count = self.index_count;
+    hdr.epoch_ms = self.roll_epoch;
+    hdr.created_cycle = cycle;
+    @memset(&hdr._reserved, 0);
+
+    // 5. Zero-initialize the index region (offset 64 to 64 + index_count × 8)
+    //    fallocate zeros the file, but be explicit for clarity
+    const index_base = buf.ptr + 64;
+    const index_byte_len = @as(usize, self.index_count) * 8;
+    @memset(index_base[0..index_byte_len], 0);
+
+    // 6. Flush header + index to disk
+    try std.posix.msync(@alignCast(buf), .{ .SYNC = true });
+
+    // Unmap the initialization mapping (appender will map its own window)
+    try unmapFile(buf);
+
+    return fd;
+}
+```
+
+### Data region
+
+The data region starts at offset `64 + index_count × 8`. For the default
+`FAST_DAILY` scheme (`index_count = 4096`), the data region starts at
+offset `64 + 4096 × 8 = 32,832` (32 KiB + 64 bytes).
+
+---
+
+## 7. Pre-Roll File Creation
+
+Pre-rolling creates the next cycle's `.brz` file **before** the current cycle
+ends, so that the actual roll on the hot path is a pointer swap — zero syscalls.
+
+### Concept
+
+The appender periodically calls `maybePreroll()`. If the current time is within
+`preroll_ms` milliseconds of the cycle boundary, and no pre-roll file exists
+yet, create and mmap the next cycle's file.
+
+When the actual roll happens (in the appender's write path), if
+`preroll_cycle` matches the new cycle, just swap the fd and mmap pointers.
+No `open()`, no `fallocate()`, no `mmap()` on the critical path.
+
+### Zig implementation sketch
+
+```zig
+pub fn maybePreroll(self: *Queue, current_time_ms: u64) !void {
+    const roll_length_ms = @as(u64, self.roll_length_secs) * 1000;
+    const current_cycle: u32 = @intCast(
+        (current_time_ms - self.roll_epoch) / roll_length_ms,
+    );
+    const next_cycle = current_cycle + 1;
+    const cycle_end_ms = (@as(u64, next_cycle)) * roll_length_ms + self.roll_epoch;
+
+    // Are we within the pre-roll window?
+    if (cycle_end_ms - current_time_ms < self.preroll_ms and
+        self.preroll_cycle == null)
+    {
+        // Pre-create next cycle file
+        const path = try self.cyclePath(next_cycle);
+        defer self.allocator.free(path);
+
+        const fd = try self.queuefileInit(path, next_cycle);
+
+        self.preroll_cycle = next_cycle;
+        self.preroll_fd = fd;
+
+        // Pre-mmap for instant swap on roll
+        const map_sz = std.mem.alignForward(u64, self.blocksize * 2, std.mem.page_size);
+        self.preroll_mmap = try mapFile(
+            fd,
+            0,
+            @intCast(map_sz),
+            .read_write,
+            .{ .TYPE = .SHARED, .POPULATE = true },
+        );
+    }
+}
+```
+
+### Roll swap (called from appender)
+
+```zig
+fn swapPrerolledFile(self: *Queue, new_cycle: u32) !void {
+    if (self.preroll_cycle != null and self.preroll_cycle.? == new_cycle) {
+        // Hot path: just swap pointers — zero syscalls
+        // The appender takes ownership of preroll_fd and preroll_mmap
+        self.appender.?.current_fd = self.preroll_fd.?;
+        self.appender.?.current_mmap = self.preroll_mmap.?;
+
+        // Clear pre-roll state
+        self.preroll_fd = null;
+        self.preroll_mmap = null;
+        self.preroll_cycle = null;
+    } else {
+        // Pre-roll missed or wasn't applicable — fall back to synchronous creation
+        const path = try self.cyclePath(new_cycle);
+        defer self.allocator.free(path);
+        _ = try self.queuefileInit(path, new_cycle);
+        // Appender opens and maps normally
+    }
+}
+```
+
+### Timing
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `preroll_ms` | 500 | Milliseconds before cycle end to trigger pre-roll |
+
+For the default `FAST_DAILY` scheme (24-hour cycles), pre-roll happens 500 ms
+before midnight UTC. For `TEST_SECONDLY` (1-second cycles), 500 ms means
+pre-roll starts halfway through every cycle.
+
+---
+
+## 8. io_uring Setup
+
+io_uring provides an efficient notification mechanism for writer→reader
+communication. Instead of polling, readers submit an io_uring SQE to wait on
+an eventfd, and receive a completion when a message is available.
+
+### Initialization
+
+```zig
+fn initIoUring(self: *Queue) !void {
+    // Create eventfd for writer→reader signaling
+    self.eventfd = try std.posix.eventfd(0, .{ .NONBLOCK = true });
+    errdefer {
+        std.posix.close(self.eventfd.?);
+        self.eventfd = null;
+    }
+
+    // Initialize io_uring context
+    self.uring_ctx = try IoUringContext.init(.{
+        .queue_depth = 64,
+        .flags = 0,
+    });
+}
+```
+
+### How it works
+
+| Actor | Operation |
+|-------|-----------|
+| **Writer** | After publishing a message (release store on the 4-byte header), writes `1` to the eventfd |
+| **Reader** | Submits an io_uring `POLL_ADD` SQE on the eventfd; gets a CQE when the eventfd becomes readable |
+
+This avoids busy-spinning in readers when no messages are available. The
+eventfd write is a single syscall; the reader's io_uring poll is batched and
+kernel-mediated.
+
+### IoUringContext struct
+
+```zig
+pub const IoUringContext = struct {
+    ring: std.os.linux.IoUring,
+
+    pub fn init(opts: struct {
+        queue_depth: u13 = 64,
+        flags: u32 = 0,
+    }) !IoUringContext {
+        const ring = try std.os.linux.IoUring.init(opts.queue_depth, opts.flags);
+        return .{ .ring = ring };
+    }
+
+    pub fn deinit(self: *IoUringContext) void {
+        self.ring.deinit();
+    }
+
+    pub fn submitPollEventfd(self: *IoUringContext, efd: posix.fd_t) !void {
+        _ = try self.ring.poll_add(0, efd, std.os.linux.POLL.IN);
+        _ = try self.ring.submit();
+    }
+};
+```
+
+---
+
+## 9. Queue File Enumeration
+
+Scan the queue directory for `.brz` data files (excluding `metadata.brz`),
+extract cycle numbers from filenames, and sort by cycle.
+
+```zig
+fn refreshQueueFiles(self: *Self) !void {
     // Free old paths
-    for (self.queuefile_paths.items) |p| self.allocator.free(p);
+    for (self.queuefile_paths.items) |p| {
+        self.allocator.free(p);
+    }
     self.queuefile_paths.clearRetainingCapacity();
 
     var dir = try std.fs.cwd().openDir(self.dirname, .{ .iterate = true });
@@ -440,649 +597,411 @@ fn refreshQueueFiles(self: *Queue) !void {
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".cq4")) continue;
+        const name = entry.name;
 
-        const full = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ self.dirname, entry.name },
-        );
-        try self.queuefile_paths.append(full);
+        // Skip metadata file
+        if (std.mem.eql(u8, name, "metadata.brz")) continue;
+
+        // Must end with .brz
+        if (!std.mem.endsWith(u8, name, ".brz")) continue;
+
+        const owned = try self.allocator.dupe(u8, name);
+        try self.queuefile_paths.append(owned);
     }
 
-    // Sort lexicographically — cycle order matches filename order
+    // Sort by cycle (lexicographic on date-based filenames works correctly)
     std.mem.sort([]const u8, self.queuefile_paths.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+            return std.mem.lessThan(u8, a, b);
         }
     }.lessThan);
 }
 ```
 
----
+### Cycle extraction
 
-## 7. Directory Listing Init
-
-`directory_listing_init` (lines 1400-1476) creates the `metadata.cq4t` file
-from scratch. It writes one metadata message containing the `STStore` header
-with nested `SCQMeta` / `SCQSRoll` configuration, followed by six data
-messages for the shared fields.
-
-### Message structure
-
-```
-METADATA message:
-  header: STStore {
-    wireType: "BINARY_LIGHT"
-    metadata: SCQMeta {
-      roll: SCQSRoll {
-        length: <roll_length_ms>
-        format: "<java_date_format>"
-        epoch: <roll_epoch>
-      }
-      deltaCheckpointInterval: 64
-      sourceId: 0
-    }
-  }
-
-DATA message 1: listing.highestCycle  = <cycle>      (uint64, aligned)
-DATA message 2: listing.lowestCycle   = <cycle>      (uint64, aligned)
-DATA message 3: listing.modCount      = 1            (uint64, aligned)
-DATA message 4: chronicle.write.lock  = 0x8000000000000000
-DATA message 5: chronicle.lastIndexReplicated = -1 (0xFFFFFFFFFFFFFFFF)
-DATA message 6: chronicle.lastAcknowledgedIndexReplicated = -1
-```
-
-Each message is framed with a 4-byte header (metadata bit | size for metadata
-messages, plain size for data messages). The uint64 values in data messages
-are **8-byte aligned** so they can be atomically read/written via the mmap.
-
-### Zig implementation sketch
-
-The C code uses `wirepad_t` — a growable buffer with nesting support. We
-build an equivalent `WirePad` in Zig (covered in a wire protocol document)
-and use it here:
+The cycle number is computed from the filename's date/time components, not
+stored in the filename itself. To get the cycle from a path:
 
 ```zig
-fn directoryListingInit(self: *Queue, cycle: u64) !void {
-    const dirlist_name = self.dirlist_name orelse return error.DirlistNameNotSet;
-
-    // Create/truncate the file
-    const file = try std.fs.cwd().createFile(dirlist_name, .{
-        .mode = 0o777,
-        .truncate = true,
-    });
-    defer file.close();
-
-    var pad = try WirePad.init(self.allocator, 1024);
-    defer pad.deinit();
-
-    const roll_epoch: i32 = if (self.roll_epoch == -1) 0 else self.roll_epoch;
-
-    // ── Metadata message: STStore with SCQMeta/SCQSRoll ──────
-    pad.qcStart(.metadata);
-
-    pad.eventName("header");
-    pad.typePrefix("STStore");
-    pad.nestEnter();
-    {
-        pad.fieldTypeEnum("wireType", "WireType", "BINARY_LIGHT");
-
-        pad.field("metadata");
-        pad.typePrefix("SCQMeta");
-        pad.nestEnter();
-        {
-            pad.field("roll");
-            pad.typePrefix("SCQSRoll");
-            pad.nestEnter();
-            {
-                pad.fieldVarint("length", self.roll_length_ms);
-                pad.fieldText("format", self.roll_format.?);
-                pad.fieldVarint("epoch", roll_epoch);
-            }
-            pad.nestExit();
-
-            pad.fieldVarint("deltaCheckpointInterval", 64);
-            pad.fieldVarint("sourceId", 0);
-        }
-        pad.nestExit();
-        pad.padToAlign8();
-    }
-    pad.nestExit();
-
-    pad.qcFinish();
-
-    // ── Six data messages ─────────────────────────────────────
-    const data_fields = [_]struct { name: []const u8, value: u64 }{
-        .{ .name = "listing.highestCycle", .value = cycle },
-        .{ .name = "listing.lowestCycle", .value = cycle },
-        .{ .name = "listing.modCount", .value = 1 },
-        .{ .name = "chronicle.write.lock", .value = 0x8000_0000_0000_0000 },
-        .{ .name = "chronicle.lastIndexReplicated", .value = @bitCast(@as(i64, -1)) },
-        .{ .name = "chronicle.lastAcknowledgedIndexReplicated", .value = @bitCast(@as(i64, -1)) },
-    };
-
-    for (data_fields) |df| {
-        pad.qcStart(.data);
-        pad.eventName(df.name);
-        pad.uint64Aligned(df.value);
-        pad.qcFinish();
-    }
-
-    // Write the entire pad to the file
-    try file.writeAll(pad.bytes());
+fn cycleFromPath(self: *Self, filename: []const u8) !u32 {
+    // Parse the strftime-formatted portion of the filename
+    // e.g. "20250101F.brz" → parse with "%Y%m%dF" → epoch seconds → cycle
+    const stem = filename[0 .. filename.len - 4]; // strip ".brz"
+    const epoch_secs = try parseStrftime(stem, self.roll_strftime);
+    const cycle = (epoch_secs * 1000 - self.roll_epoch) / self.roll_length_ms;
+    return @intCast(cycle);
 }
 ```
-
-**Critical detail:** The `uint64Aligned` call must produce an 8-byte-aligned
-value within the file so that when the file is later mmap'd, the kernel can
-serve atomic loads/stores on those addresses. The C `wirepad_uint64_aligned`
-function pads the current position to an 8-byte boundary, writes the `0xA7`
-INT64 control byte followed by the 8-byte little-endian value. Our Zig
-`WirePad` must reproduce this exact layout for interop with Java and with
-readers of the shared memory.
 
 ---
 
-## 8. Directory Listing Reopen
+## 10. Configuration
 
-`directory_listing_reopen` (lines 1478-1498) opens and mmaps the directory
-listing file, then parses it to locate the pointers to the three key fields
-(`highest_cycle`, `lowest_cycle`, `modcount`) within the mmap region.
+All configuration setters must be called **before** `open()`. They set fields
+on the `Queue` struct that are used during metadata creation (for new queues)
+or validated against existing metadata (for existing queues).
+
+### setRollScheme
 
 ```zig
-const DirlistMode = enum { read_only, read_write };
-
-fn directoryListingReopen(self: *Queue, mode: DirlistMode) !void {
-    const dirlist_name = self.dirlist_name orelse return error.DirlistNameNotSet;
-
-    // Close previous mapping if any
-    if (self.dirlist_map) |old_map| {
-        std.posix.munmap(old_map);
-        self.dirlist_map = null;
-    }
-    if (self.dirlist_fd) |old_fd| {
-        std.posix.close(old_fd);
-        self.dirlist_fd = null;
-    }
-
-    // Open with appropriate flags
-    const open_flags: std.fs.File.OpenFlags = switch (mode) {
-        .read_only => .{},
-        .read_write => .{ .mode = .read_write },
-    };
-    const file = try std.fs.cwd().openFile(dirlist_name, open_flags);
-    self.dirlist_fd = file.handle;
-    // Note: we do NOT defer file.close() — we keep the fd alive for the mmap
-
-    const stat = try file.stat();
-    const prot: u32 = switch (mode) {
-        .read_only => std.posix.PROT.READ,
-        .read_write => std.posix.PROT.READ | std.posix.PROT.WRITE,
-    };
-
-    self.dirlist_map = try std.posix.mmap(
-        null,
-        stat.size,
-        prot,
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    );
-
-    // Parse the mapping to find field pointers
-    self.parseDirlist();
-
-    // Validate that all three required pointers were found
-    if (self.dirlist_fields.highest_cycle == null or
-        self.dirlist_fields.lowest_cycle == null or
-        self.dirlist_fields.modcount == null)
-    {
-        return error.DirlistFieldParseFailed;
-    }
+pub fn setRollScheme(self: *Self, name: []const u8) !void {
+    const scheme = findSchemeByName(name) orelse return error.UnknownRollScheme;
+    self.roll_name = scheme.name;
+    self.roll_format = scheme.format_str;
+    self.roll_length_secs = scheme.roll_length_secs;
+    self.roll_length_ms = @as(u64, scheme.roll_length_secs) * 1000;
+    self.index_count = scheme.index_count;
+    self.index_spacing = scheme.index_spacing;
+    self.roll_strftime = try javaFormatToStrftime(self.allocator, scheme.format_str);
 }
 ```
 
-### How `parseDirlist` finds field pointers
-
-The directory listing is a sequence of Chronicle Queue messages. The wire
-parser walks each data message looking for `event_name` values matching
-`"listing.highestCycle"`, `"listing.lowestCycle"`, and `"listing.modCount"`.
-When found, it stores a **pointer into the mmap** (not a copy of the value)
-so that future reads see the live shared-memory value. The C does this via
-the `ptr_uint64` callback in `wirecallbacks_t` (see `handle_dirlist_ptr`,
-lines 691-702).
-
-In Zig the parsing callback receives a slice into the mmap buffer. We
-compute the pointer to the uint64 payload:
+### setBlocksize
 
 ```zig
-fn parseDirlist(self: *Queue) void {
-    const map = self.dirlist_map orelse return;
-
-    var base: usize = 0;
-    var index: u64 = 0;
-
-    while (base + 4 < map.len) {
-        const header = std.mem.readInt(u32, map[base..][0..4], .little);
-
-        if (header == HD_UNALLOCATED) break;
-
-        const meta_bits = header & HD_MASK_META;
-        const sz: usize = @intCast(header & HD_MASK_LENGTH);
-
-        if (meta_bits == HD_EOF) break;
-
-        if (meta_bits == HD_METADATA) {
-            // Skip metadata messages (already parsed for roll config)
-            base += 4 + sz;
-            // v5 pad to 4-byte alignment
-            if (self.version == .v5) {
-                const pad4 = (-%: sz) & 0x03;
-                base += pad4;
-            }
-            continue;
-        }
-
-        // Data message — look for known event names within the wire data
-        if (base + 4 + sz <= map.len) {
-            const payload = map[base + 4 .. base + 4 + sz];
-            self.matchDirlistField(payload);
-        }
-
-        index += 1;
-        base += 4 + sz;
-        if (self.version == .v5) {
-            const pad4 = (-%: sz) & 0x03;
-            base += pad4;
-        }
-    }
-}
-
-fn matchDirlistField(self: *Queue, payload: []const u8) void {
-    // The wire format for a data message is:
-    //   B9 <len> <event_name_bytes>   — EVENT_NAME control byte
-    //   A7 <8 bytes little-endian>    — INT64 control byte
-    // We search for the event name then extract the pointer to the uint64.
-    // (A full wire parser would handle this generically; this is a focused
-    //  extractor for the three fields we need.)
-
-    const event_name = extractEventName(payload) orelse return;
-    const uint64_ptr = findAlignedUint64(payload) orelse return;
-
-    if (std.mem.eql(u8, event_name, "listing.highestCycle")) {
-        self.dirlist_fields.highest_cycle = uint64_ptr;
-    } else if (std.mem.eql(u8, event_name, "listing.lowestCycle")) {
-        self.dirlist_fields.lowest_cycle = uint64_ptr;
-    } else if (std.mem.eql(u8, event_name, "listing.modCount")) {
-        self.dirlist_fields.modcount = uint64_ptr;
-    }
+pub fn setBlocksize(self: *Self, blocksize: u64) void {
+    self.blocksize = blocksize;
 }
 ```
 
-The actual pointer is into the **live mmap** — any writer that updates the
-field via the mmap will be visible to this reader, enabling the real-time
-shared-memory IPC protocol.
+### setPrerollMs (NEW)
+
+```zig
+pub fn setPrerollMs(self: *Self, ms: u64) void {
+    self.preroll_ms = ms;
+}
+```
+
+Controls how far in advance of a cycle boundary the pre-roll file is created.
+Set to `0` to disable pre-rolling entirely.
+
+### setUseHugePages (NEW)
+
+```zig
+pub fn setUseHugePages(self: *Self, enabled: bool) void {
+    self.use_huge_pages = enabled;
+}
+```
+
+When enabled, mmap calls include `MAP_HUGETLB` for 2 MiB huge pages. Falls
+back to 4 KiB pages if the kernel can't satisfy the request. Requires the
+blocksize to be 2 MiB-aligned.
+
+### setCreate
+
+```zig
+pub fn setCreate(self: *Self, permitted: bool) void {
+    self.create_permitted = permitted;
+}
+```
 
 ---
 
-## 9. Queue File Init
+## 11. Queue Cleanup (deinit)
 
-`queuefile_init` (lines 1370-1398) creates a new `.cq4` file and extends it
-to `qf_disk_sz` (83,754,496 bytes) by seeking to the last byte and writing
-a single byte. This pre-allocates disk space so that mmap can cover the
-entire file.
+Teardown releases all resources in reverse order of acquisition. Every mmap
+is unmapped, every fd is closed, every allocation is freed.
 
 ```zig
-fn queuefileInit(self: *Queue, path: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{
-        .mode = 0o777,
-        .truncate = true,
-        .read = true,
-    });
-    defer file.close();
-
-    // Extend file to qf_disk_sz bytes by seeking and writing a single byte
-    try file.seekTo(Queue.qf_disk_sz - 1);
-    try file.writer().writeByte(0);
-
-    // TODO: write queue file header (metadata with roll config)
-    // TODO: write index2index structure
-}
-```
-
-**Note:** The C code has two TODO comments here — the queuefile header and
-index2index are not yet written. The Zig port should eventually write:
-1. A metadata message with the roll configuration (matching what Java writes)
-2. An index2index page for the indexing structure
-
-For now, the file is created as a sparse allocation that will be populated
-by the appender.
-
----
-
-## 10. Queue Cleanup
-
-`chronicle_cleanup` (lines 1326-1368) tears down everything:
-
-1. Unlinks the queue from the global list
-2. Closes all tailers (each: unmap, close fd, free)
-3. Closes the appender (same as tailer)
-4. Unmaps the directory listing
-5. Closes the dirlist fd
-6. Frees all owned strings
-7. Frees the glob results
-8. Frees the queue struct itself
-
-In Zig, we use `deinit` and lean on the allocator:
-
-```zig
-pub fn deinit(self: *Queue) void {
-    // Close all tailers
-    while (self.tailers.first) |node| {
-        const tailer = &node.data;
-        tailer.close(); // handles munmap, close(fd), unlink from list
+pub fn deinit(self: *Self) void {
+    // 1. Close all tailers (munmap + close fd for each)
+    for (self.tailers.items) |tailer| {
+        tailer.deinit();
     }
+    self.tailers.deinit();
 
-    // Close the appender
+    // 2. Close appender if present
     if (self.appender) |app| {
-        app.close();
+        app.deinit();
         self.appender = null;
     }
 
-    // Unmap directory listing
-    if (self.dirlist_map) |map| {
-        std.posix.munmap(map);
+    // 3. Cancel pending io_uring operations and tear down ring
+    if (self.uring_ctx) |*ctx| {
+        ctx.deinit();
+        self.uring_ctx = null;
     }
-    if (self.dirlist_fd) |fd| {
+
+    // 4. Close eventfd
+    if (self.eventfd) |efd| {
+        std.posix.close(efd);
+        self.eventfd = null;
+    }
+
+    // 5. Unmap and close pre-roll fd/mmap if present
+    if (self.preroll_mmap) |buf| {
+        unmapFile(buf) catch {};
+        self.preroll_mmap = null;
+    }
+    if (self.preroll_fd) |fd| {
         std.posix.close(fd);
+        self.preroll_fd = null;
+    }
+    self.preroll_cycle = null;
+
+    // 6. Unmap and close metadata
+    if (self.metadata_mmap) |buf| {
+        unmapFile(buf) catch {};
+        self.metadata_mmap = null;
+    }
+    self.metadata = null;
+    if (self.metadata_fd) |fd| {
+        std.posix.close(fd);
+        self.metadata_fd = null;
     }
 
-    // Free all owned strings
-    if (self.dirlist_name) |n| self.allocator.free(n);
-    if (self.roll_format) |s| self.allocator.free(s);
-    if (self.roll_name) |s| self.allocator.free(s);
-    if (self.roll_strftime) |s| self.allocator.free(s);
-
-    // Free globbed paths
-    for (self.queuefile_paths.items) |p| self.allocator.free(p);
+    // 7. Free all allocated queue file path strings
+    for (self.queuefile_paths.items) |p| {
+        self.allocator.free(p);
+    }
     self.queuefile_paths.deinit();
 
-    // Free dirname and the queue struct itself
+    // 8. Free dirname if owned
     self.allocator.free(self.dirname);
-    self.allocator.destroy(self);
 }
 ```
 
-**Zig advantage:** By storing the allocator in the struct, `deinit` can free
-everything without the caller needing to pass the allocator back. The
-`errdefer` pattern in `init` / `open` ensures partial failures also clean up.
+### Ordering rationale
+
+| Step | Why this order |
+|------|----------------|
+| Tailers first | Tailers hold read-only mappings into data files; close before files |
+| Appender second | Appender may hold write mappings; must flush before closing |
+| io_uring third | Cancel in-flight SQEs before closing the fds they reference |
+| eventfd fourth | After io_uring is down, no one polls it |
+| Pre-roll fifth | Independent fd/mmap, safe to close after appender |
+| Metadata sixth | Other components may reference metadata pointer; close last |
+| Strings last | Path strings may be referenced by error messages during teardown |
 
 ---
 
-## 11. Global Queue Registry
+## 12. Error Handling
 
-The C code uses a global singly-linked list (`queue_head`) so that
-`chronicle_peek()` can iterate all open queues. This is inherently
-thread-unsafe and creates hidden global state.
-
-In Zig, we replace this with an explicit `QueueRegistry`:
-
-```zig
-pub const QueueRegistry = struct {
-    queues: std.ArrayList(*Queue),
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) QueueRegistry {
-        return .{
-            .queues = std.ArrayList(*Queue).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *QueueRegistry) void {
-        // Note: does NOT deinit the queues themselves — caller owns them
-        self.queues.deinit();
-    }
-
-    pub fn register(self: *QueueRegistry, queue: *Queue) !void {
-        try self.queues.append(queue);
-    }
-
-    pub fn unregister(self: *QueueRegistry, queue: *Queue) void {
-        for (self.queues.items, 0..) |q, i| {
-            if (q == queue) {
-                _ = self.queues.orderedRemove(i);
-                return;
-            }
-        }
-    }
-
-    /// Poll all registered queues (equivalent to C chronicle_peek)
-    pub fn peekAll(self: *QueueRegistry) void {
-        for (self.queues.items) |queue| {
-            queue.peekQueue();
-        }
-    }
-};
-```
-
-Usage pattern:
-
-```zig
-var registry = QueueRegistry.init(allocator);
-defer registry.deinit();
-
-var queue = try Queue.init(allocator, "/tmp/myqueue");
-try registry.register(queue);
-defer {
-    registry.unregister(queue);
-    queue.deinit();
-}
-
-try queue.open();
-
-// Later, in event loop:
-registry.peekAll();
-```
-
-This keeps the queue collection explicit and testable, with no hidden global
-state. For single-queue programs that don't need a registry, the user can
-simply call `queue.peekQueue()` directly.
-
----
-
-## 12. Error Handling Strategy
-
-The C library uses a single global error string:
-
-```c
-static const char* cerr_msg;
-int chronicle_err(const char* msg) {
-    printf("chronicle error: '%s\n", msg);
-    cerr_msg = msg;
-    return -1;
-}
-```
-
-This has several problems:
-- Not thread-safe
-- Loses context from nested errors
-- Caller must remember to check return value AND call `chronicle_strerror()`
-
-In Zig, we use **error unions** — the canonical Zig error handling pattern:
+### Error set
 
 ```zig
 pub const QueueError = error{
-    // Init / open errors
-    DirStatFailed,
-    NotADirectory,
-    QueueNotFoundNoCreate,
-    VersionRequired,
-    CreateRequiresEmptyDir,
-    RollSchemeRequired,
-    VersionMismatch,
+    // Directory errors
+    QueueNotFound,
+    DirectoryNotFound,
+    DirectoryCreateFailed,
 
-    MissingRollFormat,
-    MissingRollLength,
-    MissingRollEpoch,
-    UnknownRollScheme,
-    InvalidDateFormat,
-
-    // Directory listing errors
-    DirlistNameNotSet,
-    DirlistFieldParseFailed,
-    DirlistOpenFailed,
-    DirlistMmapFailed,
+    // Metadata errors
+    InvalidMagic,
+    InvalidVersion,
+    MetadataCorrupt,
+    MetadataCreateFailed,
 
     // Queue file errors
-    QueuefileCreateFailed,
-    QueuefileLseekFailed,
-    QueuefileWriteFailed,
+    QueueFileCreateFailed,
+    QueueFileCorrupt,
+    InvalidQueueFileHeader,
 
-    // General
-    OutOfMemory,
-    AllocFailed,
+    // Configuration errors
+    InvalidRollConfig,
+    UnknownRollScheme,
+    RollConfigMismatch,
+
+    // mmap errors
+    MmapFailed,
+    MunmapFailed,
+    MsyncFailed,
+
+    // fallocate errors
+    FallocateFailed,
+    DiskFull,
+
+    // io_uring errors
+    IoUringInitFailed,
+    IoUringSubmitFailed,
+    EventfdCreateFailed,
+
+    // Pre-roll errors
+    PrerollFailed,
+
+    // Lock errors
+    WriteLockContention,
 };
 ```
 
-Functions return `QueueError!T` where `T` is the success type. The caller
-can use `try` to propagate, `catch` to handle, or `catch |err| switch (err)`
-for exhaustive matching.
-
-For diagnostic logging (replacing the `printf` calls), we use `std.log`:
+### Logging
 
 ```zig
-const log = std.log.scoped(.chronicle);
+const log = std.log.scoped(.brz_queue);
 
-// In functions:
-log.info("opening dir {s}", .{self.dirname});
-log.err("dir stat failed for {s}", .{self.dirname});
+// In open():
+log.info("opening queue at {s}", .{self.dirname});
+log.debug("detected version: {}", .{self.version});
+log.debug("roll scheme: {s} ({}s cycles, {} index entries)", .{
+    self.roll_name, self.roll_length_secs, self.index_count,
+});
+
+// In metadataInit():
+log.info("creating metadata.brz ({} bytes)", .{Queue.metadata_file_sz});
+
+// In queuefileInit():
+log.info("creating queue file: {s} (cycle {})", .{ path, cycle });
+
+// In maybePreroll():
+log.debug("pre-rolling cycle {} ({} ms before boundary)", .{
+    next_cycle, cycle_end_ms - current_time_ms,
+});
 ```
-
-This integrates with Zig's log level filtering — debug builds get verbose
-output, release builds are quiet by default.
 
 ---
 
-## 13. Roll Scheme Table
-
-The C code defines ~27 roll schemes in a static array (lines 436-465). In
-Zig, we define this as a comptime-known array of structs:
-
-```zig
-pub const RollScheme = struct {
-    name: []const u8,
-    format: []const u8,      // Java SimpleDateFormat
-    roll_length_secs: u32,
-    index_count: u32,
-    index_spacing: u32,
-};
-
-pub const roll_schemes = [_]RollScheme{
-    // ── In use by cq5 ─────────────────────────────────────────
-    .{ .name = "FIVE_MINUTELY",        .format = "yyyyMMdd-HHmm'V'",    .roll_length_secs = 5 * 60,      .index_count = 2 << 10, .index_spacing = 256 },
-    .{ .name = "TEN_MINUTELY",         .format = "yyyyMMdd-HHmm'X'",    .roll_length_secs = 10 * 60,     .index_count = 2 << 10, .index_spacing = 256 },
-    .{ .name = "TWENTY_MINUTELY",      .format = "yyyyMMdd-HHmm'XX'",   .roll_length_secs = 20 * 60,     .index_count = 2 << 10, .index_spacing = 256 },
-    .{ .name = "HALF_HOURLY",          .format = "yyyyMMdd-HHmm'H'",    .roll_length_secs = 30 * 60,     .index_count = 2 << 10, .index_spacing = 256 },
-    .{ .name = "FAST_HOURLY",          .format = "yyyyMMdd-HH'F'",      .roll_length_secs = 60 * 60,     .index_count = 4 << 10, .index_spacing = 256 },
-    .{ .name = "TWO_HOURLY",           .format = "yyyyMMdd-HH'II'",     .roll_length_secs = 2 * 60 * 60, .index_count = 4 << 10, .index_spacing = 256 },
-    .{ .name = "FOUR_HOURLY",          .format = "yyyyMMdd-HH'IV'",     .roll_length_secs = 4 * 60 * 60, .index_count = 4 << 10, .index_spacing = 256 },
-    .{ .name = "SIX_HOURLY",           .format = "yyyyMMdd-HH'VI'",     .roll_length_secs = 6 * 60 * 60, .index_count = 4 << 10, .index_spacing = 256 },
-    .{ .name = "FAST_DAILY",           .format = "yyyyMMdd'F'",         .roll_length_secs = 24 * 60 * 60,.index_count = 4 << 10, .index_spacing = 256 },
-    // ── Used historically by cq4 ──────────────────────────────
-    .{ .name = "MINUTELY",             .format = "yyyyMMdd-HHmm",       .roll_length_secs = 60,          .index_count = 2 << 10, .index_spacing = 16 },
-    .{ .name = "HOURLY",               .format = "yyyyMMdd-HH",         .roll_length_secs = 60 * 60,     .index_count = 4 << 10, .index_spacing = 16 },
-    .{ .name = "DAILY",                .format = "yyyyMMdd",            .roll_length_secs = 24 * 60 * 60,.index_count = 8 << 10, .index_spacing = 64 },
-    // ── Large rolls ───────────────────────────────────────────
-    .{ .name = "LARGE_HOURLY",         .format = "yyyyMMdd-HH'L'",      .roll_length_secs = 60 * 60,     .index_count = 8 << 10, .index_spacing = 64 },
-    .{ .name = "LARGE_DAILY",          .format = "yyyyMMdd'L'",         .roll_length_secs = 24 * 60 * 60,.index_count = 32 << 10,.index_spacing = 128 },
-    .{ .name = "XLARGE_DAILY",         .format = "yyyyMMdd'X'",         .roll_length_secs = 24 * 60 * 60,.index_count = 32 << 10,.index_spacing = 256 },
-    .{ .name = "HUGE_DAILY",           .format = "yyyyMMdd'H'",         .roll_length_secs = 24 * 60 * 60,.index_count = 32 << 10,.index_spacing = 1024 },
-    // ── Test / benchmark ──────────────────────────────────────
-    .{ .name = "SMALL_DAILY",          .format = "yyyyMMdd'S'",         .roll_length_secs = 24 * 60 * 60,.index_count = 8 << 10, .index_spacing = 8 },
-    .{ .name = "LARGE_HOURLY_SPARSE",  .format = "yyyyMMdd-HH'LS'",    .roll_length_secs = 60 * 60,     .index_count = 4 << 10, .index_spacing = 1024 },
-    .{ .name = "LARGE_HOURLY_XSPARSE", .format = "yyyyMMdd-HH'LX'",    .roll_length_secs = 60 * 60,     .index_count = 2 << 10, .index_spacing = 1 << 20 },
-    .{ .name = "HUGE_DAILY_XSPARSE",   .format = "yyyyMMdd'HX'",       .roll_length_secs = 24 * 60 * 60,.index_count = 16 << 10,.index_spacing = 1 << 20 },
-    .{ .name = "TEST_SECONDLY",        .format = "yyyyMMdd-HHmmss'T'",  .roll_length_secs = 1,           .index_count = 32 << 10,.index_spacing = 4 },
-    .{ .name = "TEST4_SECONDLY",       .format = "yyyyMMdd-HHmmss'T4'", .roll_length_secs = 1,           .index_count = 32,      .index_spacing = 4 },
-    .{ .name = "TEST_HOURLY",          .format = "yyyyMMdd-HH'T'",      .roll_length_secs = 60 * 60,     .index_count = 16,      .index_spacing = 4 },
-    .{ .name = "TEST_DAILY",           .format = "yyyyMMdd'T1'",        .roll_length_secs = 24 * 60 * 60,.index_count = 8,       .index_spacing = 1 },
-    .{ .name = "TEST2_DAILY",          .format = "yyyyMMdd'T2'",        .roll_length_secs = 24 * 60 * 60,.index_count = 16,      .index_spacing = 2 },
-    .{ .name = "TEST4_DAILY",          .format = "yyyyMMdd'T4'",        .roll_length_secs = 24 * 60 * 60,.index_count = 32,      .index_spacing = 4 },
-    .{ .name = "TEST8_DAILY",          .format = "yyyyMMdd'T8'",        .roll_length_secs = 24 * 60 * 60,.index_count = 128,     .index_spacing = 8 },
-};
-```
-
-Since these are `comptime`-known, lookups can be done at compile time for
-known scheme names, or at runtime via linear scan for user-supplied names.
-
----
-
-## 14. Testing Notes
+## 13. Testing Strategy
 
 ### Unit tests for lifecycle
 
 ```zig
 const testing = std.testing;
 
-test "Queue init and deinit" {
-    const queue = try Queue.init(testing.allocator, "/tmp/test_chronicle");
-    defer queue.deinit();
+test "metadata creation produces 512-byte file" {
+    const tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try testing.expectEqual(@as(u32, 1 << 20), queue.blocksize);
-    try testing.expectEqual(Version.unknown, queue.version);
-    try testing.expectEqualStrings("/tmp/test_chronicle", queue.dirname);
+    var q = try Queue.init(testing.allocator, tmp.path);
+    defer q.deinit();
+    q.setCreate(true);
+
+    try q.open();
+
+    // Verify file size
+    const stat = try tmp.dir.statFile("metadata.brz");
+    try testing.expectEqual(@as(u64, 512), stat.size);
 }
 
-test "Java date format conversion" {
-    const result = try convertJavaDateFormat(testing.allocator, "yyyyMMdd-HH'F'");
-    defer testing.allocator.free(result);
-    try testing.expectEqualStrings("%Y%m%d-%HF", result);
+test "metadata read-back via pointer cast" {
+    const tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var q = try Queue.init(testing.allocator, tmp.path);
+    defer q.deinit();
+    q.setCreate(true);
+
+    try q.open();
+
+    // Verify fields through the metadata pointer
+    try testing.expectEqual(@as(u32, 0x425A514D), q.metadata.?.magic);
+    try testing.expectEqual(@as(u16, 1), q.metadata.?.version);
+    try testing.expectEqual(@as(u32, 86400), q.metadata.?.roll_length_secs);
+    try testing.expectEqual(@as(u32, 4096), q.metadata.?.index_count);
+    try testing.expectEqual(@as(u32, 256), q.metadata.?.index_spacing);
 }
 
-test "Roll scheme lookup" {
-    const queue = try Queue.init(testing.allocator, "/tmp/test");
-    defer queue.deinit();
+test "queue file creation with fallocate" {
+    const tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try queue.setRollScheme("FAST_HOURLY");
-    try testing.expectEqualStrings("FAST_HOURLY", queue.roll_name.?);
-    try testing.expectEqual(@as(i32, 3_600_000), queue.roll_length_ms);
+    var q = try Queue.init(testing.allocator, tmp.path);
+    defer q.deinit();
+    q.setCreate(true);
+
+    try q.open();
+
+    const fd = try q.queuefileInit(
+        try std.fs.path.join(testing.allocator, &.{ tmp.path, "20250101F.brz" }),
+        0,
+    );
+    defer std.posix.close(fd);
+
+    // Verify pre-allocated size
+    const stat = try std.posix.fstat(fd);
+    try testing.expect(stat.size >= Queue.qf_disk_sz);
+}
+
+test "pre-roll file creation timing" {
+    const tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var q = try Queue.init(testing.allocator, tmp.path);
+    defer q.deinit();
+    q.setCreate(true);
+    q.setPrerollMs(1000); // 1 second window
+
+    try q.open();
+
+    // Simulate time 500ms before cycle boundary
+    const roll_ms = @as(u64, q.roll_length_secs) * 1000;
+    const cycle_boundary = roll_ms; // end of cycle 0
+    const fake_time = cycle_boundary - 500;
+
+    try q.maybePreroll(fake_time);
+
+    // Pre-roll should have been triggered (500 < 1000ms window)
+    try testing.expect(q.preroll_cycle != null);
+    try testing.expectEqual(@as(u32, 1), q.preroll_cycle.?);
+}
+
+test "cycle enumeration with .brz files" {
+    const tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create some fake .brz files
+    _ = try tmp.dir.createFile("20250101F.brz", .{});
+    _ = try tmp.dir.createFile("20250102F.brz", .{});
+    _ = try tmp.dir.createFile("20250103F.brz", .{});
+    _ = try tmp.dir.createFile("metadata.brz", .{});
+
+    var q = try Queue.init(testing.allocator, tmp.path);
+    defer q.deinit();
+
+    try q.refreshQueueFiles();
+
+    // Should find 3 data files (metadata.brz excluded)
+    try testing.expectEqual(@as(usize, 3), q.queuefile_paths.items.len);
+
+    // Should be sorted
+    try testing.expect(std.mem.lessThan(u8, q.queuefile_paths.items[0], q.queuefile_paths.items[1]));
+    try testing.expect(std.mem.lessThan(u8, q.queuefile_paths.items[1], q.queuefile_paths.items[2]));
+}
+
+test "version detection finds v1 from metadata.brz" {
+    const tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write a minimal valid metadata file
+    const f = try tmp.dir.createFile("metadata.brz", .{});
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, 0x425A514D, .little);
+    _ = try f.write(&buf);
+    f.close();
+
+    const version = try detectVersion(tmp.path);
+    try testing.expectEqual(Version.v1, version);
 }
 ```
 
 ### Integration tests
 
-- Create a temporary directory, init a v5 queue with create, open it, verify
-  `metadata.cq4t` exists and can be parsed.
-- Open a queue directory created by Java Chronicle Queue, verify version
-  detection and roll config reading.
-- Test cleanup: verify no leaked file descriptors (check `/proc/self/fd`).
+- **Round-trip**: create queue → write message → read message → verify contents
+- **Re-open**: create queue, close it, re-open → verify metadata survives
+- **Pre-roll + roll**: write messages until cycle rolls → verify pre-rolled file
+  is used and no syscalls happen during the roll
+- **Multi-reader**: spawn multiple reader threads → verify all see the same
+  messages in order
 
 ### Memory leak detection
 
-Zig's `testing.allocator` tracks all allocations and fails the test if any
-are leaked. This replaces the need for Valgrind in most cases.
+All tests should run under Zig's `GeneralPurposeAllocator` with leak detection
+enabled. The `deinit` path must free every allocation made during `init`/`open`:
 
----
+```zig
+test "no memory leaks on full lifecycle" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const check = gpa.deinit();
+        if (check == .leak) @panic("memory leak detected");
+    }
+    const allocator = gpa.allocator();
 
-## Summary of C → Zig Mapping
+    var q = try Queue.init(allocator, "/tmp/brz-queue-leak-test");
+    defer q.deinit();
+    q.setCreate(true);
+    try q.open();
 
-| C function | Zig method | Key changes |
-|---|---|---|
-| `chronicle_init` | `Queue.init` | `errdefer` for partial failures |
-| `chronicle_open` | `Queue.open` | Error union instead of -1 return |
-| `chronicle_cleanup` | `Queue.deinit` | Allocator-based, no global list walk |
-| `chronicle_set_version` | `Queue.setVersion` | Enum instead of int |
-| `chronicle_set_roll_scheme` | `Queue.setRollScheme` | Returns `error.UnknownRollScheme` |
-| `chronicle_set_create` | `Queue.setCreate` | `bool` instead of `int` |
-| `chronicle_set_encoder` | `Queue.setEncoder` | Typed function pointers |
-| `chronicle_set_decoder` | `Queue.setDecoder` | Typed function pointers |
-| `chronicle_version_detect` | `detectVersion` | Uses `std.fs.Dir.openFile` |
-| `directory_listing_init` | `Queue.directoryListingInit` | `WirePad` builder |
-| `directory_listing_reopen` | `Queue.directoryListingReopen` | `std.posix.mmap` |
-| `queuefile_init` | `Queue.queuefileInit` | `std.fs.File` seek + write |
-| `chronicle_apply_roll_scheme` | `Queue.applyRollScheme` | Pure Zig string conversion |
-| `chronicle_get_cycle_fn` | `Queue.getCycleFn` | `std.fmt.allocPrint` |
-| `chronicle_err` / `chronicle_strerror` | Error unions | No global state |
-| Global `queue_head` list | `QueueRegistry` | Explicit, testable |
+    // ... use queue ...
+}
+```

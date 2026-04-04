@@ -1,1161 +1,686 @@
 # Task 5: Appender (Writer) Implementation
 
-This document covers the Zig reimplementation of the Chronicle Queue appender
-(writer) — the `chronicle_append_ts` function and all supporting logic. The
-appender is the most complex single function in libchronicle, combining lazy
-initialisation, a state machine loop, atomic CAS operations, cycle rolling,
-EOF patching, and file creation with atomic rename.
+> **brz-queue** — lock-free, memory-mapped IPC queue in Zig
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Appender Architecture](#2-appender-architecture)
-3. [chronicle_append / chronicle_append_ts Entry Points](#3-entry-points)
-4. [Size Validation](#4-size-validation)
-5. [Modcount Refresh](#5-modcount-refresh)
-6. [Lazy Appender Creation](#6-lazy-appender-creation)
-7. [The Write Loop State Machine](#7-the-write-loop-state-machine)
-8. [Handling TS_AWAITING_QUEUEFILE](#8-handling-ts_awaiting_queuefile)
-9. [Handling TS_EXTEND_FAIL](#9-handling-ts_extend_fail)
-10. [Handling Non-AWAITING_ENTRY States](#10-handling-non-awaiting_entry-states)
-11. [The CAS Write Sequence](#11-the-cas-write-sequence)
-12. [Cycle Rolling](#12-cycle-rolling)
-13. [EOF Patching](#13-eof-patching)
-14. [Clock and Cycle Helpers](#14-clock-and-cycle-helpers)
-15. [Poke Queue Modcount](#15-poke-queue-modcount)
-16. [Concurrency Model](#16-concurrency-model)
-17. [Complete Zig Code Sketch](#17-complete-zig-code-sketch)
-18. [Testing Notes](#18-testing-notes)
+2. [Appender Struct](#2-appender-struct)
+3. [The Hot Path: `append(msg)`](#3-the-hot-path-appendmsg)
+4. [CAS Arbitration Detail](#4-cas-arbitration-detail)
+5. [Cycle Roll Handling](#5-cycle-roll-handling)
+6. [Pre-Roll Integration](#6-pre-roll-integration)
+7. [Flat Index Updates](#7-flat-index-updates)
+8. [eventfd Signaling](#8-eventfd-signaling)
+9. [File Extension](#9-file-extension)
+10. [EOF Patching](#10-eof-patching)
+11. [Performance Characteristics](#11-performance-characteristics)
+12. [Error Handling](#12-error-handling)
+13. [Testing Strategy](#13-testing-strategy)
 
 ---
 
 ## 1. Overview
 
-The appender is the write path of Chronicle Queue. A single call to
-`chronicle_append_ts(queue, msg, ms)` may trigger any combination of:
+The appender is the write-side of brz-queue. It is a **single-writer** component — only one
+thread may append at a time within a given process. No external locking is needed for the
+single-writer case. When multiple *processes* each have an appender on the same queue directory,
+coordination is handled by the CAS on the entry header in shared mmap memory.
 
-- Creating the appender tailer (first call only)
-- Re-opening the directory listing in read-write mode
-- Creating a new `.cq4` queuefile (with atomic rename)
-- Extending an existing queuefile on disk
-- Writing an EOF marker to roll to the next cycle
-- Patching EOF markers on stale cycle files
-- Performing a CAS (compare-and-swap) to acquire the write lock
-- Writing the payload and releasing the lock by writing the size header
+The design prioritizes:
 
-All of this happens inside a `while(1)` loop that polls the appender tailer's
-state machine (the same `peek_queue_tailer_r` used by readers) and reacts to
-each state.
+- **Zero allocations on the hot path** — all memory is pre-mapped; payload is written directly
+  into the mmap region via the comptime codec interface.
+- **Minimal syscalls on the hot path** — zero in steady state, except for an optional eventfd
+  write to signal readers.
+- **Predictable latency** — tiered CAS backoff (spin → yield → exponential) replaces any
+  coarse sleep. Pre-roll ensures cycle transitions don't stall the writer.
 
-### C function reference
+### File Conventions
 
-| C function | Lines | Purpose |
-|---|---|---|
-| `chronicle_append` | 1036-1039 | Wrapper: calls `chronicle_append_ts` with current clock |
-| `chronicle_append_ts` | 1041-1231 | Full append logic |
-| `chronicle_clock_ms` | 582-588 | Get current time in milliseconds |
-| `chronicle_cycle_from_ms` | 590-592 | Convert milliseconds to cycle number |
-| `poke_queue_modcount` | 802-810 | Push cycle/modcount to shared mmap |
-| `lock_cmpxchgl` | 216-222 | Inline asm: `lock; cmpxchgl` |
-| `lock_xadd` | 224-231 | Inline asm: `lock; xaddl` |
-| `queuefile_init` | 1370-1398 | Create empty .cq4 file |
-| `queue_double_blocksize` | 252-256 | Double blocksize when needed |
+| Artifact | Extension / Name |
+|---|---|
+| Data files | `.brz` (one per cycle) |
+| Shared metadata | `metadata.brz` |
 
 ---
 
-## 2. Appender Architecture
+## 2. Appender Struct
 
-The appender is **not** a separate struct — it is a `tailer_t` with special
-properties:
-
-| Property | Reader tailer | Appender tailer |
-|---|---|---|
-| `mmap_protection` | `PROT_READ` | `PROT_READ \| PROT_WRITE` |
-| `dispatcher` | User callback | `null` |
-| `dispatch_ctx` | User context | `null` |
-| Linked list | In `queue->tailers` | Stored as `queue->appender` |
-| Index start | User-specified | `(highest_cycle - patch_cycles) << cycle_shift` |
-
-The appender reuses the tailer's state machine (`peek_queue_tailer_r`) to
-navigate through the queue files. Because it has `PROT_WRITE`, it can:
-- Write to the mmap'd queuefile
-- Signal `TS_EXTEND_FAIL` when the file needs growing
-- Perform CAS operations on headers
-
----
-
-## 3. Entry Points
-
-### `chronicle_append` (C line 1036)
-
-A thin wrapper that calls `chronicle_append_ts` with the current clock:
-
-```c
-uint64_t chronicle_append(queue_t *queue, COBJ msg) {
-    long ms = chronicle_clock_ms(queue);
-    return chronicle_append_ts(queue, msg, ms);
-}
-```
-
-In Zig:
+The appender is a specialized Tailer with write permissions. It re-uses the Tailer's mmap
+window management, tip tracking, and file descriptor lifecycle, and layers write-specific
+state on top.
 
 ```zig
-pub fn append(self: *Queue, msg: *const anyopaque) !u64 {
-    return self.appendTs(msg, self.clockMs());
-}
-```
+pub const Appender = struct {
+    queue: *Queue,
+    tailer: Tailer,           // mmap window, tip, index, fd, etc.
+    cas_attempt: u32 = 0,     // backoff iteration counter
+    preroll_checked: bool = false,
 
-### `chronicle_append_ts` (C line 1041)
-
-This is the full implementation, detailed in sections 4-13 below.
-
----
-
-## 4. Size Validation
-
-Before anything else, the appender validates the write size (C lines 1082-1086):
-
-```c
-size_t write_sz = queue->append_sizeof(msg);
-if (write_sz < 0) return 0;
-if (write_sz > HD_MASK_META) return chronicle_err("shm msg sz > 30bit");
-while (write_sz > queue->blocksize)
-    queue_double_blocksize(queue);
-```
-
-Three checks:
-1. **Positive size** — the sizeof callback must return a valid size
-2. **Fits in 30 bits** — the header format uses 30 bits for the length field
-   (`HD_MASK_LENGTH = 0x3FFFFFFF`), so maximum message size is ~1 GiB
-3. **Fits in blocksize** — if the message is larger than the current blocksize,
-   double the blocksize repeatedly until it fits. This ensures the mmap window
-   (2× blocksize) can contain the entire message.
-
-In Zig:
-
-```zig
-const write_sz = self.append_sizeof.?(msg);
-if (write_sz == 0) return error.ZeroSizeMessage;
-if (write_sz > HD_MASK_LENGTH) return error.MessageTooLarge;
-while (write_sz > self.blocksize) {
-    self.doubleBlocksize();
-}
-```
-
-### `doubleBlocksize`
-
-```zig
-fn doubleBlocksize(self: *Queue) void {
-    const new = self.blocksize << 1;
-    log.info("doubling blocksize from 0x{x} to 0x{x}", .{ self.blocksize, new });
-    self.blocksize = new;
-}
-```
-
----
-
-## 5. Modcount Refresh
-
-Before writing, we poll the directory listing mmap for changes (C line 1089):
-
-```c
-peek_queue_modcount(queue);
-```
-
-This reads the shared `modcount` field from the mmap. If it has changed since
-our last check, it refreshes `highest_cycle` and `lowest_cycle` too. This
-allows our appender to follow another appender that may have created new
-queuefiles.
-
-### `peek_queue_modcount` (C lines 788-800)
-
-```c
-void peek_queue_modcount(queue_t* queue) {
-    uint64_t modcount;
-    memcpy(&modcount, queue->dirlist_fields.modcount, sizeof(modcount));
-    if (queue->modcount != modcount) {
-        memcpy(&queue->modcount, queue->dirlist_fields.modcount, sizeof(modcount));
-        memcpy(&queue->lowest_cycle, queue->dirlist_fields.lowest_cycle, sizeof(modcount));
-        memcpy(&queue->highest_cycle, queue->dirlist_fields.highest_cycle, sizeof(modcount));
+    pub fn init(queue: *Queue) !Appender {
+        var tailer = try Tailer.init(queue, .write);
+        return Appender{
+            .queue = queue,
+            .tailer = tailer,
+        };
     }
-}
-```
 
-In Zig:
-
-```zig
-fn peekQueueModcount(self: *Queue) void {
-    const fields = self.dirlist_fields;
-    const modcount = @as(*const volatile u64, @ptrCast(fields.modcount.?)).*;
-
-    if (self.modcount != modcount) {
-        log.info("{s} modcount changed from {} to {}", .{ self.dirname, self.modcount, modcount });
-        self.modcount = modcount;
-        self.lowest_cycle = @as(*const volatile u64, @ptrCast(fields.lowest_cycle.?)).*;
-        self.highest_cycle = @as(*const volatile u64, @ptrCast(fields.highest_cycle.?)).*;
+    pub fn deinit(self: *Appender) void {
+        self.tailer.deinit();
     }
-}
-```
-
-**Note on `volatile`:** The C code uses `memcpy` from an mmap'd pointer,
-which prevents the compiler from caching the value. In Zig, we use
-`@as(*const volatile u64, ...).*` to achieve the same effect — ensuring
-every read actually hits the mmap'd memory and is not elided by the
-optimiser.
-
----
-
-## 6. Lazy Appender Creation
-
-The appender is created on the first call to `appendTs`, not during `open`.
-This is because appending requires the directory listing to be mapped
-read-write, and most readers never need that.
-
-### C logic (lines 1092-1112)
-
-```c
-if (queue->appender == NULL) {
-    tailer_t* tailer = malloc(sizeof(tailer_t));
-    bzero(tailer, sizeof(tailer_t));
-    tailer->qf_index = (queue->highest_cycle - patch_cycles) << queue->cycle_shift;
-    tailer->dispatcher = NULL;
-    tailer->state = 5;  // TS_PEEK
-    tailer->mmap_protection = PROT_READ | PROT_WRITE;
-    tailer->queue = queue;
-    queue->appender = tailer;
-
-    int x = directory_listing_reopen(queue, O_RDWR, PROT_READ | PROT_WRITE);
-    if (x != 0) return -1;
-}
+};
 ```
 
 Key points:
-- **`qf_index`** starts at `(highest_cycle - patch_cycles) << cycle_shift`.
-  The `patch_cycles = 3` lookback ensures the appender scans recent cycle
-  files to patch any missing EOF markers before writing new data.
-- **`mmap_protection`** is `PROT_READ | PROT_WRITE` — this is what allows
-  CAS operations and direct writes to the mmap'd queuefile.
-- **Directory listing re-open** — switches from read-only to read-write so
-  the appender can update `highest_cycle`, `lowest_cycle`, and `modcount`
-  in the shared mmap.
 
-### Zig sketch
+- `tailer` holds the current file descriptor, mmap base pointer, mmap window offset/length,
+  tip (byte offset into the current cycle file), and cached file size.
+- `cas_attempt` tracks how many consecutive CAS failures have occurred so the tiered backoff
+  can choose the right strategy.
+- `preroll_checked` is a per-append flag to avoid redundant pre-roll arithmetic.
+
+---
+
+## 3. The Hot Path: `append(msg)`
+
+This is the most performance-critical code in the entire library. Every nanosecond matters.
+
+### High-level flow
+
+1. **`codec.serialized_size(msg)`** → compute payload size. This is an inline, comptime-
+   dispatched function call. No allocation, no syscall.
+
+2. **Compute total entry size**: `4 + payload + pad4`. The 4-byte header is always present.
+   Padding rounds up to the next 4-byte boundary for alignment.
+
+3. **Check modcount** — volatile `u64` read from the mmap'd `metadata.brz` region. If
+   modcount has changed since our last check, refresh cached queue parameters (highest
+   cycle, etc.). This is a single memory read — no syscall.
+
+4. **Ensure mmap window covers the current tip**. In steady state the tip is within the
+   already-mapped region and this is a simple bounds check (no-op). Only on a block boundary
+   crossing does a remap occur, using `MAP_POPULATE` to pre-fault pages.
+
+5. **CAS: `UNALLOCATED → WORKING`** — a single `lock cmpxchg` instruction on the 4-byte
+   header at the tip. Uses `.acq_rel` / `.monotonic` ordering. On failure: tiered backoff
+   and retry (see §4).
+
+6. **Check for cycle roll** — compare the current wall-clock cycle number against the
+   appender's cycle. This is an arithmetic comparison on cached values.
+   - If a roll is needed: write an EOF marker to the current position, swap to the
+     pre-rolled file if available, or create a new file as a fallback.
+
+7. **`codec.write(mmap_buf + 4, msg, size)`** — serialize the payload directly into the
+   mmap region, starting 4 bytes past the header. No intermediate buffer, no allocation.
+
+8. **Release store: write `header = DATA | size`** — this publishes the message. On x86
+   this compiles to a plain `MOV` (store-release is free on x86 TSO). On ARM this would
+   be an `stlr`. No `mfence` needed.
+
+9. **Update flat index** — every `index_spacing` messages, atomically store the current
+   byte offset as a `u64` into the index region. Single atomic store, no syscall.
+
+10. **Signal eventfd** — write 8 bytes (`u64` value 1) to the eventfd descriptor to wake
+    readers blocked in `io_uring` or `epoll`. This is the only syscall in steady state,
+    and it can be made optional or batched.
+
+11. **Advance tip and seqnum** — pure arithmetic on local state.
+
+### Syscall analysis (steady state)
+
+| Step | Operation | Syscalls |
+|---|---|---|
+| 1 | Payload size computation | 0 |
+| 2 | Entry size arithmetic | 0 |
+| 3 | Modcount check | 0 (mmap read) |
+| 4 | Window bounds check | 0 (usually no-op) |
+| 5 | CAS claim | 0 (atomic instruction) |
+| 6 | Cycle check | 0 (arithmetic) |
+| 7 | Payload write | 0 (mmap write) |
+| 8 | Header publish | 0 (mmap write) |
+| 9 | Index update | 0 (mmap write, every N) |
+| 10 | eventfd signal | **1** `write(eventfd, ...)` |
+| 11 | Tip/seqnum advance | 0 |
+| **Total** | | **0–1** |
+
+### Full implementation sketch
 
 ```zig
-fn ensureAppender(self: *Queue) !*Tailer {
-    if (self.appender) |app| return app;
-
-    var tailer = try self.allocator.create(Tailer);
-    errdefer self.allocator.destroy(tailer);
-    tailer.* = Tailer{
-        .queue = self,
-        .mmap_protection = std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .state = .peek,
-        .dispatcher = null,
-        .dispatch_ctx = null,
-    };
-
-    // Start scanning from patch_cycles before highest to patch missing EOFs
-    const start_cycle = if (self.highest_cycle > patch_cycles)
-        self.highest_cycle - patch_cycles
-    else
-        0;
-    tailer.qf_index = start_cycle << self.cycle_shift;
-
-    self.appender = tailer;
-
-    // Re-open directory listing in read-write mode
-    try self.directoryListingReopen(.read_write);
-
-    log.info("appender created, starting at cycle {}", .{start_cycle});
-    return tailer;
-}
-```
-
----
-
-## 7. The Write Loop State Machine
-
-After the appender exists, `chronicle_append_ts` enters a `while(1)` loop
-(C lines 1115-1228) that repeatedly polls the appender and reacts to its
-state:
-
-```
-┌─────────────────────────────────────────────┐
-│              while (true)                    │
-│  ┌─────────────────────────────────────────┐ │
-│  │  r = peek_queue_tailer(queue, appender) │ │
-│  └─────────────┬───────────────────────────┘ │
-│                │                             │
-│    ┌───────────┼───────────┬──────────┐      │
-│    ▼           ▼           ▼          ▼      │
-│  AWAITING    EXTEND     AWAITING   (other)   │
-│  QUEUEFILE   FAIL       ENTRY                │
-│    │           │           │          │      │
-│  create      extend      CAS       sleep     │
-│  file        file        write     retry     │
-│    │           │           │                 │
-│  continue    continue    break               │
-│                                              │
-└──────────────────────────────────────────────┘
-```
-
-The C code actually calls `peek_queue_tailer` **twice** before switching on
-the result (lines 1117-1118):
-
-```c
-int r = chronicle_peek_queue_tailer(queue, appender);
-r = chronicle_peek_queue_tailer(queue, appender);
-```
-
-The comment says "2nd call defensive to ensure 1 whole blocksize is available
-to put". This double-poll advances the appender far enough to guarantee the
-write window is positioned correctly.
-
----
-
-## 8. Handling TS_AWAITING_QUEUEFILE
-
-When the appender's cycle points to a file that doesn't exist, we need to
-create it. C lines 1124-1150:
-
-```c
-if (r == TS_AWAITING_QUEUEFILE) {
-    char* fn_buf;
-    asprintf(&fn_buf, "%s.%d.tmp", appender->qf_fn, pid_header);
-    if (queuefile_init(fn_buf, queue) != 0) return -1;
-    if (rename(fn_buf, appender->qf_fn) != 0) {
-        sleep(1);
-        continue;
-    }
-    free(fn_buf);
-    uint64_t cyc = appender->qf_index >> queue->cycle_shift;
-    if (cyc > queue->highest_cycle) {
-        queue->highest_cycle = cyc;
-        poke_queue_modcount(queue);
-    }
-    continue;
-}
-```
-
-### Protocol
-
-1. **Generate temp filename** — `<desired_name>.cq4.<pid>.tmp`
-2. **Create the queuefile** — call `queuefile_init` which creates the file
-   and extends it to `qf_disk_sz` (83,754,496 bytes)
-3. **Atomic rename** — `rename(tmp, final)`. If this fails (another writer
-   raced us), sleep and retry. The rename is atomic on POSIX, so exactly one
-   writer wins.
-4. **Bump modcount** — if our new file has a higher cycle than the recorded
-   `highest_cycle`, update the shared mmap fields and atomically increment
-   `modcount` so other processes see the change.
-5. **Continue** — retry the loop; the tailer will now successfully open the file.
-
-### Zig sketch
-
-```zig
-.awaiting_queuefile => {
-    const qf_fn = appender.qf_fn orelse return error.NoFilename;
-
-    // Build temporary filename: <path>.cq4.<pid>.tmp
-    const pid = std.os.linux.getpid();
-    const tmp_name = try std.fmt.allocPrint(
-        self.allocator,
-        "{s}.{d}.tmp",
-        .{ qf_fn, pid },
-    );
-    defer self.allocator.free(tmp_name);
-
-    // Create the empty queuefile at the temporary path
-    try self.queuefileInit(tmp_name);
-
-    // Atomic rename — if it fails, another writer won the race
-    std.fs.cwd().rename(tmp_name, qf_fn) catch |err| {
-        log.warn("create queuefile rename failed: {}", .{err});
-        std.time.sleep(1 * std.time.ns_per_s);
-        continue;
-    };
-
-    log.info("created queuefile: {s}", .{qf_fn});
-
-    // If this is a new highest cycle, tell other processes
-    const cyc = appender.qf_index >> self.cycle_shift;
-    if (cyc > self.highest_cycle) {
-        self.highest_cycle = cyc;
-        self.pokeQueueModcount();
-    }
-    continue;
-},
-```
-
----
-
-## 9. Handling TS_EXTEND_FAIL
-
-The tailer state machine returns `TS_EXTEND_FAIL` when the appender's mmap
-window is approaching the end of the file (less than 2× blocksize remaining)
-and the tailer has write protection. The appender must extend the file on
-disk. C lines 1152-1165:
-
-```c
-if (r == TS_EXTEND_FAIL) {
-    uint64_t extend_to = appender->qf_statbuf.st_size + qf_disk_sz;
-    if (lseek(appender->qf_fd, extend_to - 1, SEEK_SET) == -1) {
-        sleep(1); continue;
-    }
-    if (write(appender->qf_fd, "", 1) != 1) {
-        sleep(1); continue;
-    }
-    continue;
-}
-```
-
-This extends the file by another `qf_disk_sz` (≈83 MB) chunk. The technique
-of seeking past the end and writing one byte causes the filesystem to allocate
-the space (or create a sparse file, depending on the filesystem).
-
-### Zig sketch
-
-```zig
-.extend_fail => {
-    const fd = appender.qf_fd orelse return error.NoFileDescriptor;
-    const current_size = (try std.posix.fstat(fd)).size;
-    const extend_to: u64 = @intCast(current_size + @as(i64, @intCast(Queue.qf_disk_sz)));
-
-    // Extend by seeking and writing a single byte
-    const file = std.fs.File{ .handle = fd };
-    file.seekTo(extend_to - 1) catch {
-        std.time.sleep(1 * std.time.ns_per_s);
-        continue;
-    };
-    file.writer().writeByte(0) catch {
-        std.time.sleep(1 * std.time.ns_per_s);
-        continue;
-    };
-
-    log.info("extended queuefile to {} bytes", .{extend_to});
-    continue;
-},
-```
-
----
-
-## 10. Handling Non-AWAITING_ENTRY States
-
-If the tailer returns anything other than `TS_AWAITING_ENTRY`,
-`TS_AWAITING_QUEUEFILE`, or `TS_EXTEND_FAIL`, the appender cannot write.
-This could be `TS_BUSY` (another writer holds the lock) or an error state.
-The C code sleeps and retries (lines 1171-1175):
-
-```c
-if (r != TS_AWAITING_ENTRY) {
-    printf("shmipc: Cannot write in state %d, sleeping\n", r);
-    sleep(1);
-    continue;
-}
-```
-
-In Zig, we can be more nuanced — return transient errors for retryable states
-and hard errors for fatal ones:
-
-```zig
-.busy => {
-    // Another writer holds the lock — back off and retry
-    std.time.sleep(1 * std.time.ns_per_s);
-    continue;
-},
-.e_stat, .e_mmap => {
-    return error.FatalTailerError;
-},
-else => {
-    log.warn("cannot write in state {}, sleeping", .{r});
-    std.time.sleep(1 * std.time.ns_per_s);
-    continue;
-},
-```
-
----
-
-## 11. The CAS Write Sequence
-
-This is the core of the appender — the actual write operation. When the
-tailer is in `TS_AWAITING_ENTRY`, we know `qf_tip` points to an unallocated
-header in the mmap. The sequence is:
-
-### Step-by-step (C lines 1177-1228)
-
-#### 1. Bounds check
-
-```c
-if ((appender->qf_tip - appender->qf_mmapoff) + write_sz > appender->qf_mmapsz) {
-    printf("aborting on bug: write would segfault buffer!\n");
-    abort();
-}
-```
-
-This is a safety check — if we somehow got here without enough space in the
-mmap window, abort rather than SIGBUS.
-
-#### 2. Calculate pointer
-
-```c
-unsigned char* ptr = (appender->qf_tip - appender->qf_mmapoff) + appender->qf_buf;
-```
-
-`ptr` is the address within the mmap that corresponds to the file position
-`qf_tip`. The math: `qf_tip` is the absolute file offset; `qf_mmapoff` is
-where the mmap window starts; `qf_buf` is the base address of the mmap.
-
-#### 3. CAS: UNALLOCATED → WORKING
-
-```c
-uint32_t ret = lock_cmpxchgl(ptr, HD_UNALLOCATED, HD_WORKING);
-```
-
-This performs an atomic compare-and-swap on the 4-byte header:
-- Expected old value: `HD_UNALLOCATED` (0x00000000)
-- Desired new value: `HD_WORKING` (0x80000000) — sets the "working" bit,
-  with the PID in the lower bits (the C code uses `HD_WORKING` without PID
-  for the actual CAS, but `pid_header` is prepared for debugging)
-
-The `lock;` prefix ensures this is atomic across all CPUs sharing the mmap.
-
-**If CAS fails** (`ret != HD_UNALLOCATED`): another writer beat us. Sleep
-and retry the entire loop.
-
-#### 4. Memory fence
-
-```c
-asm volatile ("mfence" ::: "memory");
-```
-
-After acquiring the lock, issue a full memory fence to ensure no subsequent
-reads are reordered before the CAS.
-
-#### 5. Check for cycle roll
-
-```c
-if (ms > 0) {
-    uint64_t cyc = chronicle_cycle_from_ms(queue, ms);
-    if (cyc > appender->qf_index >> queue->cycle_shift) {
-        appender->qf_index = cyc << queue->cycle_shift;
-        uint32_t header = HD_EOF;
-        memcpy(ptr, &header, sizeof(header));
-        continue;
-    }
-}
-```
-
-If the current timestamp indicates we should be in a newer cycle than the
-file we're writing to, write an `HD_EOF` marker instead of the data. This
-signals to all readers that this cycle file is complete. The loop continues,
-and the next iteration will create the new cycle's queuefile.
-
-#### 6. Check for stale cycle (EOF patching)
-
-```c
-if (appender->qf_index < queue->highest_cycle << queue->cycle_shift) {
-    uint32_t header = HD_EOF;
-    memcpy(ptr, &header, sizeof(header));
-    continue;
-}
-```
-
-If we acquired the write lock but we're in a cycle file older than
-`highest_cycle`, another writer has already moved on. Write EOF and continue.
-This patches files that Java may have left without an EOF (Java relies on
-readers timing out instead).
-
-#### 7. Write payload
-
-```c
-queue->append_write(ptr+4, msg, write_sz);
-```
-
-Write the message body starting 4 bytes after the header.
-
-#### 8. Memory fence
-
-```c
-asm volatile ("mfence" ::: "memory");
-```
-
-Ensure the payload is fully written to memory before we publish the header.
-Without this fence, another reader could see the size header and read
-partially-written payload data.
-
-#### 9. Write header (release lock)
-
-```c
-uint32_t header = write_sz & HD_MASK_LENGTH;
-memcpy(ptr, &header, sizeof(header));
-```
-
-Overwrite the header from `HD_WORKING` to the actual size. This atomically
-"publishes" the entry — any reader seeing a non-working, non-zero header
-will read the payload. The size in the header is the payload size (not
-including the 4-byte header itself).
-
-#### 10. Break
-
-The write is complete. `chronicle_append_ts` returns `appender->qf_index`,
-which is the 64-bit index of the written entry (cycle in upper 32 bits,
-seqnum in lower 32 bits).
-
-### Important note on post-write state
-
-The appender does **NOT** advance `qf_tip` or `qf_index` after writing.
-Instead, it lets the tailer's `peek_queue_tailer_r` function discover the
-entry on the next poll and advance naturally. This avoids duplicating the
-advancement logic and ensures the mmap window is correctly maintained.
-
----
-
-## 12. Cycle Rolling
-
-Cycle rolling is the process of finishing one queuefile and starting the next
-when a time boundary is crossed (e.g., a new hour for `FAST_HOURLY`).
-
-### How the appender detects a roll
-
-In step 5 of the CAS sequence (§11), after acquiring the write lock:
-
-```c
-uint64_t cyc = chronicle_cycle_from_ms(queue, ms);
-if (cyc > appender->qf_index >> queue->cycle_shift) {
-    // Current timestamp says we should be in a later cycle
-    appender->qf_index = cyc << queue->cycle_shift;
-    // Write EOF to close this cycle file
-    uint32_t header = HD_EOF;
-    memcpy(ptr, &header, sizeof(header));
-    continue;
-}
-```
-
-The steps:
-1. Convert the current timestamp to a cycle number: `cycle = (ms - epoch) / roll_length`
-2. Compare with the cycle embedded in the appender's index
-3. If the timestamp cycle is greater, set `qf_index` to the start of the new
-   cycle (seqnum = 0) and write `HD_EOF` to the current position
-4. The `continue` restarts the write loop. On the next iteration,
-   `peek_queue_tailer_r` will see the EOF, advance to the next cycle, and
-   return `TS_AWAITING_QUEUEFILE` (since the new file doesn't exist yet)
-5. The `TS_AWAITING_QUEUEFILE` handler creates the new file
-6. On the next iteration after that, the appender is positioned in the new
-   file and the write proceeds
-
-### Cycle number calculation
-
-```c
-long chronicle_clock_ms(queue_t* queue) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (tv.tv_sec) * 1000 + (tv.tv_usec) / 1000;
-}
-
-uint64_t chronicle_cycle_from_ms(queue_t* queue, long ms) {
-    return (ms - queue->roll_epoch) / queue->roll_length;
-}
-```
-
-For `FAST_HOURLY` with `epoch=0` and `roll_length=3600000`:
-- Cycle 0 = 1970-01-01 00:00 to 00:59
-- The current cycle at any moment is simply `ms_since_epoch / 3600000`
-
----
-
-## 13. EOF Patching
-
-Java Chronicle Queue has a design flaw: when a writer is down during a cycle
-roll, the previous cycle file may not get an EOF marker. Java readers work
-around this by "timing out" — if a reader is waiting for data in cycle N and
-knows cycle N+3 exists, it skips ahead.
-
-The C library takes a more proactive approach: the appender starts scanning
-from `highest_cycle - patch_cycles` (where `patch_cycles = 3`) and writes
-EOF markers to any stale files it encounters.
-
-This happens in two places:
-
-### 1. During the CAS sequence (§11, step 6)
-
-If the appender acquires the write lock in a cycle file that is older than
-`highest_cycle`, it writes EOF instead of data. This catches the case where
-the appender is still scanning old files during its catch-up phase.
-
-### 2. In the tailer state machine (covered in doc 08)
-
-The tailer's `QB_AWAITING_ENTRY` handler checks if
-`cycle < highest_cycle - patch_cycles` and skips forward, effectively
-tolerating missing EOFs for sufficiently old files.
-
-### The `patch_cycles` constant
-
-```c
-uint32_t patch_cycles = 3;
-```
-
-This value of 3 is a compromise: scan the last 3 cycle files for missing
-EOFs, but don't waste time scanning the entire history. It matches Java's
-timeout heuristic.
-
----
-
-## 14. Clock and Cycle Helpers
-
-### `chronicle_clock_ms`
-
-```c
-long chronicle_clock_ms(queue_t* queue) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (tv.tv_sec) * 1000 + (tv.tv_usec) / 1000;
-}
-```
-
-In Zig:
-
-```zig
-pub fn clockMs(self: *const Queue) i64 {
-    _ = self; // reserved for future custom clock support
-    const ts = std.time.milliTimestamp();
-    return ts;
-}
-```
-
-`std.time.milliTimestamp()` returns milliseconds since the Unix epoch, which
-is exactly what we need.
-
-### `chronicle_cycle_from_ms`
-
-```c
-uint64_t chronicle_cycle_from_ms(queue_t* queue, long ms) {
-    return (ms - queue->roll_epoch) / queue->roll_length;
-}
-```
-
-In Zig:
-
-```zig
-pub fn cycleFromMs(self: *const Queue, ms: i64) u64 {
-    const adjusted = ms - @as(i64, self.roll_epoch);
-    return @intCast(@divTrunc(adjusted, @as(i64, self.roll_length_ms)));
-}
-```
-
----
-
-## 15. Poke Queue Modcount
-
-After creating a new queuefile or updating cycle boundaries, the appender
-must inform other processes by writing to the shared mmap and atomically
-incrementing the modcount.
-
-### C implementation (lines 802-810)
-
-```c
-void poke_queue_modcount(queue_t* queue) {
-    memcpy(queue->dirlist_fields.highest_cycle, &queue->highest_cycle, sizeof(modcount));
-    memcpy(queue->dirlist_fields.lowest_cycle, &queue->lowest_cycle, sizeof(modcount));
-    lock_xadd(queue->dirlist_fields.modcount, 1);
-}
-```
-
-The `lock; xaddl` instruction atomically increments the modcount in the
-shared mmap. Other processes polling `peek_queue_modcount` will see the new
-value and refresh their cycle boundaries.
-
-### Zig implementation
-
-Zig's `@atomicRmw` compiles to the appropriate atomic instruction:
-
-```zig
-fn pokeQueueModcount(self: *Queue) void {
-    const fields = self.dirlist_fields;
-
-    // Write updated cycle values to the mmap
-    const high_ptr: *volatile u64 = @ptrCast(fields.highest_cycle.?);
-    const low_ptr: *volatile u64 = @ptrCast(fields.lowest_cycle.?);
-    high_ptr.* = self.highest_cycle;
-    low_ptr.* = self.lowest_cycle;
-
-    // Atomically increment modcount
-    const mod_ptr: *u64 = @ptrCast(@alignCast(fields.modcount.?));
-    _ = @atomicRmw(u64, mod_ptr, .Add, 1, .seq_cst);
-
-    log.info("bumped modcount", .{});
-}
-```
-
-**Note on memory ordering:** We use `.seq_cst` (sequentially consistent) for
-the atomic add to match the semantics of the x86 `lock; xaddl` instruction,
-which provides a full memory barrier. The volatile writes to the cycle fields
-ensure they are flushed before the modcount increment.
-
----
-
-## 16. Concurrency Model
-
-### CAS operation in Zig
-
-The C code uses inline assembly for the CAS:
-
-```c
-static inline uint32_t lock_cmpxchgl(unsigned char *mem, uint32_t newval, uint32_t oldval) {
-    __typeof (*mem) ret;
-    __asm __volatile ("lock; cmpxchgl %2, %1"
-    : "=a" (ret), "=m" (*mem)
-    : "r" (newval), "m" (*mem), "0" (oldval));
-    return (uint32_t) ret;
-}
-```
-
-Note the C calling convention here: `lock_cmpxchgl(ptr, HD_UNALLOCATED, HD_WORKING)`
-passes `newval=HD_UNALLOCATED=0x00000000` and `oldval=HD_WORKING=0x80000000`.
-But looking at the actual call site (line 1192):
-
-```c
-uint32_t ret = lock_cmpxchgl(ptr, HD_UNALLOCATED, HD_WORKING);
-```
-
-And the check `if (ret == HD_UNALLOCATED)` — this means the function is called
-with the parameters in an unusual order where the "expected" value is the
-second parameter (`HD_UNALLOCATED`) and the "desired" value is the third
-(`HD_WORKING`). Actually, re-reading the assembly: `cmpxchgl %2, %1` compares
-`EAX` (loaded with `oldval` via `"0"(oldval)`) against `%1` (the memory),
-and if equal, stores `%2` (`newval`) into memory. So `oldval=HD_WORKING` is
-what we expect to find... wait.
-
-Let's trace more carefully. The call is:
-```c
-lock_cmpxchgl(ptr, HD_UNALLOCATED, HD_WORKING)
-```
-So `newval = HD_UNALLOCATED = 0`, `oldval = HD_WORKING = 0x80000000`. The
-inline asm loads `EAX = oldval = 0x80000000`, then `cmpxchgl` compares EAX
-to `*mem`. If `*mem == 0x80000000`, store `newval = 0` into `*mem`.
-
-But the check after is `if (ret == HD_UNALLOCATED)` meaning `if (ret == 0)`,
-i.e., the **original** value in memory was 0 (unallocated). If `cmpxchgl`
-found `*mem != EAX`, it loads `*mem` into `EAX` (the return value). So when
-`*mem` is actually `0x00000000` (unallocated), the compare fails
-(`0 != 0x80000000`), EAX gets `0`, and `ret == 0 == HD_UNALLOCATED`, which
-the code treats as **success**.
-
-**This means the CAS is actually NOT performing a swap when it "succeeds".**
-The original memory remains `0x00000000`. The function is being used as a
-**read-with-fence** — it atomically reads the header with the `lock` prefix
-ensuring cache coherence. The actual "lock" of the header for writing is
-done later by the `memcpy` of `HD_EOF` or the size header.
-
-Re-examining the logic: the C code acquires the "write lock" conceptually
-by checking the header is `HD_UNALLOCATED` via the CAS, then immediately
-writes either EOF or the payload+header. The CAS serves as an atomic test —
-if two writers race, only one sees `HD_UNALLOCATED` and proceeds. The other
-sees `HD_WORKING` (or the size if the first writer already finished) and
-retries.
-
-Wait — actually, let me re-read. When `*mem == 0x00000000` and
-`EAX == 0x80000000`: `cmpxchgl` compares, they're NOT equal, so it loads
-`*mem` into EAX (ret = 0) and does NOT store. But the intent is clearly to
-atomically set `HD_WORKING`...
-
-Looking at the parameter order more carefully: the third parameter in the
-inline asm maps to constraint `"0"(oldval)` which pre-loads EAX. The second
-maps to `"r"(newval)` which is `%2`. So `cmpxchgl %2, %1` does:
-`if (*mem == EAX) { *mem = %2; ZF=1; } else { EAX = *mem; ZF=0; }`.
-With `EAX = HD_WORKING`, `%2 = HD_UNALLOCATED = 0`.
-
-The function parameters are named confusingly. In the call:
-`lock_cmpxchgl(ptr, HD_UNALLOCATED, HD_WORKING)` means
-`newval = 0, oldval = 0x80000000`. The asm compares memory against
-`0x80000000`. If memory is `0x80000000` (working), it writes `0`
-(unallocated) — that's an unlock. If memory is `0` (unallocated), the
-compare fails and ret = `0`.
-
-**So the parameters are actually swapped at the call site.** The call should
-logically be `lock_cmpxchgl(ptr, HD_WORKING, HD_UNALLOCATED)` to CAS from
-unallocated to working. The swapped parameters mean the "CAS" as coded
-actually tries to swap WORKING→UNALLOCATED, which fails when memory is
-UNALLOCATED (the common case), returning the actual value `0x00000000`. The
-code then checks `ret == HD_UNALLOCATED` and considers this success.
-
-**The practical effect:** The CAS instruction itself doesn't modify memory on
-"success". It functions as an atomic read. The write lock is then established
-by the subsequent `memcpy` of the header. This works because:
-1. Two concurrent callers both call the CAS
-2. Both read `HD_UNALLOCATED` and proceed
-3. But only one will successfully write the payload before the other re-reads
-   and sees the modified header
-
-This is actually a **race condition** in the C code — two writers could both
-pass the CAS check and both write to the same slot. In practice, the race
-window is tiny and the `mfence` after the CAS provides some serialisation,
-but it's not truly safe for multiple concurrent writers.
-
-**For the Zig reimplementation**, we should fix this and do a proper CAS:
-
-```zig
-fn cmpxchgHeader(ptr: *u32, expected: u32, desired: u32) ?u32 {
-    return @cmpxchgStrong(u32, ptr, expected, desired, .seq_cst, .seq_cst);
-}
-```
-
-`@cmpxchgStrong` returns `null` on success (the swap happened) or the actual
-value on failure. This gives us a correct atomic lock:
-
-```zig
-// Attempt to acquire write lock: UNALLOCATED → WORKING
-const header_ptr: *u32 = @ptrCast(@alignCast(ptr));
-if (cmpxchgHeader(header_ptr, HD_UNALLOCATED, HD_WORKING)) |_| {
-    // CAS failed — another writer got there first
-    log.info("write lock failed, retrying", .{});
-    std.time.sleep(1 * std.time.ns_per_s);
-    continue;
-}
-// CAS succeeded — we own this slot
-```
-
----
-
-## 17. Complete Zig Code Sketch
-
-Bringing it all together, here is the full `appendTs` function:
-
-```zig
-pub fn appendTs(self: *Queue, msg: *const anyopaque, ms: i64) !u64 {
-    // ── 1. Size validation ───────────────────────────────────
-    const write_sz: u32 = @intCast(self.append_sizeof.?(msg));
-    if (write_sz == 0) return error.ZeroSizeMessage;
-    if (write_sz > HD_MASK_LENGTH) return error.MessageTooLarge;
-    while (write_sz > self.blocksize) {
-        self.doubleBlocksize();
+pub fn append(self: *Appender, msg: anytype) !void {
+    const size = codec.serializedSize(msg);
+    const pad = (4 - (size % 4)) % 4;
+    const total = @as(u32, 4 + size + pad);
+
+    // Step 3: modcount refresh (volatile mmap read, no syscall)
+    self.refreshModcountIfChanged();
+
+    // Step 4: ensure mmap window covers tip
+    try self.tailer.ensureWindow(self.tailer.tip, total);
+
+    // Step 5: CAS claim
+    const header_ptr = self.headerPtrAtTip();
+    try self.claimSlot(header_ptr);
+
+    // Step 6: cycle roll check
+    const now_ms = self.queue.clockMs();
+    const current_cycle = self.queue.cycleFromMs(now_ms);
+    if (current_cycle > self.tailer.cycle) {
+        try self.rollCycle(header_ptr, current_cycle);
+        // After roll, re-claim in the new file
+        return self.append(msg);
     }
 
-    // ── 2. Refresh modcount ──────────────────────────────────
-    self.peekQueueModcount();
+    // Step 7: write payload directly into mmap
+    const payload_ptr = self.payloadPtrAtTip();
+    codec.write(payload_ptr, msg, size);
 
-    // ── 3. Lazy appender creation ────────────────────────────
-    const appender = try self.ensureAppender();
+    // Zero padding bytes
+    if (pad > 0) {
+        @memset(payload_ptr[size..][0..pad], 0);
+    }
 
-    // ── 4. Write loop ────────────────────────────────────────
+    // Step 8: publish header (release store — plain MOV on x86)
+    @atomicStore(u32, header_ptr, Header.DATA | size, .release);
+
+    // Step 9: flat index update
+    self.maybeUpdateIndex();
+
+    // Step 10: signal eventfd
+    self.signalReaders();
+
+    // Step 11: advance tip and seqnum
+    self.tailer.tip += total;
+    self.tailer.seqnum += 1;
+
+    // Pre-roll check (cheap branch, almost always false)
+    self.maybePreroll(now_ms);
+}
+```
+
+---
+
+## 4. CAS Arbitration Detail
+
+Even though brz-queue is single-writer within a process, multiple *processes* may each have
+an appender open on the same queue directory. The CAS on the entry header arbitrates between
+them.
+
+### Header constants
+
+```zig
+pub const Header = struct {
+    pub const UNALLOCATED: u32 = 0x00000000;
+    pub const WORKING:     u32 = 0x80000000;  // simplified — no PID encoding
+    pub const EOF:         u32 = 0x00000000;  // with EOF flag in high bits
+    pub const DATA:        u32 = 0x00000000;  // high bit clear, low 30 bits = size
+
+    // Mask helpers
+    pub const SIZE_MASK:   u32 = 0x3FFFFFFF;
+    pub const FLAG_MASK:   u32 = 0xC0000000;
+};
+```
+
+The WORKING marker is a simple `0x80000000` — no PID is encoded. This simplifies the header
+format and avoids the need to parse out a PID on the reader side.
+
+### CAS loop with tiered backoff
+
+```zig
+fn claimSlot(self: *Appender, ptr: *volatile u32) !void {
+    self.cas_attempt = 0;
     while (true) {
-        // Poll appender state (double poll for safety)
-        _ = self.peekQueueTailer(appender);
-        const r = self.peekQueueTailer(appender);
+        const result = @cmpxchgStrong(
+            u32,
+            ptr,
+            Header.UNALLOCATED,
+            Header.WORKING,
+            .acq_rel,    // success: acquire+release (read-modify-write)
+            .monotonic,  // failure: relaxed is sufficient to observe the current value
+        );
+        if (result == null) {
+            // Success — we own the slot
+            self.cas_attempt = 0;
+            return;
+        }
+        // Contention — another process's appender holds WORKING
+        try casBackoff(&self.cas_attempt);
+    }
+}
+```
 
-        switch (r) {
-            // ── 4a. Need to create queuefile ─────────────────
-            .awaiting_queuefile => {
-                const qf_fn = appender.qf_fn orelse return error.NoFilename;
-                const pid = std.os.linux.getpid();
-                const tmp_name = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}.{d}.tmp",
-                    .{ qf_fn, pid },
-                );
-                defer self.allocator.free(tmp_name);
+### Tiered backoff strategy
 
-                try self.queuefileInit(tmp_name);
+```zig
+fn casBackoff(attempt: *u32) !void {
+    const n = attempt.*;
+    attempt.* += 1;
 
-                std.fs.cwd().rename(tmp_name, qf_fn) catch {
-                    std.time.sleep(1 * std.time.ns_per_s);
-                    continue;
-                };
+    if (n < 64) {
+        // Tier 1: spin with pause hint (0–64 iterations)
+        // On x86 this emits PAUSE; on ARM it emits YIELD.
+        // Cost: ~5-40ns per iteration.
+        std.atomic.spinLoopHint();
+    } else if (n < 256) {
+        // Tier 2: yield to OS scheduler (64–256 iterations)
+        // Allows other threads/processes to make progress.
+        std.Thread.yield() catch {};
+    } else {
+        // Tier 3: exponential backoff capped at 1ms (256+ iterations)
+        // Backs off exponentially: 1μs, 2μs, 4μs, ... 1ms max.
+        const shift = @min(n - 256, 10); // cap shift at 10 → 1024μs ≈ 1ms
+        const us: u64 = @as(u64, 1) << @intCast(shift);
+        const capped = @min(us, 1000); // hard cap at 1ms
+        std.time.sleep(capped * std.time.ns_per_us);
+    }
+}
+```
 
-                const cyc = appender.qf_index >> self.cycle_shift;
-                if (cyc > self.highest_cycle) {
-                    self.highest_cycle = cyc;
-                    self.pokeQueueModcount();
-                }
-                continue;
-            },
+**Why three tiers?**
 
-            // ── 4b. Need to extend queuefile ─────────────────
-            .extend_fail => {
-                const fd = appender.qf_fd orelse return error.NoFileDescriptor;
-                const stat = try std.posix.fstat(fd);
-                const extend_to = @as(u64, @intCast(stat.size)) + Queue.qf_disk_sz;
+| Tier | Range | Latency | Use Case |
+|---|---|---|---|
+| Spin | 0–63 | ~5–40 ns/iter | Brief contention (ns-scale) |
+| Yield | 64–255 | ~1–10 μs | Short contention (μs-scale) |
+| Exponential | 256+ | 1 μs – 1 ms | Extended contention or crashed writer |
 
-                const file = std.fs.File{ .handle = fd };
-                file.seekTo(extend_to - 1) catch {
-                    std.time.sleep(1 * std.time.ns_per_s);
-                    continue;
-                };
-                file.writer().writeByte(0) catch {
-                    std.time.sleep(1 * std.time.ns_per_s);
-                    continue;
-                };
-                continue;
-            },
+This replaces the previous approach of sleeping for 1 second on contention, which was far
+too coarse for a low-latency queue. The tiered scheme gives sub-microsecond response for
+the common case (brief contention) while still backing off gracefully under sustained load.
 
-            // ── 4c. Ready to write ───────────────────────────
-            .awaiting_entry => {
-                // Bounds check
-                const offset_in_map = appender.qf_tip - appender.qf_mmapoff;
-                if (offset_in_map + write_sz + 4 > appender.qf_mmapsz) {
-                    log.err("write would exceed mmap buffer — aborting", .{});
-                    return error.WriteWouldOverflow;
-                }
+---
 
-                // Calculate pointer into mmap
-                const base = appender.qf_buf orelse return error.NoMmapBuffer;
-                const ptr: [*]u8 = base + offset_in_map;
-                const header_ptr: *align(1) u32 = @ptrCast(ptr);
+## 5. Cycle Roll Handling
 
-                // CAS: UNALLOCATED → WORKING
-                if (@cmpxchgStrong(
-                    u32,
-                    header_ptr,
-                    HD_UNALLOCATED,
-                    HD_WORKING,
-                    .seq_cst,
-                    .seq_cst,
-                )) |_| {
-                    // CAS failed — another writer holds the slot
-                    log.info("write lock failed, retrying", .{});
-                    std.time.sleep(1 * std.time.ns_per_s);
-                    continue;
-                }
+A cycle roll occurs when the wall-clock time crosses into a new cycle boundary (e.g., a new
+day for `DAILY` roll cycle, a new hour for `HOURLY`). The appender must close the current
+`.brz` data file and start writing to a new one.
 
-                // CAS succeeded — we own this slot.
-                // Full memory fence (implicit in seq_cst above, but explicit
-                // for clarity matching the C code's mfence)
-                @fence(.seq_cst);
+### With pre-roll (fast path)
 
-                // Check if we need to roll to a new cycle
-                if (ms > 0) {
-                    const cyc = self.cycleFromMs(ms);
-                    const current_cycle = appender.qf_index >> self.cycle_shift;
-                    if (cyc > current_cycle) {
-                        log.info("cycle roll: current {} proposed {}", .{ current_cycle, cyc });
-                        appender.qf_index = cyc << self.cycle_shift;
+When the pre-roll system has already prepared the next cycle file, the roll is nearly free:
 
-                        // Write EOF to trigger roll
-                        const eof: u32 = HD_EOF;
-                        @as(*align(1) u32, @ptrCast(ptr)).* = eof;
-                        continue;
-                    }
-                }
+1. **Detect roll**: `current_cycle > appender_cycle` (arithmetic comparison).
+2. **Write EOF marker** to the current position in the current file — a single 4-byte mmap
+   write of the EOF header constant.
+3. **Check pre-roll availability**: `queue.preroll_cycle == current_cycle`.
+   - If true: swap the file descriptor and mmap pointers from the pre-roll state into the
+     appender's tailer. **Zero syscalls** — just pointer assignments.
+4. **Update `highest_cycle`** in `metadata.brz` — atomic store to the mmap'd metadata region.
+5. **Bump `modcount`** — atomic fetch-add on the mmap'd modcount field. This notifies readers
+   that queue metadata has changed.
+6. **Reset tip** to the data start offset in the new file.
+7. **Retry append** — return to the top of `append()` to write the message into the new file.
 
-                // Check if we're behind highest_cycle (patch EOF)
-                if (appender.qf_index < self.highest_cycle << self.cycle_shift) {
-                    log.info("patching EOF on stale cycle file", .{});
-                    const eof: u32 = HD_EOF;
-                    @as(*align(1) u32, @ptrCast(ptr)).* = eof;
-                    continue;
-                }
+```zig
+fn rollCycle(self: *Appender, current_header_ptr: *volatile u32, new_cycle: u64) !void {
+    // Write EOF to current position
+    @atomicStore(u32, current_header_ptr, Header.EOF_MARKER, .release);
 
-                // ── Write the payload ────────────────────────
-                self.append_write.?(ptr + 4, msg, write_sz);
+    if (self.queue.preroll_cycle == new_cycle) {
+        // Fast path: swap pre-rolled file into active position
+        self.tailer.fd = self.queue.preroll_fd;
+        self.tailer.mmap_base = self.queue.preroll_mmap;
+        self.tailer.mmap_len = self.queue.preroll_mmap_len;
+        self.queue.preroll_fd = null;
+        self.queue.preroll_mmap = null;
+        self.queue.preroll_cycle = 0;
+    } else {
+        // Slow path: create new cycle file on demand
+        try self.createCycleFile(new_cycle);
+    }
 
-                // Fence: ensure payload is visible before header
-                @fence(.seq_cst);
+    self.tailer.cycle = new_cycle;
+    self.tailer.tip = self.queue.data_start_offset;
 
-                // ── Publish: write size header (releases lock) ─
-                const size_header: u32 = write_sz & HD_MASK_LENGTH;
-                @as(*align(1) u32, @ptrCast(ptr)).* = size_header;
+    // Update shared metadata
+    self.queue.atomicStoreHighestCycle(new_cycle);
+    self.queue.bumpModcount();
+}
+```
 
-                log.debug("wrote {} bytes at index {}", .{ write_sz, appender.qf_index });
-                break;
-            },
+### Without pre-roll (slow path — fallback)
 
-            // ── 4d. Any other state — back off ───────────────
-            else => {
-                log.warn("cannot write in state {}, sleeping", .{@intFromEnum(r)});
-                std.time.sleep(1 * std.time.ns_per_s);
-                continue;
-            },
+If the pre-roll system hasn't prepared the next file (e.g., rapid successive rolls, or the
+pre-roll window was missed), the appender must create the file synchronously:
+
+1. Compute the filename: `{cycle_number}.brz`.
+2. Create the file with `fallocate` to pre-allocate disk blocks.
+3. `mmap` with `MAP_POPULATE` to pre-fault pages.
+4. Write the file header.
+5. Continue with the roll as above.
+
+This path involves multiple syscalls (`open`, `fallocate`, `fstat`, `mmap`) and is
+significantly slower. The pre-roll system exists specifically to avoid this on the hot path.
+
+---
+
+## 6. Pre-Roll Integration
+
+At the end of each append, a cheap check determines whether it's time to pre-create the
+next cycle file:
+
+```zig
+fn maybePreroll(self: *Appender, now_ms: i64) void {
+    if (shouldPreroll(now_ms, self.queue)) {
+        self.queue.maybePreroll(now_ms) catch {};
+    }
+}
+
+fn shouldPreroll(now_ms: i64, queue: *Queue) bool {
+    // Already pre-rolled?
+    if (queue.preroll_cycle != 0) return false;
+
+    // How close are we to the next cycle boundary?
+    const cycle_end_ms = queue.cycleEndMs(queue.current_cycle);
+    const remaining_ms = cycle_end_ms - now_ms;
+
+    // Pre-roll when we're within the pre-roll window (e.g., last 10% of cycle)
+    return remaining_ms <= queue.preroll_window_ms;
+}
+```
+
+This is a **single branch** on the hot path — a comparison of two integers. It is almost
+always `false`. When it evaluates to `true`, that one append call pays the cost of file
+creation. But because the actual roll later just swaps pointers, the cost is amortized
+over the many thousands of appends that follow.
+
+### Pre-roll file creation
+
+```zig
+fn maybePreroll(queue: *Queue, now_ms: i64) !void {
+    const next_cycle = queue.current_cycle + 1;
+    const filename = try queue.cycleFilename(next_cycle); // e.g., "20250615.brz"
+
+    // Create and pre-allocate the file
+    const fd = try std.posix.open(filename, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
+    _ = std.os.linux.fallocate(fd, 0, 0, @intCast(queue.initial_file_size));
+
+    // mmap with MAP_POPULATE to pre-fault pages
+    const mmap_ptr = try std.posix.mmap(
+        null,
+        queue.initial_file_size,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .TYPE = .SHARED, .POPULATE = true },
+        fd,
+        0,
+    );
+
+    // Write initial file header
+    queue.writeFileHeader(mmap_ptr);
+
+    // Store pre-roll state for the fast-path swap
+    queue.preroll_fd = fd;
+    queue.preroll_mmap = mmap_ptr;
+    queue.preroll_mmap_len = queue.initial_file_size;
+    queue.preroll_cycle = next_cycle;
+}
+```
+
+---
+
+## 7. Flat Index Updates
+
+The appender maintains a flat inline index to allow readers to seek efficiently. Every
+`index_spacing` messages, it stores the byte offset of that message's entry in the index
+region of the file.
+
+```zig
+fn maybeUpdateIndex(self: *Appender) void {
+    const seqnum = self.tailer.seqnum;
+    const spacing = self.queue.index_spacing;
+
+    if (seqnum % spacing == 0) {
+        const slot = seqnum / spacing;
+        if (slot < self.queue.index_count) {
+            const index_ptr = self.indexSlotPtr(slot);
+            @atomicStore(u64, index_ptr, self.tailer.tip, .release);
         }
     }
-
-    return appender.qf_index;
 }
 ```
 
+This is a single atomic `u64` store — no syscall, no allocation. With the default
+`index_spacing = 256`, this executes once per 256 appends. The modulo check compiles to
+a bitwise AND when the spacing is a power of two.
+
+### Index region layout
+
+The index region is a contiguous array of `u64` values at a fixed offset within each `.brz`
+data file:
+
+```
+[file header][index region: N × u64][data region: entries...]
+```
+
+Readers use the index to binary-search for a target sequence number, then scan forward from
+the nearest indexed offset. This avoids a full linear scan from the start of the file.
+
 ---
 
-## 18. Testing Notes
+## 8. eventfd Signaling
+
+After publishing the header (step 8), the appender signals readers that a new message is
+available. This wakes readers that are blocked in `io_uring` or `epoll_wait` on the eventfd.
+
+```zig
+fn signalReaders(self: *Appender) void {
+    if (self.queue.eventfd) |efd| {
+        const val: u64 = 1;
+        _ = std.posix.write(efd, std.mem.asBytes(&val)) catch {};
+    }
+}
+```
+
+This is a single `write` syscall — 8 bytes written to the eventfd descriptor. The kernel
+coalesces multiple writes, so if readers are slow to drain, signals don't pile up.
+
+### Optimization options
+
+- **Polling readers**: If all readers use a pure spin-poll loop, eventfd signaling can be
+  disabled entirely (`queue.eventfd = null`), reducing steady-state syscalls to **zero**.
+- **Batched signaling**: Signal only every N messages instead of every message. This trades
+  latency for throughput in high-volume scenarios.
+
+---
+
+## 9. File Extension
+
+When the remaining space in the current mmap window drops below `2 × blocksize`, the
+appender extends the file using `fallocate` and refreshes the mmap.
+
+```zig
+fn extendFileIfNeeded(self: *Appender) !void {
+    const remaining = self.tailer.file_size - self.tailer.tip;
+    const threshold = 2 * self.queue.blocksize;
+
+    if (remaining < threshold) {
+        const new_size = self.tailer.file_size + self.queue.qf_disk_size;
+
+        // Pre-allocate disk blocks (avoids ENOSPC on later writes)
+        _ = std.os.linux.fallocate(
+            self.tailer.fd,
+            0,    // mode: default (allocate)
+            0,    // offset: from start
+            @intCast(new_size),
+        );
+
+        // Update cached file size (fstat)
+        const stat = try std.posix.fstat(self.tailer.fd);
+        self.tailer.file_size = @intCast(stat.size);
+
+        // Remap if needed to cover new region
+        try self.tailer.remapWindow(self.tailer.tip);
+    }
+}
+```
+
+`fallocate` pre-allocates disk blocks without writing zeros, which is faster than
+`ftruncate` and avoids `ENOSPC` surprises during later mmap writes. The remap uses
+`MAP_POPULATE` to pre-fault pages in the new region.
+
+---
+
+## 10. EOF Patching
+
+If a previous writer crashed while holding WORKING (i.e., between the CAS and the header
+publish), the entry is left in a partially-written state. A subsequent appender detects this
+and patches in an EOF marker so readers don't get stuck.
+
+```zig
+fn patchEof(self: *Appender, cycle: u32) !void {
+    // Only look back a limited number of cycles
+    const start_cycle = if (cycle > self.queue.patch_cycles)
+        cycle - self.queue.patch_cycles
+    else
+        0;
+
+    var c = start_cycle;
+    while (c < cycle) : (c += 1) {
+        const filename = try self.queue.cycleFilename(c);
+        const fd = std.posix.open(filename, .{ .ACCMODE = .RDWR }, 0o644) catch continue;
+        defer std.posix.close(fd);
+
+        const stat = try std.posix.fstat(fd);
+        const mmap_ptr = try std.posix.mmap(
+            null,
+            @intCast(stat.size),
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        defer std.posix.munmap(mmap_ptr);
+
+        // Scan forward from data start, find last valid entry, write EOF after it
+        var offset = self.queue.data_start_offset;
+        while (offset < stat.size) {
+            const header = @as(*volatile u32, @ptrCast(@alignCast(mmap_ptr + offset))).*;
+            if (header == Header.UNALLOCATED or header == Header.WORKING) {
+                // Patch this as EOF
+                @atomicStore(u32, @ptrCast(@alignCast(mmap_ptr + offset)), Header.EOF_MARKER, .release);
+                break;
+            }
+            const entry_size = 4 + (header & Header.SIZE_MASK);
+            const padded = (entry_size + 3) & ~@as(u32, 3);
+            offset += padded;
+        }
+    }
+}
+```
+
+The `patch_cycles` parameter limits how far back the appender looks. Typically this is a
+small number (e.g., 2–4 cycles) to avoid scanning ancient files on startup.
+
+---
+
+## 11. Performance Characteristics
+
+| Operation | Steady-State Cost |
+|---|---|
+| Payload size computation | Inline function call (comptime-dispatched) |
+| Modcount check | Volatile `u64` read from mmap |
+| CAS claim | Single `lock cmpxchg` instruction |
+| Payload write | `memcpy` into mmap (or inline codec write) |
+| Header publish | Release store (plain `MOV` on x86) |
+| Index update | Atomic `u64` store (every N messages) |
+| eventfd signal | 1 `write` syscall |
+| Padding | 0–3 zero bytes |
+| **Total syscalls (steady state)** | **0–1** (eventfd only) |
+| **Allocations (steady state)** | **0** |
+
+### Memory ordering summary
+
+| Operation | Ordering | x86 Instruction |
+|---|---|---|
+| CAS (success) | `.acq_rel` | `lock cmpxchg` |
+| CAS (failure) | `.monotonic` | (implicit in `lock cmpxchg`) |
+| Header publish | `.release` | `MOV` (TSO gives release for free) |
+| Index store | `.release` | `MOV` |
+| Modcount read | `.acquire` (volatile) | `MOV` (TSO gives acquire for free) |
+
+No `mfence` or `SeqCst` operations are used on the write path. The x86 TSO memory model
+makes release stores and acquire loads free (they compile to plain `MOV`). On ARM/AArch64,
+the compiler would emit `stlr` / `ldar` as needed.
+
+---
+
+## 12. Error Handling
+
+### Recoverable errors
+
+| Error | Cause | Recovery |
+|---|---|---|
+| `MmapFailed` | Kernel refuses mmap (OOM, address space exhaustion) | Return error to caller; caller can retry |
+| `FallocateFailed` | Disk full or filesystem doesn't support fallocate | Return error; queue cannot extend |
+| `FileCreateFailed` | Permission denied, path doesn't exist | Return error; queue directory misconfigured |
+| `CycleRollFailed` | Failed to create new cycle file during slow-path roll | Return error; pre-roll avoids this in normal operation |
+
+### Non-recoverable states
+
+| State | Cause | Behavior |
+|---|---|---|
+| Corrupted header | Bit flip in mmap region | Detected by readers via invalid header; appender may overwrite |
+| Stuck WORKING | Writer crashed between CAS and publish | Next appender patches EOF on startup (see §10) |
+
+### Error propagation
+
+The `append()` function returns `!void` — it propagates errors to the caller via Zig's
+error union. The hot path itself does not allocate error objects. Errors from file operations
+(fallocate, mmap, open) are propagated as-is from `std.posix`.
+
+---
+
+## 13. Testing Strategy
 
 ### Unit tests
 
-```zig
-test "size validation rejects oversized messages" {
-    var queue = try Queue.init(testing.allocator, "/tmp/test");
-    defer queue.deinit();
+- **Append and read-back verification**: Write a message via the appender, read it back via
+  a tailer, and assert byte-for-byte equality.
+- **Size computation**: Verify that `codec.serializedSize()` matches actual serialized output
+  for all supported types.
+- **Padding correctness**: Verify that entries are always 4-byte aligned and padding bytes
+  are zero.
 
-    // Mock a sizeof that returns > 30 bits
-    queue.append_sizeof = struct {
-        fn f(_: *const anyopaque) usize {
-            return 0x40000000; // exceeds HD_MASK_LENGTH
-        }
-    }.f;
+### CAS contention tests
 
-    const result = queue.appendTs(undefined, 0);
-    try testing.expectError(error.MessageTooLarge, result);
-}
+- **Multi-process writers**: Fork two processes, each with an appender on the same queue
+  directory. Verify that all messages from both processes appear exactly once in the queue
+  with no corruption.
+- **Backoff timing**: Instrument the backoff function and verify that tier transitions happen
+  at the correct iteration counts (64, 256).
 
-test "blocksize doubles to fit large messages" {
-    var queue = try Queue.init(testing.allocator, "/tmp/test");
-    defer queue.deinit();
+### Cycle roll tests
 
-    try testing.expectEqual(@as(u32, 1 << 20), queue.blocksize);
+- **Roll transition correctness**: Write messages spanning a cycle boundary. Verify that:
+  - EOF is written at the end of the old cycle file.
+  - The new cycle file starts with a valid header.
+  - No messages are lost or duplicated across the boundary.
+- **Pre-roll timing verification**: Set a short cycle duration (e.g., 100ms) and verify that
+  the pre-roll file is created within the pre-roll window.
+- **Pre-roll swap**: Verify that when pre-roll is available, the roll completes without any
+  `open`/`mmap` syscalls (use `strace` or syscall counting).
 
-    // Simulate needing to double
-    while (@as(u32, 2 << 20) > queue.blocksize) {
-        queue.doubleBlocksize();
-    }
-    try testing.expectEqual(@as(u32, 2 << 20), queue.blocksize);
-}
-```
+### Index tests
 
-### Integration tests
+- **Index update verification**: Write N × `index_spacing` messages. Verify that each index
+  slot contains the correct byte offset for the corresponding message.
+- **Seek via index**: Use the index to seek to a message by sequence number and verify that
+  the message at that offset is correct.
 
-1. **Single-writer append:** Create a queue, append 100 messages, verify
-   they can be read back with a tailer in the correct order.
-2. **Cycle roll:** Use `TEST_SECONDLY` roll scheme, append messages spanning
-   multiple seconds, verify multiple `.cq4` files are created with proper
-   EOF markers.
-3. **File extension:** Append enough data to exceed the initial 83 MB file
-   size, verify the file is extended and writes continue.
-4. **Interop:** Create a queue with Zig, read it with Java Chronicle Queue
-   (and vice versa).
-5. **Multi-writer stress test:** Two writer processes appending simultaneously
-   to validate CAS correctness (expect no data corruption or lost messages).
+### EOF patching tests
 
-### Debugging aids
+- **Crash simulation**: Write a WORKING header without a subsequent DATA header (simulating
+  a crash). Start a new appender and verify it patches the stale WORKING header to EOF.
+- **Multiple stale cycles**: Create stale WORKING headers across several cycle files and
+  verify all are patched within `patch_cycles` range.
 
-The C code uses `chronicle_debug_tailer` to dump appender state. The Zig
-equivalent should implement `std.fmt.format` for the `Tailer` struct:
+### Stress tests
 
-```zig
-pub fn format(self: *const Tailer, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-    _ = fmt;
-    _ = options;
-    try writer.print("Tailer{{ state={}, cycle={}, seqnum={}, tip={}, fd={} }}", .{
-        @intFromEnum(self.state),
-        self.qf_index >> self.queue.cycle_shift,
-        self.qf_index & self.queue.seqnum_mask,
-        self.qf_tip,
-        self.qf_fd,
-    });
-}
-```
-
----
-
-## Summary of C → Zig Mapping
-
-| C function | Zig method | Key changes |
-|---|---|---|
-| `chronicle_append` | `Queue.append` | Thin wrapper, same logic |
-| `chronicle_append_ts` | `Queue.appendTs` | Error unions, proper CAS, `switch` instead of `if` chain |
-| `chronicle_clock_ms` | `Queue.clockMs` | `std.time.milliTimestamp()` |
-| `chronicle_cycle_from_ms` | `Queue.cycleFromMs` | Typed arithmetic |
-| `poke_queue_modcount` | `Queue.pokeQueueModcount` | `@atomicRmw` instead of inline asm |
-| `peek_queue_modcount` | `Queue.peekQueueModcount` | `volatile` reads instead of `memcpy` |
-| `lock_cmpxchgl` | `@cmpxchgStrong` | Correct CAS semantics (fixes C race) |
-| `lock_xadd` | `@atomicRmw(.Add)` | Standard Zig atomic |
-| `queuefile_init` | `Queue.queuefileInit` | `std.fs.File` API |
-| `queue_double_blocksize` | `Queue.doubleBlocksize` | Same logic |
+- **Throughput benchmark**: Measure messages/second for a single-writer appender with payloads
+  of 64, 256, 1024, and 4096 bytes.
+- **Latency benchmark**: Measure p50/p99/p999 append latency using `std.time.Timer`.
+- **File extension under load**: Write enough messages to trigger multiple file extensions and
+  verify no corruption at extension boundaries.
