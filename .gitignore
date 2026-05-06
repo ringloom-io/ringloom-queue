@@ -1,0 +1,8 @@
+.zig-cache
+zig-out
+.agents
+copilot-instructions.md
+
+build
+node_modules
+.gradle

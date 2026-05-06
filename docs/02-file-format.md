@@ -97,7 +97,7 @@ The shared metadata file is a fixed 512-byte `extern struct` — all fields at k
 
 ```zig
 pub const SharedMetadata = extern struct {
-    magic: u32 = 0x425A514D,         // "BZQM" (BZQ Metadata)
+    magic: u32 = 0x4D515A42,         // "BZQM" bytes in little-endian u32 form
     version: u16 = 1,
     flags: u16 = 0,
     roll_length_secs: u32,
@@ -107,8 +107,9 @@ pub const SharedMetadata = extern struct {
     highest_cycle: u64 align(8),      // atomic — highest active cycle
     lowest_cycle: u64 align(8),       // atomic — lowest active cycle
     modcount: u64 align(8),           // atomic — modification counter
-    write_lock: u64 align(8),         // atomic — 0x8000000000000000 = unlocked
-    _reserved: [448]u8 = [_]u8{0} ** 448,
+    write_position: u64 align(8),     // atomic — published byte offset in active cycle
+    appender_lock: u64 align(8),      // atomic — 0 = unlocked, non-zero = owner token
+    _reserved: [440]u8 = [_]u8{0} ** 440,
     // Total: 512 bytes (one disk sector)
 };
 ```
@@ -117,7 +118,7 @@ pub const SharedMetadata = extern struct {
 
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
-| 0 | 4 | `u32` | `magic` | Magic number `0x425A514D` ("BZQM" in ASCII) |
+| 0 | 4 | `u32` | `magic` | Magic number `0x4D515A42` (`"BZQM"` bytes on little-endian systems) |
 | 4 | 2 | `u16` | `version` | Format version (currently `1`) |
 | 6 | 2 | `u16` | `flags` | Reserved flags (currently `0`) |
 | 8 | 4 | `u32` | `roll_length_secs` | Roll period in seconds (e.g., 86400 for daily) |
@@ -128,16 +129,19 @@ pub const SharedMetadata = extern struct {
 | 32 | 8 | `u64` | `highest_cycle` | Highest active cycle number (atomic) |
 | 40 | 8 | `u64` | `lowest_cycle` | Lowest active cycle number (atomic) |
 | 48 | 8 | `u64` | `modcount` | Modification counter, atomically incremented (atomic) |
-| 56 | 8 | `u64` | `write_lock` | Write lock; `0x8000000000000000` = unlocked (atomic) |
-| 64 | 448 | `[448]u8` | `_reserved` | Reserved, zero-filled |
+| 56 | 8 | `u64` | `write_position` | Published write offset in `highest_cycle` / active cycle (atomic) |
+| 64 | 8 | `u64` | `appender_lock` | Appender lease; `0` = unlocked, non-zero = owner token (atomic) |
+| 72 | 440 | `[440]u8` | `_reserved` | Reserved, zero-filled |
 | **512** | — | — | — | **Total size** |
 
 ### Notes
 
 - The file is exactly 512 bytes — one disk sector — ensuring atomic writeback on most hardware.
-- All atomic fields (`highest_cycle`, `lowest_cycle`, `modcount`, `write_lock`) are 8-byte aligned for correct atomic access through the shared mapping.
-- The `magic` field must be `0x425A514D` or the file is corrupt / not a brz-queue metadata file.
-- The `write_lock` value `0x8000000000000000` means unlocked. Any other value means a writer holds the lock.
+- All atomic fields (`highest_cycle`, `lowest_cycle`, `modcount`, `write_position`, `appender_lock`) are 8-byte aligned for correct atomic access through the shared mapping.
+- The `magic` field must be `0x4D515A42` or the file is corrupt / not a brz-queue metadata file.
+- The magic constants are chosen so a hex dump of the little-endian file starts with readable ASCII (`42 5A 51 4D` = `BZQM`, `42 5A 51 43` = `BZQC`).
+- `write_position` is updated with release ordering after the final message header is published; tailers read it with acquire ordering to avoid probing beyond committed data.
+- `appender_lock` is a lifecycle lease, not a per-append lock. An appender CASes it from `0` to an owner token when opened and restores `0` on close. No global lock is taken on the hot path.
 
 ---
 
@@ -183,7 +187,7 @@ Offset 0x0000:
 
 ```zig
 pub const QueueFileHeader = extern struct {
-    magic: u32 = 0x425A5143,         // "BZQC" (BZQ Chronicle)
+    magic: u32 = 0x43515A42,         // "BZQC" bytes in little-endian u32 form
     version: u16 = 1,
     flags: u16 = 0,
     roll_length_secs: u32,
@@ -200,7 +204,7 @@ pub const QueueFileHeader = extern struct {
 
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
-| 0 | 4 | `u32` | `magic` | Magic number `0x425A5143` ("BZQC" in ASCII) |
+| 0 | 4 | `u32` | `magic` | Magic number `0x43515A42` (`"BZQC"` bytes on little-endian systems) |
 | 4 | 2 | `u16` | `version` | Format version (currently `1`) |
 | 6 | 2 | `u16` | `flags` | Reserved flags (currently `0`) |
 | 8 | 4 | `u32` | `roll_length_secs` | Roll period in seconds |
@@ -214,7 +218,7 @@ pub const QueueFileHeader = extern struct {
 
 ### Notes
 
-- The `magic` field must be `0x425A5143` or the file is corrupt / not a brz-queue data file.
+- The `magic` field must be `0x43515A42` or the file is corrupt / not a brz-queue data file.
 - Roll configuration fields (`roll_length_secs`, `index_spacing`, `index_count`, `epoch_ms`) are duplicated from the shared metadata for self-describing files and integrity checking.
 
 ---
@@ -347,8 +351,39 @@ To seek to a target seqnum:
    - Jump to the byte offset stored in `index[index_slot]`
    - The message at that offset has `seqnum = index_slot × index_spacing`
    - Scan forward `target_seqnum - (index_slot × index_spacing)` messages
-3. If the index slot is empty (0), binary-search backwards for the nearest populated slot, then scan forward
-4. Worst case: scan forward `index_spacing - 1` messages from the nearest index entry
+3. If the index slot is empty (`0`), binary-search backwards for the nearest populated slot, then scan forward
+4. If no populated slot exists, start at the data-region offset with seqnum `0`
+5. Worst case in a healthy file: scan forward `index_spacing - 1` messages from the nearest index entry
+
+### Index Sparsity and Recovery
+
+Index entries are an acceleration structure, not the source of truth. The source of truth is the message stream: a released DATA header commits a message; an EOF header commits a cycle boundary.
+
+The appender writes an index entry after publishing every `index_spacing`-th message. If a process crashes after publishing the DATA header but before writing the index entry, the message remains valid and discoverable by linear scan.
+
+Required behavior:
+
+1. `index[0]` should be written during normal creation of the first message in a cycle, because it points to the first data-region offset.
+2. Seek must tolerate any index slot containing `0`.
+3. On appender startup, before appending to an existing active cycle, recovery scans forward from the last populated index entry and repairs any missing index entries up to the last committed message.
+4. If recovery is skipped for read-only opens, tailers still seek correctly by falling back to linear scan from the nearest earlier populated slot or from the data-region start.
+
+```zig
+fn seekOffset(index: IndexRegion, target_seqnum: u32, data_start: u64) !SeekPoint {
+    const target_slot = target_seqnum / index.spacing;
+    var slot = @min(target_slot, index.count - 1);
+
+    while (true) {
+        if (index.lookup(slot)) |offset| {
+            return .{ .offset = offset, .seqnum = slot * index.spacing };
+        }
+        if (slot == 0) break;
+        slot -= 1;
+    }
+
+    return .{ .offset = data_start, .seqnum = 0 };
+}
+```
 
 ---
 
@@ -453,6 +488,15 @@ Where:
 - `epoch_ms` = configured epoch offset in milliseconds (typically 0)
 - `roll_length_ms` = `roll_length_secs × 1000`
 
+Cycle calculation is UTC-only. Local time zones and daylight-saving transitions must not affect cycle numbers or filenames.
+
+### Clock Handling
+
+- Appends use wall-clock UTC milliseconds to choose the roll cycle.
+- The appender must never roll backwards. If the wall clock moves backwards and computes a cycle lower than the currently open cycle, keep writing to the current cycle.
+- Pre-roll scheduling should use a monotonic timestamp for relative delays once the next wall-clock boundary has been computed. This prevents NTP slews or administrator clock changes from repeatedly creating or cancelling pre-roll work.
+- If the wall clock jumps forward by multiple cycles, the appender writes EOF to the old cycle and opens the computed current cycle; it does not create empty intermediate cycle files unless configured for audit completeness.
+
 ### Filename from Cycle
 
 ```
@@ -473,6 +517,16 @@ Queue data files are pre-allocated at creation time using `fallocate(2)` on Linu
 | Extension size | Another 83,754,496 bytes |
 
 The entire pre-allocated region is zero-filled, which is recognized as `HD_UNALLOCATED` (header value `0x00000000`).
+
+Pre-allocation alone does not remove every page-fault source. It prevents filesystem block allocation from occurring on first write, but the process can still take minor faults when page-table entries are installed, and on some kernels the first write can still fault if a page was populated read-only. For the appender latency profile, each future writable window must be prepared before the appender reaches it:
+
+1. `fallocate` the file range.
+2. Map the future window in a background prefetcher.
+3. Prefer `madvise(MADV_POPULATE_WRITE)` where available; otherwise use `MAP_POPULATE` plus a manual write-touch of one byte per page in still-unallocated space.
+4. Optionally `mlock` the current and next appender windows when `RLIMIT_MEMLOCK` allows it.
+5. Hand the ready mapping to the appender for pointer swap.
+
+The manual write-touch must be idempotent and constrained to future unallocated pages. It may store `0` to one byte in each page because the preallocated region is already zero-filled, but it must never touch at or behind the appender's claimed/published write position.
 
 ---
 
@@ -495,14 +549,15 @@ All multi-byte values in the entire format are **little-endian**.
 
 ## Concurrency
 
-brz-queue supports **single writer thread, multiple reader threads** on the same machine.
+brz-queue supports **one active writer thread/process and multiple reader threads/processes** on the same machine.
 
 ### Write Path
 
-1. Writer atomically CAS the 4-byte header from `HD_UNALLOCATED` (`0x00000000`) to `HD_WORKING` (`0x80000000`) using `@cmpxchgStrong` with `.acquire` / `.release` ordering
+1. Writer atomically CASes the 4-byte header from `HD_UNALLOCATED` (`0x00000000`) to `HD_WORKING` (`0x80000000`) using `@cmpxchgStrong` with monotonic ordering. This claims the slot; it does not publish payload bytes.
 2. Writer copies payload bytes into the region after the header
 3. Writer atomically stores the final header (`DATA | payload_size`) with `.release` ordering
 4. If this message's seqnum is a multiple of `index_spacing`, atomically write the index entry
+5. Writer release-stores the new `write_position` in `metadata.brz`
 
 ### Read Path
 
@@ -514,14 +569,13 @@ brz-queue supports **single writer thread, multiple reader threads** on the same
 
 ### Memory Ordering
 
-- CAS on the 4-byte header uses acquire/release ordering
-- On x86, CAS (`lock cmpxchgl`) provides an implicit full memory barrier
+- Slot-claim CAS on the 4-byte header uses monotonic ordering; the final header store is the release operation that publishes payload bytes
 - On ARM/other architectures, acquire/release semantics ensure correct ordering
 - No explicit `mfence` is needed beyond what the atomic operations provide
 
 ### Limitations
 
-- Single writer thread only (multiple writers require external coordination)
+- Single active writer only; the `appender_lock` lease prevents accidental concurrent appenders
 - Cross-machine access is **NOT** supported — shared memory primitives are machine-local
 - Multiple reader threads are fully supported with no coordination needed
 
@@ -539,8 +593,8 @@ brz-queue supports **single writer thread, multiple reader threads** on the same
 
 ### Magic Numbers
 
-1. `metadata.brz` must have magic `0x425A514D` ("BZQM") at offset 0
-2. Queue data files must have magic `0x425A5143` ("BZQC") at offset 0
+1. `metadata.brz` must have magic `0x4D515A42` ("BZQM" bytes) at offset 0
+2. Queue data files must have magic `0x43515A42` ("BZQC" bytes) at offset 0
 3. Any other value indicates corruption or an incompatible file
 
 ### Message Ordering

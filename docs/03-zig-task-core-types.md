@@ -706,8 +706,8 @@ writer and all readers. Atomic fields are accessed with acquire/release ordering
 // src/brz/metadata.zig
 
 pub const SharedMetadata = extern struct {
-    /// Magic number: "BZQM" (0x425A514D).
-    magic: u32 = 0x425A514D,
+    /// Magic number: "BZQM" bytes as a little-endian u32 (0x4D515A42).
+    magic: u32 = 0x4D515A42,
     /// Format version.
     version: u16 = 1,
     /// Reserved flags.
@@ -726,10 +726,12 @@ pub const SharedMetadata = extern struct {
     lowest_cycle: u64 align(8),
     /// Monotonically increasing modification counter. Accessed atomically.
     modcount: u64 align(8),
-    /// Write lock (0 = unlocked, non-zero = locked). CAS with tiered backoff.
-    write_lock: u64 align(8),
+    /// Published byte offset in the active cycle. Accessed atomically.
+    write_position: u64 align(8),
+    /// Appender lifecycle lease (0 = unlocked, non-zero = owner token).
+    appender_lock: u64 align(8),
     /// Reserved for future use. Pads struct to exactly 512 bytes.
-    _reserved: [448]u8 = [_]u8{0} ** 448,
+    _reserved: [440]u8 = [_]u8{0} ** 440,
 };
 
 comptime {
@@ -763,8 +765,8 @@ region, followed by the data region.
 // src/brz/metadata.zig (continued)
 
 pub const QueueFileHeader = extern struct {
-    /// Magic number: "BZQC" (0x425A5143).
-    magic: u32 = 0x425A5143,
+    /// Magic number: "BZQC" bytes as a little-endian u32 (0x43515A42).
+    magic: u32 = 0x43515A42,
     /// Format version.
     version: u16 = 1,
     /// Reserved flags.
@@ -903,6 +905,9 @@ const RollScheme = @import("roll.zig").RollScheme;
 const SharedMetadata = @import("metadata.zig").SharedMetadata;
 const QueueFileHeader = @import("metadata.zig").QueueFileHeader;
 const IoUringContext = @import("uring.zig").IoUringContext;
+const Appender = @import("appender.zig").Appender;
+const PagePrefetcher = @import("prefetcher.zig").PagePrefetcher;
+const Cleaner = @import("cleaner.zig").Cleaner;
 
 pub const Queue = struct {
     allocator: Allocator,
@@ -912,8 +917,8 @@ pub const Queue = struct {
     dirname: []const u8,
 
     // ── Configuration ───────────────────────────────────────────────────────
-    /// Block size for mmap windows. Must be a power of two. Default: 1 MiB.
-    blocksize: u32 = 1024 * 1024,
+    /// Block size for mmap windows. Must be a power of two. Default: 2 MiB.
+    blocksize: u32 = 2 * 1024 * 1024,
     /// Whether this queue has permission to create new files.
     create: bool = false,
 
@@ -962,11 +967,16 @@ pub const Queue = struct {
     /// io_uring context for tailer wakeup notifications.
     uring_ctx: ?*IoUringContext = null,
 
+    /// Optional background page prefetcher for appender windows.
+    prefetcher: ?*PagePrefetcher = null,
+    /// Optional background cleaner for old mappings, page-cache hints, and retention.
+    cleaner: ?*Cleaner = null,
+
     // ── Tailers ─────────────────────────────────────────────────────────────
     /// All reader tailers attached to this queue.
     tailers: std.ArrayList(*Tailer),
     /// The appender (created lazily on first append). NOT thread-safe.
-    appender: ?*Tailer = null,
+    appender: ?*Appender = null,
 
     // ── Error state ─────────────────────────────────────────────────────────
     last_error: ?[]const u8 = null,
@@ -1207,9 +1217,10 @@ pub const Tailer = struct {
 
 ### Thread Safety Notes
 
-- **Appender (write tailer):** NOT thread-safe. Only one thread may append at a time.
-  The single-writer model eliminates the need for CAS on the write path except for
-  the 4-byte header transition (UNALLOCATED → WORKING → data header).
+- **Appender:** NOT thread-safe. Only one active thread/process may append to a queue
+  at a time; the appender lease is acquired outside the hot path. The 4-byte header
+  transition (`UNALLOCATED → WORKING → DATA`) is still atomic so readers and recovery
+  never observe a partially published payload.
 - **Reader tailers:** Each tailer is independently thread-safe — it has its own mmap
   window, tip, index, and state. No mutable state is shared between tailers. Multiple
   tailers can read the same queue concurrently from different threads.
@@ -1234,28 +1245,13 @@ const linux = std.os.linux;
 pub const IoUringContext = struct {
     /// The io_uring instance.
     ring: linux.IoUring,
-    /// Shared eventfd signaled by the appender when new entries are written.
-    eventfd: posix.fd_t,
 
     /// Initialize the io_uring context with the given queue depth.
     pub fn init(queue_depth: u13) !IoUringContext {
-        const efd = try posix.eventfd(0, .{ .NONBLOCK = true });
-        errdefer posix.close(efd);
-
         var ring = try linux.IoUring.init(queue_depth, 0);
         errdefer ring.deinit();
 
-        return .{
-            .ring = ring,
-            .eventfd = efd,
-        };
-    }
-
-    /// Signal all waiting tailers that new data is available.
-    /// Called by the appender after writing an entry.
-    pub fn signal(self: *IoUringContext) void {
-        const val: u64 = 1;
-        _ = posix.write(self.eventfd, std.mem.asBytes(&val)) catch {};
+        return .{ .ring = ring };
     }
 
     /// Register a tailer for wakeup via IORING_OP_POLL_ADD on its eventfd.
@@ -1292,10 +1288,9 @@ pub const IoUringContext = struct {
         }
     }
 
-    /// Clean up the io_uring instance and eventfd.
+    /// Clean up the io_uring instance. Tailers own their eventfds.
     pub fn deinit(self: *IoUringContext) void {
         self.ring.deinit();
-        posix.close(self.eventfd);
     }
 };
 ```
@@ -1305,7 +1300,8 @@ pub const IoUringContext = struct {
 1. Tailer enters `awaiting_entry` state.
 2. Tailer calls `uring_ctx.registerTailer(self)` to register for wakeup.
 3. Tailer blocks on `uring_ctx.waitForCompletions(timeout_ns)`.
-4. Appender writes a new entry and calls `uring_ctx.signal()`.
+4. Appender writes a new entry and writes `1` to each registered waiting tailer's eventfd
+   if notification is enabled.
 5. io_uring completes the poll operation, waking the tailer.
 6. Tailer re-reads the header at `qf_tip` and finds the new entry.
 
@@ -1333,7 +1329,7 @@ pub const patch_cycles: u32 = 3;
 pub const default_qf_disk_size: u64 = 83_754_496;
 
 /// Default mmap block size (1 MiB). Must be a power of two.
-pub const default_blocksize: u32 = 1024 * 1024;
+pub const default_blocksize: u32 = 2 * 1024 * 1024;
 
 /// Maximum payload size for a single entry (bytes).
 pub const max_data_size: usize = 1000;

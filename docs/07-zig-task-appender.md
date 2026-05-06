@@ -24,19 +24,18 @@
 
 ## 1. Overview
 
-The appender is the write-side of brz-queue. It is a **single-writer** component — only one
-thread may append at a time within a given process. No external locking is needed for the
-single-writer case. When multiple *processes* each have an appender on the same queue directory,
-coordination is handled by the CAS on the entry header in shared mmap memory.
+The appender is the write-side of brz-queue. It is a **single active writer** component — only one
+thread/process may hold the appender lease for a queue at a time. No lock is taken in the append
+loop; the lifecycle lease prevents accidental concurrent appenders before the hot path starts.
 
 The design prioritizes:
 
 - **Zero allocations on the hot path** — all memory is pre-mapped; payload is written directly
   into the mmap region via the comptime codec interface.
-- **Minimal syscalls on the hot path** — zero in steady state, except for an optional eventfd
-  write to signal readers.
-- **Predictable latency** — tiered CAS backoff (spin → yield → exponential) replaces any
-  coarse sleep. Pre-roll ensures cycle transitions don't stall the writer.
+- **Minimal syscalls on the hot path** — zero in the polling profile, except for optional
+  per-waiting-tailer eventfd writes when blocking readers are enabled.
+- **Predictable latency** — a background prefetcher prepares future mappings/pages and pre-roll
+  ensures cycle transitions don't stall the writer when the prefetcher keeps up.
 
 ### File Conventions
 
@@ -100,18 +99,20 @@ This is the most performance-critical code in the entire library. Every nanoseco
    modcount has changed since our last check, refresh cached queue parameters (highest
    cycle, etc.). This is a single memory read — no syscall.
 
-4. **Ensure mmap window covers the current tip**. In steady state the tip is within the
-   already-mapped region and this is a simple bounds check (no-op). Only on a block boundary
-   crossing does a remap occur, using `MAP_POPULATE` to pre-fault pages.
-
-5. **CAS: `UNALLOCATED → WORKING`** — a single `lock cmpxchg` instruction on the 4-byte
-   header at the tip. Uses `.acq_rel` / `.monotonic` ordering. On failure: tiered backoff
-   and retry (see §4).
-
-6. **Check for cycle roll** — compare the current wall-clock cycle number against the
-   appender's cycle. This is an arithmetic comparison on cached values.
+4. **Check for cycle roll** — compare the current wall-clock cycle number against the
+   appender's cycle before claiming a data slot.
    - If a roll is needed: write an EOF marker to the current position, swap to the
-     pre-rolled file if available, or create a new file as a fallback.
+     pre-rolled/pre-touched file if available, or create/map/touch a new file as a fallback.
+
+5. **Ensure mmap window covers the current tip**. In steady state the tip is within the
+   already-mapped/pre-touched region and this is a simple bounds check (no-op). At a block
+   boundary, swap in a ready window from the prefetcher; synchronous mmap/populate is only a
+   fallback and should be counted as a prefetch miss.
+
+6. **CAS: `UNALLOCATED → WORKING`** — a single `lock cmpxchg` instruction on the 4-byte
+   header at the tip. Uses `.monotonic` / `.monotonic` ordering; the final DATA header release
+   store publishes the payload. On failure: recovery/backoff policy handles the unexpected
+   busy slot (see §4).
 
 7. **`codec.write(mmap_buf + 4, msg, size)`** — serialize the payload directly into the
    mmap region, starting 4 bytes past the header. No intermediate buffer, no allocation.
@@ -123,11 +124,12 @@ This is the most performance-critical code in the entire library. Every nanoseco
 9. **Update flat index** — every `index_spacing` messages, atomically store the current
    byte offset as a `u64` into the index region. Single atomic store, no syscall.
 
-10. **Signal eventfd** — write 8 bytes (`u64` value 1) to the eventfd descriptor to wake
-    readers blocked in `io_uring` or `epoll`. This is the only syscall in steady state,
-    and it can be made optional or batched.
+10. **Signal waiters** — optionally write 8 bytes (`u64` value 1) to each registered
+    waiting tailer's eventfd. This is the only steady-state syscall source, and it can be
+    disabled or batched.
 
-11. **Advance tip and seqnum** — pure arithmetic on local state.
+11. **Advance tip and seqnum** — pure arithmetic on local state, followed by a release-store
+    of `metadata.write_position`.
 
 ### Syscall analysis (steady state)
 
@@ -142,7 +144,7 @@ This is the most performance-critical code in the entire library. Every nanoseco
 | 7 | Payload write | 0 (mmap write) |
 | 8 | Header publish | 0 (mmap write) |
 | 9 | Index update | 0 (mmap write, every N) |
-| 10 | eventfd signal | **1** `write(eventfd, ...)` |
+| 10 | waiter signal | **0–N** `write(eventfd, ...)`, depending on waiting tailers |
 | 11 | Tip/seqnum advance | 0 |
 | **Total** | | **0–1** |
 
@@ -157,21 +159,19 @@ pub fn append(self: *Appender, msg: anytype) !void {
     // Step 3: modcount refresh (volatile mmap read, no syscall)
     self.refreshModcountIfChanged();
 
-    // Step 4: ensure mmap window covers tip
-    try self.tailer.ensureWindow(self.tailer.tip, total);
-
-    // Step 5: CAS claim
-    const header_ptr = self.headerPtrAtTip();
-    try self.claimSlot(header_ptr);
-
-    // Step 6: cycle roll check
+    // Step 4: cycle roll check before claiming a data slot
     const now_ms = self.queue.clockMs();
     const current_cycle = self.queue.cycleFromMs(now_ms);
     if (current_cycle > self.tailer.cycle) {
-        try self.rollCycle(header_ptr, current_cycle);
-        // After roll, re-claim in the new file
-        return self.append(msg);
+        try self.rollCycle(current_cycle);
     }
+
+    // Step 5: ensure mmap window covers tip
+    try self.tailer.ensureWindow(self.tailer.tip, total);
+
+    // Step 6: CAS claim
+    const header_ptr = self.headerPtrAtTip();
+    try self.claimSlot(header_ptr);
 
     // Step 7: write payload directly into mmap
     const payload_ptr = self.payloadPtrAtTip();
@@ -189,11 +189,12 @@ pub fn append(self: *Appender, msg: anytype) !void {
     self.maybeUpdateIndex();
 
     // Step 10: signal eventfd
-    self.signalReaders();
+    try self.signalReaders();
 
     // Step 11: advance tip and seqnum
     self.tailer.tip += total;
     self.tailer.seqnum += 1;
+    @atomicStore(u64, &self.queue.metadata.?.write_position, self.tailer.tip, .release);
 
     // Pre-roll check (cheap branch, almost always false)
     self.maybePreroll(now_ms);
@@ -204,9 +205,9 @@ pub fn append(self: *Appender, msg: anytype) !void {
 
 ## 4. CAS Arbitration Detail
 
-Even though brz-queue is single-writer within a process, multiple *processes* may each have
-an appender open on the same queue directory. The CAS on the entry header arbitrates between
-them.
+The appender lease ensures there is only one active writer. The CAS on the entry header
+marks an entry as in-progress while the payload is being copied; it is not the global
+writer arbitration mechanism.
 
 ### Header constants
 
@@ -237,15 +238,15 @@ fn claimSlot(self: *Appender, ptr: *volatile u32) !void {
             ptr,
             Header.UNALLOCATED,
             Header.WORKING,
-            .acq_rel,    // success: acquire+release (read-modify-write)
-            .monotonic,  // failure: relaxed is sufficient to observe the current value
+            .monotonic,  // success: claim only; final DATA header publishes
+            .monotonic,  // failure: no ordering needed for retry/recovery
         );
         if (result == null) {
             // Success — we own the slot
             self.cas_attempt = 0;
             return;
         }
-        // Contention — another process's appender holds WORKING
+        // Busy/corrupt slot — normally recovery or a stale WORKING marker
         try casBackoff(&self.cas_attempt);
     }
 }
@@ -284,7 +285,7 @@ fn casBackoff(attempt: *u32) !void {
 |---|---|---|---|
 | Spin | 0–63 | ~5–40 ns/iter | Brief contention (ns-scale) |
 | Yield | 64–255 | ~1–10 μs | Short contention (μs-scale) |
-| Exponential | 256+ | 1 μs – 1 ms | Extended contention or crashed writer |
+| Exponential | 256+ | 1 μs – 1 ms | Stale WORKING marker or recovery stall |
 
 This replaces the previous approach of sleeping for 1 second on contention, which was far
 too coarse for a low-latency queue. The tiered scheme gives sub-microsecond response for
@@ -462,34 +463,43 @@ the nearest indexed offset. This avoids a full linear scan from the start of the
 
 ## 8. eventfd Signaling
 
-After publishing the header (step 8), the appender signals readers that a new message is
-available. This wakes readers that are blocked in `io_uring` or `epoll_wait` on the eventfd.
+After publishing the header and `write_position`, the appender may signal readers that new
+data is available. This is optional because every signal is a syscall paid by the appender.
+The minimum-latency profile disables signaling and uses polling readers; blocking readers
+trade a small appender cost for zero idle CPU.
 
 ```zig
-fn signalReaders(self: *Appender) void {
-    if (self.queue.eventfd) |efd| {
+fn signalReaders(self: *Appender) !void {
+    var it = self.queue.waiting_tailers.iterator();
+    while (it.next()) |tailer| {
+        const efd = tailer.wakeup_eventfd orelse continue;
         const val: u64 = 1;
-        _ = std.posix.write(efd, std.mem.asBytes(&val)) catch {};
+        _ = try std.posix.write(efd, std.mem.asBytes(&val));
     }
 }
 ```
 
-This is a single `write` syscall — 8 bytes written to the eventfd descriptor. The kernel
-coalesces multiple writes, so if readers are slow to drain, signals don't pile up.
+This is one `write` syscall per waiting tailer, not per configured tailer. The waiter
+registry is updated when a tailer enters/leaves blocking `collect()`. If signal latency is
+less important than append latency, use batching or disable signaling.
 
 ### Optimization options
 
 - **Polling readers**: If all readers use a pure spin-poll loop, eventfd signaling can be
-  disabled entirely (`queue.eventfd = null`), reducing steady-state syscalls to **zero**.
+  disabled entirely (`signal_blocking_tailers = false`), reducing steady-state syscalls to **zero**.
 - **Batched signaling**: Signal only every N messages instead of every message. This trades
   latency for throughput in high-volume scenarios.
+- **Waiting-only signaling**: Signal only tailers that have explicitly registered as parked.
+  This avoids O(number of tailers) work when readers are actively polling.
 
 ---
 
 ## 9. File Extension
 
 When the remaining space in the current mmap window drops below `2 × blocksize`, the
-appender extends the file using `fallocate` and refreshes the mmap.
+prefetcher should already have extended the file using `fallocate` and prepared the next
+mapping. The appender function below is a correctness fallback and should increment a
+prefetch-miss diagnostic because it can add jitter.
 
 ```zig
 fn extendFileIfNeeded(self: *Appender) !void {
@@ -500,19 +510,21 @@ fn extendFileIfNeeded(self: *Appender) !void {
         const new_size = self.tailer.file_size + self.queue.qf_disk_size;
 
         // Pre-allocate disk blocks (avoids ENOSPC on later writes)
-        _ = std.os.linux.fallocate(
+        const rc = std.os.linux.fallocate(
             self.tailer.fd,
             0,    // mode: default (allocate)
-            0,    // offset: from start
-            @intCast(new_size),
+            @intCast(self.tailer.file_size),
+            @intCast(new_size - self.tailer.file_size),
         );
+        if (rc != 0) return error.FallocateFailed;
 
         // Update cached file size (fstat)
         const stat = try std.posix.fstat(self.tailer.fd);
         self.tailer.file_size = @intCast(stat.size);
 
-        // Remap if needed to cover new region
+        // Remap and pre-touch if needed to cover new region
         try self.tailer.remapWindow(self.tailer.tip);
+        try self.tailer.touchWritableWindow();
     }
 }
 ```
@@ -586,16 +598,16 @@ small number (e.g., 2–4 cycles) to avoid scanning ancient files on startup.
 | Payload write | `memcpy` into mmap (or inline codec write) |
 | Header publish | Release store (plain `MOV` on x86) |
 | Index update | Atomic `u64` store (every N messages) |
-| eventfd signal | 1 `write` syscall |
+| eventfd signal | Optional/batched `write` syscalls to waiting tailers |
 | Padding | 0–3 zero bytes |
-| **Total syscalls (steady state)** | **0–1** (eventfd only) |
+| **Total syscalls (steady state)** | **0** in polling profile, **0–N waiting tailers** when signaling |
 | **Allocations (steady state)** | **0** |
 
 ### Memory ordering summary
 
 | Operation | Ordering | x86 Instruction |
 |---|---|---|
-| CAS (success) | `.acq_rel` | `lock cmpxchg` |
+| CAS (success) | `.monotonic` | `lock cmpxchg` |
 | CAS (failure) | `.monotonic` | (implicit in `lock cmpxchg`) |
 | Header publish | `.release` | `MOV` (TSO gives release for free) |
 | Index store | `.release` | `MOV` |

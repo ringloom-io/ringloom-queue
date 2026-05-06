@@ -192,15 +192,17 @@ test "SharedMetadata field offsets match the spec" {
     try testing.expectEqual(@as(usize, 32), @offsetOf(SharedMetadata, "highest_cycle"));
     try testing.expectEqual(@as(usize, 40), @offsetOf(SharedMetadata, "lowest_cycle"));
     try testing.expectEqual(@as(usize, 48), @offsetOf(SharedMetadata, "modcount"));
-    try testing.expectEqual(@as(usize, 56), @offsetOf(SharedMetadata, "write_lock"));
-    try testing.expectEqual(@as(usize, 64), @offsetOf(SharedMetadata, "_reserved"));
+    try testing.expectEqual(@as(usize, 56), @offsetOf(SharedMetadata, "write_position"));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(SharedMetadata, "appender_lock"));
+    try testing.expectEqual(@as(usize, 72), @offsetOf(SharedMetadata, "_reserved"));
 }
 
 test "SharedMetadata atomic fields are 8-byte aligned" {
     try testing.expect(@offsetOf(SharedMetadata, "highest_cycle") % 8 == 0);
     try testing.expect(@offsetOf(SharedMetadata, "lowest_cycle") % 8 == 0);
     try testing.expect(@offsetOf(SharedMetadata, "modcount") % 8 == 0);
-    try testing.expect(@offsetOf(SharedMetadata, "write_lock") % 8 == 0);
+    try testing.expect(@offsetOf(SharedMetadata, "write_position") % 8 == 0);
+    try testing.expect(@offsetOf(SharedMetadata, "appender_lock") % 8 == 0);
 }
 
 test "SharedMetadata magic number is correct" {
@@ -212,9 +214,10 @@ test "SharedMetadata magic number is correct" {
         .highest_cycle = 0,
         .lowest_cycle = 0,
         .modcount = 0,
-        .write_lock = 0x8000000000000000,
+        .write_position = 0,
+        .appender_lock = 0,
     };
-    try testing.expectEqual(@as(u32, 0x425A514D), m.magic);
+    try testing.expectEqual(@as(u32, 0x4D515A42), m.magic);
 }
 
 test "QueueFileHeader has correct total size" {
@@ -241,7 +244,7 @@ test "QueueFileHeader magic number is correct" {
         .epoch_ms = 0,
         .created_cycle = 0,
     };
-    try testing.expectEqual(@as(u32, 0x425A5143), h.magic);
+    try testing.expectEqual(@as(u32, 0x43515A42), h.magic);
 }
 ```
 
@@ -509,7 +512,7 @@ test "metadata.brz is valid 512-byte struct" {
     var raw: [512]u8 = undefined;
     _ = try file.readAll(&raw);
     const magic = std.mem.readInt(u32, raw[0..4], .little);
-    try testing.expectEqual(@as(u32, 0x425A514D), magic); // "BZQM"
+    try testing.expectEqual(@as(u32, 0x4D515A42), magic); // "BZQM"
 
     // Verify roll config fields match
     const roll_secs = std.mem.readInt(u32, raw[8..12], .little);
@@ -546,7 +549,7 @@ test "queue file has correct header and index region" {
     _ = try brz_file.preadAll(&hdr_buf, 0);
 
     const magic = std.mem.readInt(u32, hdr_buf[0..4], .little);
-    try testing.expectEqual(@as(u32, 0x425A5143), magic); // "BZQC"
+    try testing.expectEqual(@as(u32, 0x43515A42), magic); // "BZQC"
 
     const index_count = std.mem.readInt(u32, hdr_buf[16..20], .little);
     try testing.expectEqual(@as(u32, 32), index_count); // TEST4_SECONDLY
@@ -1102,6 +1105,57 @@ test "benchmark: io_uring wakeup latency" {
 }
 ```
 
+### 6.4 Prefetcher Page-Fault Regression
+
+The low-jitter profile must prove that the appender does not take page faults in
+steady state when the prefetcher is enabled.
+
+```zig
+test "benchmark: appender has no steady-state page faults with prefetcher" {
+    const before = try test_util.readTaskFaultCounters();
+
+    // Open queue with enable_prefetcher=true, append enough data to cross
+    // several mmap windows, then read counters again.
+    try runAppendBenchmark(.{
+        .enable_prefetcher = true,
+        .prefetch_runway_bytes = 16 * 1024 * 1024,
+        .signal_blocking_tailers = false,
+    });
+
+    const after = try test_util.readTaskFaultCounters();
+    try testing.expectEqual(before.major_faults, after.major_faults);
+    try testing.expect(after.minor_faults - before.minor_faults < 4);
+}
+```
+
+The small minor-fault allowance covers unrelated runtime/test harness activity.
+Dedicated latency runs should pin the benchmark to an isolated CPU and sample
+`perf stat -e page-faults,minor-faults,major-faults,dTLB-load-misses`.
+
+### 6.5 Cleaner Does Not Reclaim Hot Data
+
+```zig
+test "cleaner only reclaims data behind local tailers and retention floor" {
+    var queue = try openTestQueue(.{
+        .enable_cleaner = true,
+        .retention_cycles = 2,
+    });
+    defer queue.deinit();
+
+    // Append and roll several cycles, keep one tailer intentionally behind,
+    // then run cleaner once.
+    try appendAcrossCycles(&queue, 5);
+    var lagging = try queue.tailer(Index.compose(queue.currentCycle() - 1, 0));
+    defer lagging.deinit();
+
+    try queue.cleaner.?.runOnce();
+
+    try testing.expect(try queue.cycleExists(queue.currentCycle()));
+    try testing.expect(try queue.cycleExists(queue.currentCycle() - 1));
+    try testing.expect(!(try queue.cycleExists(queue.currentCycle() - 4)));
+}
+```
+
 ---
 
 ## 7. Property-Based Testing
@@ -1478,7 +1532,7 @@ Test `cycleToFilename()` for every defined roll scheme:
 |---|---|---|---|
 | `SharedMetadata` | 512 | Total size, all field offsets, atomic field alignment | P1 |
 | `QueueFileHeader` | 64 | Total size, all field offsets | P1 |
-| Magic numbers | — | `0x425A514D` (metadata), `0x425A5143` (data file) | P1 |
+| Magic numbers | — | `0x4D515A42` (metadata), `0x43515A42` (data file) | P1 |
 
 ### 10.5 Multi-Process Coordination
 

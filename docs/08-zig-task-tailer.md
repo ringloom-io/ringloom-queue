@@ -269,10 +269,11 @@ fn pad4(sz: u32) u32 {
 
 ## 5. io_uring Wakeup — `collect()`
 
-The blocking read API uses io_uring with eventfd to wait efficiently for new data.
-The writer signals the eventfd after publishing each entry. The tailer registers a
-read on the eventfd with io_uring, which blocks in the kernel with zero CPU usage
-until the writer signals.
+The blocking read API can use io_uring with eventfd to wait efficiently for new data.
+Each blocking tailer owns its own eventfd. When a tailer enters `collect()`, it registers
+itself in the queue's waiter registry; after publishing data, the appender signals only
+registered waiters. This avoids relying on a single shared eventfd, which would not provide
+reliable broadcast semantics for multiple tailers.
 
 ```zig
 pub fn collect(self: *Tailer) !Entry {
@@ -281,9 +282,11 @@ pub fn collect(self: *Tailer) !Entry {
 
     // 2. No data available — wait on io_uring
     while (true) {
-        // Submit a read on the eventfd
+        // Register as parked, then submit a read on this tailer's eventfd
+        try self.queue.waiting_tailers.register(self);
+        defer self.queue.waiting_tailers.unregister(self);
         var sqe = try self.queue.uring_ctx.?.getSubmitEntry();
-        sqe.prepareRead(self.queue.eventfd.?, ...);
+        sqe.prepareRead(self.wakeup_eventfd.?, ...);
         try self.queue.uring_ctx.?.submit();
 
         // Wait for completion (blocks in kernel, zero CPU usage)
@@ -301,7 +304,7 @@ pub fn collect(self: *Tailer) !Entry {
 | Scenario | Behavior |
 |---|---|
 | Data already available | Same as `poll()` — no io_uring overhead at all |
-| Waiting for data | Near-zero wakeup latency (eventfd notification is sub-microsecond) |
+| Waiting for data | Low wakeup latency, with one appender syscall per waiting tailer unless batched |
 | CPU usage while waiting | Zero (thread is blocked in kernel on `io_uring_enter`) |
 
 ### Why io_uring Instead of Spin-Loop
@@ -312,11 +315,18 @@ Traditional queue implementations use a spin-loop with progressive sleep backoff
 - Tight spin burns 100% CPU on one core.
 - Progressive backoff adds milliseconds of latency in the worst case.
 
-With io_uring + eventfd:
+With io_uring + per-tailer eventfd:
 
 - **Zero CPU** while waiting — the thread is fully parked in the kernel.
-- **Sub-microsecond wakeup** — eventfd write completes an io_uring CQE instantly.
-- **No tuning needed** — no backoff parameters to configure.
+- **Low wakeup latency** — eventfd write completes an io_uring CQE quickly.
+- **Explicit tradeoff** — blocking readers save CPU but add appender notification syscalls. For minimum append latency, use polling readers or batched signaling.
+
+### Spurious and Coalesced Wakeups
+
+Eventfd counters coalesce writes. A wakeup means "poll the queue again", not "exactly one
+message is available". `collect()` must always loop through `poll()` after wakeup and must
+tolerate spurious wakeups, stale registrations, and batched signals. If `poll()` still finds
+no data, the tailer re-registers and waits again.
 
 ---
 
@@ -350,10 +360,13 @@ pub fn seekTo(self: *Tailer, target_index: u64) !void {
         }
     }
 
-    // Seek to the indexed position
+    // Seek to the indexed position, or fall back to the start of the data region.
     if (index_region.lookup(lo)) |offset| {
         self.qf_tip = offset;
         self.qf_index = Index.compose(target_cycle, lo * index_region.spacing);
+    } else {
+        self.qf_tip = index_region.dataRegionOffset();
+        self.qf_index = Index.compose(target_cycle, 0);
     }
 
     // Scan forward to the exact target seqnum
@@ -367,7 +380,7 @@ pub fn seekTo(self: *Tailer, target_index: u64) !void {
 ### Complexity Analysis
 
 The flat inline index stores byte offsets at regular intervals (the `spacing` parameter).
-With a default spacing of 256:
+With a default spacing of 256 in a healthy/recovered file:
 
 | Phase | Cost |
 |---|---|
@@ -375,8 +388,10 @@ With a default spacing of 256:
 | Linear scan to exact entry | O(256) worst case |
 | **Total** | **O(log n)** |
 
-Compare this with a naive O(n) scan from the start of the file, which would require
-reading every entry header sequentially.
+If a crash left one or more missing index entries, seek still remains correct by scanning
+from the nearest earlier populated slot or from the data-region start. Appender startup
+recovery should repair missing index entries so the steady-state bound returns to
+`index_spacing - 1`.
 
 ### Index Region Layout
 

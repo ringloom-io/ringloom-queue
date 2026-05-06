@@ -13,10 +13,10 @@ This document specifies:
 
 1. **mmap primitives** — `mapFile`, `unmapFile`, `remapFile`
 2. **Sliding window strategy** — blocksize-aligned 2× windows with pre-mapping
-3. **MAP_POPULATE** — pre-fault all pages on appender remap
+3. **Appender pre-touching** — pre-fault writable pages before the appender reaches them
 4. **madvise(MADV_SEQUENTIAL)** — aggressive read-ahead for tailers
 5. **MAP_HUGETLB** — optional 2 MiB huge pages for reduced TLB pressure
-6. **Pre-mapping the next window** — overlap mmap with write I/O
+6. **Pre-mapping the next window** — overlap mmap/page faults with write I/O
 7. **fallocate(2)** — reserve real disk blocks instead of lseek+write
 8. **Atomic operations** — CAS, loads, stores with acquire/release ordering
 9. **Tiered CAS backoff** — spin → yield → exponential sleep
@@ -127,13 +127,14 @@ accidentally writes will receive a `SIGSEGV`.
 
 ---
 
-## 2. MAP_POPULATE for Appenders
+## 2. Appender Page Pre-Touching
 
-When the appender maps a new window, we use `MAP_POPULATE` to pre-fault all
-pages in the mapped region:
+The appender must not normally map or fault pages itself. Future writable
+windows are prepared by a background prefetcher. `MAP_POPULATE` is the baseline
+mechanism for installing page-table entries during mapping:
 
 ```zig
-// Appender maps with MAP_POPULATE
+// Prefetcher maps with MAP_POPULATE
 const flags = MapFlags{ .TYPE = .SHARED, .POPULATE = true };
 const buf = try mapFile(fd, offset, size, .read_write, flags);
 ```
@@ -152,17 +153,48 @@ call itself, as a single bulk operation. The cost is:
 - **Remap is slightly slower** — the `mmap` call blocks while faulting pages
 - **Writes are jitter-free** — no per-write page faults, ever
 
-This is the right tradeoff for a latency-sensitive appender. The remap cost
-is amortized (it happens once per window) and predictable. The per-write
-jitter from demand paging is unpredictable and can spike to tens of
-microseconds.
+This is the right primitive, but only if it runs before the appender needs the
+mapping. If `MAP_POPULATE` runs synchronously inside `append()`, it creates a
+predictable but still unacceptable appender-thread latency spike.
 
 ### Combined with fallocate
 
 When `MAP_POPULATE` is used on a file region that was pre-allocated with
-`fallocate`, the page faults are guaranteed to be minor (the disk blocks
-already exist). This eliminates ALL page-fault-related latency for the
-appender after the remap.
+`fallocate`, major faults from filesystem block allocation are avoided. Some
+kernels may still defer writable PTE setup until first write, so the low-jitter
+profile also needs writable pre-touching.
+
+### Writable pre-touch order
+
+For every future appender window:
+
+1. `fallocate(fd, offset, len)` for the target range.
+2. `posix_fadvise(POSIX_FADV_WILLNEED)` where available.
+3. `mmap(PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE)`.
+4. Prefer `madvise(MADV_POPULATE_WRITE)` on Linux kernels that expose it.
+5. Otherwise, manually write-touch one byte per page in future unallocated space.
+6. Optionally `mlock` the prepared current/next windows if configured.
+
+The manual touch is an idempotent `0` store into pages that are known to be ahead
+of the appender's claimed/published write position. It must never touch a page
+that can contain committed or in-progress data.
+
+```zig
+pub fn touchWritablePages(buf: []align(std.mem.page_size) u8) void {
+    var off: usize = 0;
+    while (off < buf.len) : (off += std.mem.page_size) {
+        @as(*volatile u8, @ptrCast(&buf[off])).* = 0;
+    }
+}
+```
+
+### Chronicle Queue comparison
+
+Chronicle Queue calls this idea **pre-touching**. Its public docs describe
+touching storage resources and possibly acquiring future cycle files before the
+appender needs them; it exposes manual `ExcerptAppender.pretouch()` and an
+automatic preloader. brz-queue should implement the same principle as a
+`PagePrefetcher` thread with explicit handoff to the appender.
 
 ---
 
@@ -382,10 +414,10 @@ pub const MmapWindow = struct {
 
 ## 6. Pre-Mapping Next Window
 
-When the tip crosses 50% of the current window, the next window is
-pre-mapped in the background. When the actual remap triggers, the
-pre-mapped window is already ready — just swap pointers and unmap the
-old one.
+When the tip crosses the configured runway threshold, the next window is
+pre-mapped and write-touched in the background. When the actual remap triggers,
+the pre-mapped window is already ready — just swap pointers and defer unmapping
+the old one to the cleaner.
 
 ### Trigger condition
 
@@ -394,6 +426,10 @@ pub inline fn shouldPremap(tip_in_window: u64, window_size: u64) bool {
     return tip_in_window > (window_size >> 1);
 }
 ```
+
+The 50% threshold is a safe default, not a hard rule. A low-jitter deployment
+should also trigger prefetching when estimated time-to-boundary is below a
+configured runway (for example 5-10 ms), based on recent bytes/second.
 
 ### Implementation sketch
 
@@ -437,6 +473,7 @@ pub const PremappedWindow = struct {
                 const next_params = computeWindow(next_tip, file_size, blocksize);
                 var next_win = MmapWindow{ .fd = self.current.fd };
                 next_win.ensureMapped(next_params, prot, flags) catch {};
+                touchWritablePages(next_win.buf.?);
                 self.next = next_win;
             }
         }
@@ -446,10 +483,11 @@ pub const PremappedWindow = struct {
 
 ### Why this matters
 
-A fresh `mmap` call takes 2–10 µs (more with `MAP_POPULATE`). By
-pre-mapping while the appender still has half a window of runway, the
-latency of the remap is hidden behind normal write operations. The hot
-path never blocks on a fresh `mmap`.
+A fresh `mmap` call takes microseconds, and writable page population can take
+longer depending on memory pressure and filesystem state. By pre-mapping while
+the appender still has a window of runway, the latency of mmap and page faults is
+hidden behind normal write operations. The hot path never blocks on a fresh
+`mmap` when the prefetcher keeps up.
 
 ---
 
@@ -474,8 +512,8 @@ pub fn extendFile(fd: posix.fd_t, new_size: u64) !void {
 `fallocate` actually reserves disk blocks. After `fallocate`:
 
 - The file is non-sparse — all blocks are allocated
-- First write to each page is a **minor fault only** (no block allocation)
-- Combined with `MAP_POPULATE`, eliminates **all** page faults for the appender
+- First write to each page is at worst a **minor fault** (no block allocation)
+- Combined with background writable pre-touching, removes expected page faults from the appender hot path
 
 ### needsExtension
 
@@ -521,22 +559,17 @@ model already guarantees:
 On ARM, acquire/release map to `LDAR`/`STLR`, which are lighter than the
 full `DMB ISH` barriers that SeqCst requires.
 
-### CAS for write slot arbitration
+### CAS for entry header claim
 
 The appender claims a write slot by CAS-ing the header from `UNALLOCATED` to
-`WORKING`. We need `.acq_rel` on success: acquire to see all prior writes to
-the slot, release to publish our claim.
+`WORKING`. This claim does not publish payload data, so monotonic ordering is
+sufficient for the CAS itself. The later release-store of the DATA header is the
+publication operation readers synchronize with.
 
 ```zig
 pub fn cmpxchg32(ptr: *volatile u32, expected: u32, desired: u32) ?u32 {
-    return @cmpxchgStrong(u32, ptr, expected, desired, .acq_rel, .monotonic);
-    // On success (.acq_rel):
-    //   - Acquire: prevents subsequent reads from being reordered before the CAS.
-    //   - Release: makes our write visible to other threads/processes.
-    // On failure (.monotonic):
-    //   - We don't need ordering guarantees; we'll just retry.
-    // On x86: the `lock cmpxchg` instruction provides an implicit full barrier
-    //         regardless of the requested ordering.
+    return @cmpxchgStrong(u32, ptr, expected, desired, .monotonic, .monotonic);
+    // The final @atomicStore(..., .release) of the DATA header publishes payload bytes.
 }
 ```
 
@@ -582,7 +615,7 @@ pub inline fn atomicStore64(ptr: *volatile u64, val: u64) void {
 }
 
 pub inline fn atomicFetchAdd64(ptr: *volatile u64, val: u64) u64 {
-    return @atomicRmw(u64, ptr, .Add, val, .acq_rel);
+    return @atomicRmw(u64, ptr, .Add, val, .release);
 }
 ```
 
@@ -598,7 +631,7 @@ pub inline fn atomicStore32(ptr: *volatile u32, val: u32) void {
 }
 
 pub inline fn atomicFetchAdd32(ptr: *volatile u32, val: u32) u32 {
-    return @atomicRmw(u32, ptr, .Add, val, .acq_rel);
+    return @atomicRmw(u32, ptr, .Add, val, .release);
 }
 ```
 
@@ -606,9 +639,10 @@ pub inline fn atomicFetchAdd32(ptr: *volatile u32, val: u32) u32 {
 
 ## 9. Tiered CAS Backoff
 
-When a CAS fails (another process claimed the slot), the appender must
-retry. A naive spin-loop wastes CPU and creates contention on the cache
-line. The tiered backoff strategy adapts to contention level:
+In the single-active-appender design, a CAS failure should be rare: it normally
+means recovery found an in-progress entry or the appender hit an unexpected
+state. If retry is appropriate, a naive spin-loop wastes CPU and creates
+contention on the cache line. The tiered backoff strategy adapts to stall level:
 
 ```zig
 pub fn casBackoff(attempt: u32) void {
@@ -677,20 +711,20 @@ directly and cast to a pointer. No parsing, no serialization.
 
 ```zig
 pub const SharedMetadata = extern struct {
-    /// Magic number for validation.
-    magic: u64,
-    /// Version of the metadata format.
-    version: u64,
-    /// Write position (absolute byte offset in queue file).
-    write_position: u64,
-    /// Current cycle (which queue file is active).
-    cycle: u64,
-    /// Modification count (bumped on every structural change).
-    modcount: u64,
-    /// Blocksize in bytes.
-    blocksize: u64,
+    magic: u32 = 0x4D515A42,
+    version: u16 = 1,
+    flags: u16 = 0,
+    roll_length_secs: u32,
+    index_spacing: u32,
+    index_count: u32,
+    epoch_ms: u64,
+    highest_cycle: u64 align(8),
+    lowest_cycle: u64 align(8),
+    modcount: u64 align(8),
+    write_position: u64 align(8),
+    appender_lock: u64 align(8),
     /// Reserved for future use.
-    _reserved: [512 - 48]u8 = [_]u8{0} ** (512 - 48),
+    _reserved: [440]u8 = [_]u8{0} ** 440,
 
     comptime {
         std.debug.assert(@sizeOf(SharedMetadata) == 512);
@@ -979,7 +1013,7 @@ src/
 | `computeWindow` / `needsRemap` | `window.zig` | 2× blocksize sliding window | ☐ |
 | `shouldPremap` / `PremappedWindow` | `window.zig` | Pre-map at 50% boundary | ☐ |
 | `extendFile` (fallocate) | `file_ops.zig` | Real block allocation | ☐ |
-| `cmpxchg32` (acq_rel) | `atomic_ops.zig` | CAS for write slot arbitration | ☐ |
+| `cmpxchg32` (monotonic) | `atomic_ops.zig` | CAS for entry header claim | ☐ |
 | `atomicLoad64` / `atomicStore64` | `atomic_ops.zig` | Acquire/release ordering | ☐ |
 | `atomicFetchAdd64` | `atomic_ops.zig` | Modcount bump | ☐ |
 | `casBackoff` (tiered) | `atomic_ops.zig` | Spin → yield → exp sleep | ☐ |

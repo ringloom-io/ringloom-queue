@@ -9,12 +9,14 @@
 5. [Metadata File Creation](#5-metadata-file-creation)
 6. [Queue File Creation](#6-queue-file-creation)
 7. [Pre-Roll File Creation](#7-pre-roll-file-creation)
-8. [io_uring Setup](#8-io_uring-setup)
-9. [Queue File Enumeration](#9-queue-file-enumeration)
-10. [Configuration](#10-configuration)
-11. [Queue Cleanup (deinit)](#11-queue-cleanup-deinit)
-12. [Error Handling](#12-error-handling)
-13. [Testing Strategy](#13-testing-strategy)
+8. [PagePrefetcher Lifecycle](#8-pageprefetcher-lifecycle)
+9. [Cleaner Lifecycle](#9-cleaner-lifecycle)
+10. [io_uring Setup](#10-io_uring-setup)
+11. [Queue File Enumeration](#11-queue-file-enumeration)
+12. [Configuration](#12-configuration)
+13. [Queue Cleanup (deinit)](#13-queue-cleanup-deinit)
+14. [Error Handling](#14-error-handling)
+15. [Testing Strategy](#15-testing-strategy)
 
 ---
 
@@ -33,7 +35,7 @@ a queue through to tearing it down:
 - **Pre-roll file preparation** — pre-create the next cycle's `.brz` file
   within a configurable `preroll_ms` window so the hot-path roll is a pointer
   swap with zero syscalls
-- **io_uring setup** — initialize an io_uring context and eventfd for
+- **io_uring setup** — initialize an io_uring context and per-tailer eventfds for
   writer→reader notification
 - **Cleanup** — tear down all mappings, fds, and io_uring state in reverse
   order
@@ -90,8 +92,8 @@ pub const Queue = struct {
     index_spacing: u32 = 256,
 
     // --- Cycle / seqnum bit layout ---
-    cycle_shift: u6 = 40,
-    seqnum_mask: u64 = 0xFF_FFFF_FFFF,
+    cycle_shift: u6 = 32,
+    seqnum_mask: u64 = 0x00000000FFFFFFFF,
 
     // --- Pre-roll state (NEW) ---
     preroll_fd: ?posix.fd_t = null,
@@ -99,9 +101,17 @@ pub const Queue = struct {
     preroll_cycle: ?u32 = null,
     preroll_ms: u64 = 500, // pre-roll window: 500 ms before cycle end
 
+    // --- Background latency helpers ---
+    enable_prefetcher: bool = true,
+    prefetch_runway_bytes: u64 = 8 * 1024 * 1024,
+    enable_cleaner: bool = true,
+    retention_cycles: ?u32 = null,
+    cleaner: ?Cleaner = null,
+    prefetcher: ?PagePrefetcher = null,
+
     // --- io_uring (NEW) ---
     uring_ctx: ?IoUringContext = null,
-    eventfd: ?posix.fd_t = null,
+    waiting_tailers: WaiterRegistry = .{},
 
     // --- Huge page config (NEW) ---
     use_huge_pages: bool = false,
@@ -159,7 +169,7 @@ fn detectVersion(dirname: []const u8) !Version {
         const bytes_read = try f.readAll(&magic_buf);
         if (bytes_read == 4) {
             const magic = std.mem.readInt(u32, &magic_buf, .little);
-            if (magic == 0x425A514D) return .v1;
+            if (magic == 0x4D515A42) return .v1;
         }
         return .unknown; // file exists but magic doesn't match
     } else |_| {}
@@ -182,10 +192,10 @@ existing data files, and initializes io_uring.
 1. Validate directory exists
 2. Detect version from `metadata.brz`
 3. Open and mmap `metadata.brz` → cast to `*SharedMetadata`
-4. Validate magic number (`0x425A514D`)
+4. Validate magic number (`0x4D515A42`)
 5. Read roll config directly from struct fields (zero parsing!)
 6. Scan directory for existing `.brz` data files
-7. Initialize io_uring context and eventfd
+7. Initialize io_uring context and waiter registry
 8. Set up pre-roll state
 9. Validate configuration consistency
 
@@ -234,7 +244,7 @@ pub fn open(self: *Self) !void {
     self.metadata = @ptrCast(@alignCast(self.metadata_mmap.?.ptr));
 
     // 4. Validate magic
-    if (self.metadata.?.magic != 0x425A514D) {
+    if (self.metadata.?.magic != 0x4D515A42) {
         return error.InvalidMagic;
     }
 
@@ -253,7 +263,7 @@ pub fn open(self: *Self) !void {
     // 6. Scan directory for existing .brz data files
     try self.refreshQueueFiles();
 
-    // 7. Initialize io_uring context and eventfd
+    // 7. Initialize io_uring context and waiter registry
     try self.initIoUring();
 
     // 8. Pre-roll state starts empty — will be filled by maybePreroll()
@@ -269,6 +279,40 @@ pub fn open(self: *Self) !void {
 
 The entire open sequence is: mmap → pointer cast → read struct fields. No
 parsing, no deserialization, no offset scanning.
+
+### Appender lease
+
+Opening a queue does not acquire writer ownership. The lease is acquired when an
+appender is created and released when that appender closes:
+
+```zig
+pub fn acquireAppenderLease(self: *Self, owner_token: u64) !void {
+    const prev = @cmpxchgStrong(
+        u64,
+        &self.metadata.?.appender_lock,
+        0,
+        owner_token,
+        .acquire,
+        .monotonic,
+    );
+    if (prev != null) return error.AppenderAlreadyOpen;
+}
+
+pub fn releaseAppenderLease(self: *Self, owner_token: u64) !void {
+    const prev = @cmpxchgStrong(
+        u64,
+        &self.metadata.?.appender_lock,
+        owner_token,
+        0,
+        .release,
+        .monotonic,
+    );
+    if (prev != null) return error.AppenderLeaseLost;
+}
+```
+
+The lease CAS happens outside the append hot path. It prevents multiple writers
+from corrupting `write_position` without adding per-message synchronization.
 
 ---
 
@@ -318,7 +362,7 @@ fn metadataInit(self: *Self) !void {
 
     // 4. Cast to *SharedMetadata and fill in fields
     const meta: *SharedMetadata = @ptrCast(@alignCast(mmap_buf.ptr));
-    meta.magic = 0x425A514D;
+    meta.magic = 0x4D515A42;
     meta.version = 1;
     meta.flags = 0;
     meta.roll_length_secs = self.roll_length_secs;
@@ -330,7 +374,8 @@ fn metadataInit(self: *Self) !void {
     @atomicStore(u64, &meta.highest_cycle, 0, .release);
     @atomicStore(u64, &meta.lowest_cycle, 0, .release);
     @atomicStore(u64, &meta.modcount, 0, .release);
-    @atomicStore(u64, &meta.write_lock, 0x8000000000000000, .release); // unlocked
+    @atomicStore(u64, &meta.write_position, 0, .release);
+    @atomicStore(u64, &meta.appender_lock, 0, .release); // unlocked
 
     // Zero the reserved region (fallocate already zeroed, but be explicit)
     @memset(&meta._reserved, 0);
@@ -393,7 +438,7 @@ fn queuefileInit(self: *Self, path: []const u8, cycle: u32) !posix.fd_t {
 
     // 4. Cast to *QueueFileHeader and fill in fields
     const hdr: *QueueFileHeader = @ptrCast(@alignCast(buf.ptr));
-    hdr.magic = 0x425A5143;     // "BZQC"
+    hdr.magic = 0x43515A42;     // "BZQC"
     hdr.version = 1;
     hdr.flags = 0;
     hdr.roll_length_secs = self.roll_length_secs;
@@ -515,23 +560,110 @@ pre-roll starts halfway through every cycle.
 
 ---
 
-## 8. io_uring Setup
+## 8. PagePrefetcher Lifecycle
+
+The prefetcher is the component that keeps page faults out of the appender hot
+path. It is optional for simple deployments, but enabled by default in the
+low-jitter profile.
+
+### Responsibilities
+
+1. Watch `metadata.write_position` and the appender's current cycle.
+2. Keep at least `prefetch_runway_bytes` of writable, pre-touched space ahead of
+   the appender.
+3. Extend files with `fallocate` before the appender reaches the extension
+   threshold.
+4. Map the next appender window and populate writable PTEs using
+   `MADV_POPULATE_WRITE` when available or manual write-touch otherwise.
+5. Pre-create, preallocate, map, and touch the next cycle file inside the
+   pre-roll window.
+6. Publish a ready window/cycle through a single-producer/single-consumer handoff
+   slot. The appender may swap the ready mapping without blocking.
+
+The prefetcher may map and touch future regions, but it must never mutate the
+appender's current mapping or write at/behind the appender's claimed write
+position.
+
+```zig
+pub const PagePrefetcher = struct {
+    queue: *Queue,
+    stop: std.atomic.Value(bool) = .init(false),
+    ready_window: SpscHandoff(MappedWindow) = .{},
+
+    pub fn run(self: *PagePrefetcher) !void {
+        while (!self.stop.load(.acquire)) {
+            const pos = @atomicLoad(u64, &self.queue.metadata.?.write_position, .acquire);
+            try self.ensureRunway(pos);
+            try self.maybePreroll(self.queue.clockMs());
+            std.time.sleep(50 * std.time.ns_per_us);
+        }
+    }
+};
+```
+
+If the prefetcher falls behind, the appender can synchronously prepare the
+required window as a correctness fallback. That path should increment a
+diagnostic counter such as `prefetch_miss_count` so benchmarks can prove the hot
+path stayed on the intended profile.
+
+---
+
+## 9. Cleaner Lifecycle
+
+A cleaner thread is useful, but it is not part of message publication. Its job is
+to make the system more predictable by moving resource cleanup, page-cache hints,
+and retention work away from the appender.
+
+### Responsibilities
+
+1. Unmap old windows after the appender/tailers have moved past them.
+2. Close file descriptors no longer used by local components.
+3. Call `madvise(MADV_DONTNEED)` on stale local mappings and
+   `posix_fadvise(POSIX_FADV_DONTNEED)` on old file ranges when replay is not
+   expected soon.
+4. Apply configured retention by deleting cycle files older than the retention
+   floor.
+5. Optionally perform durability work (`sync_file_range`/`fdatasync`) if the
+   queue is configured for stronger persistence.
+
+The cleaner must be conservative. It should never reclaim the current appender
+window, a prefetched handoff window, or any region still needed by local tailers.
+Because cross-process tailers are not centrally registered, deletion should be
+based on explicit retention policy, not inferred from local tailer positions.
+
+```zig
+pub const Cleaner = struct {
+    queue: *Queue,
+    pending_unmaps: LockFreeQueue(MappedWindow),
+
+    pub fn run(self: *Cleaner) !void {
+        while (!self.queue.closing.load(.acquire)) {
+            self.reapDeferredUnmaps();
+            self.dropColdPageCache();
+            try self.applyRetention();
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+};
+```
+
+Cleaner work can improve tail latency indirectly: old mappings and page-cache
+pressure are less likely to evict the appender's prepared runway, and slow
+`munmap`, `close`, delete, or flush operations do not run on the appender thread.
+
+---
+
+## 10. io_uring Setup
 
 io_uring provides an efficient notification mechanism for writer→reader
-communication. Instead of polling, readers submit an io_uring SQE to wait on
-an eventfd, and receive a completion when a message is available.
+communication. Instead of polling, blocking readers submit an io_uring SQE to
+wait on their own eventfd, and receive a completion when a message may be
+available.
 
 ### Initialization
 
 ```zig
 fn initIoUring(self: *Queue) !void {
-    // Create eventfd for writer→reader signaling
-    self.eventfd = try std.posix.eventfd(0, .{ .NONBLOCK = true });
-    errdefer {
-        std.posix.close(self.eventfd.?);
-        self.eventfd = null;
-    }
-
     // Initialize io_uring context
     self.uring_ctx = try IoUringContext.init(.{
         .queue_depth = 64,
@@ -544,12 +676,13 @@ fn initIoUring(self: *Queue) !void {
 
 | Actor | Operation |
 |-------|-----------|
-| **Writer** | After publishing a message (release store on the 4-byte header), writes `1` to the eventfd |
-| **Reader** | Submits an io_uring `POLL_ADD` SQE on the eventfd; gets a CQE when the eventfd becomes readable |
+| **Writer** | After publishing a message and `write_position`, optionally writes `1` to each registered waiting tailer's eventfd |
+| **Reader** | Creates a per-tailer eventfd, registers as waiting, submits an io_uring `POLL_ADD` SQE, then polls after wakeup |
 
 This avoids busy-spinning in readers when no messages are available. The
-eventfd write is a single syscall; the reader's io_uring poll is batched and
-kernel-mediated.
+eventfd write is an explicit latency tradeoff on the appender: use it for
+blocking readers, batch it for throughput, or disable it for the minimum-latency
+polling profile.
 
 ### IoUringContext struct
 
@@ -578,7 +711,7 @@ pub const IoUringContext = struct {
 
 ---
 
-## 9. Queue File Enumeration
+## 11. Queue File Enumeration
 
 Scan the queue directory for `.brz` data files (excluding `metadata.brz`),
 extract cycle numbers from filenames, and sort by cycle.
@@ -636,7 +769,7 @@ fn cycleFromPath(self: *Self, filename: []const u8) !u32 {
 
 ---
 
-## 10. Configuration
+## 12. Configuration
 
 All configuration setters must be called **before** `open()`. They set fields
 on the `Queue` struct that are used during metadata creation (for new queues)
@@ -688,6 +821,32 @@ When enabled, mmap calls include `MAP_HUGETLB` for 2 MiB huge pages. Falls
 back to 4 KiB pages if the kernel can't satisfy the request. Requires the
 blocksize to be 2 MiB-aligned.
 
+### setPrefetcher (NEW)
+
+```zig
+pub fn setPrefetcher(self: *Self, enabled: bool, runway_bytes: u64) void {
+    self.enable_prefetcher = enabled;
+    self.prefetch_runway_bytes = runway_bytes;
+}
+```
+
+The prefetcher should be enabled for the minimum-jitter profile. `runway_bytes`
+must be large enough to cover the worst expected burst while the prefetcher is
+scheduled out; 8-64 MiB is a reasonable starting range depending on throughput.
+
+### setCleaner (NEW)
+
+```zig
+pub fn setCleaner(self: *Self, enabled: bool, retention_cycles: ?u32) void {
+    self.enable_cleaner = enabled;
+    self.retention_cycles = retention_cycles;
+}
+```
+
+The cleaner reclaims local mappings/page-cache and optionally deletes old cycle
+files according to retention. Set `retention_cycles = null` to keep all files and
+only perform local resource cleanup.
+
 ### setCreate
 
 ```zig
@@ -698,7 +857,7 @@ pub fn setCreate(self: *Self, permitted: bool) void {
 
 ---
 
-## 11. Queue Cleanup (deinit)
+## 13. Queue Cleanup (deinit)
 
 Teardown releases all resources in reverse order of acquisition. Every mmap
 is unmapped, every fd is closed, every allocation is freed.
@@ -723,11 +882,8 @@ pub fn deinit(self: *Self) void {
         self.uring_ctx = null;
     }
 
-    // 4. Close eventfd
-    if (self.eventfd) |efd| {
-        std.posix.close(efd);
-        self.eventfd = null;
-    }
+    // 4. Assert waiter registry is empty; tailers own/close their eventfds
+    std.debug.assert(self.waiting_tailers.isEmpty());
 
     // 5. Unmap and close pre-roll fd/mmap if present
     if (self.preroll_mmap) |buf| {
@@ -769,14 +925,14 @@ pub fn deinit(self: *Self) void {
 | Tailers first | Tailers hold read-only mappings into data files; close before files |
 | Appender second | Appender may hold write mappings; must flush before closing |
 | io_uring third | Cancel in-flight SQEs before closing the fds they reference |
-| eventfd fourth | After io_uring is down, no one polls it |
+| Waiter registry fourth | Tailers own eventfds; registry must be empty after tailers close |
 | Pre-roll fifth | Independent fd/mmap, safe to close after appender |
 | Metadata sixth | Other components may reference metadata pointer; close last |
 | Strings last | Path strings may be referenced by error messages during teardown |
 
 ---
 
-## 12. Error Handling
+## 14. Error Handling
 
 ### Error set
 
@@ -821,7 +977,8 @@ pub const QueueError = error{
     PrerollFailed,
 
     // Lock errors
-    WriteLockContention,
+    AppenderAlreadyOpen,
+    AppenderLeaseLost,
 };
 ```
 
@@ -851,7 +1008,7 @@ log.debug("pre-rolling cycle {} ({} ms before boundary)", .{
 
 ---
 
-## 13. Testing Strategy
+## 15. Testing Strategy
 
 ### Unit tests for lifecycle
 
@@ -884,7 +1041,7 @@ test "metadata read-back via pointer cast" {
     try q.open();
 
     // Verify fields through the metadata pointer
-    try testing.expectEqual(@as(u32, 0x425A514D), q.metadata.?.magic);
+    try testing.expectEqual(@as(u32, 0x4D515A42), q.metadata.?.magic);
     try testing.expectEqual(@as(u16, 1), q.metadata.?.version);
     try testing.expectEqual(@as(u32, 86400), q.metadata.?.roll_length_secs);
     try testing.expectEqual(@as(u32, 4096), q.metadata.?.index_count);
@@ -965,7 +1122,7 @@ test "version detection finds v1 from metadata.brz" {
     // Write a minimal valid metadata file
     const f = try tmp.dir.createFile("metadata.brz", .{});
     var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, 0x425A514D, .little);
+    std.mem.writeInt(u32, &buf, 0x4D515A42, .little);
     _ = try f.write(&buf);
     f.close();
 

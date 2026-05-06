@@ -90,6 +90,23 @@ pub const QueueConfig = struct {
     /// Request MAP_HUGETLB for cycle file mappings.
     use_huge_pages: bool = false,
 
+    /// Lock the current and next appender windows in RAM when permitted by
+    /// RLIMIT_MEMLOCK. Best-effort; failure is reported through diagnostics.
+    lock_appender_windows: bool = false,
+
+    /// Start the background prefetcher that preallocates, maps, and write-touches
+    /// future appender pages before the hot path reaches them.
+    enable_prefetcher: bool = true,
+
+    /// Minimum prepared writable runway ahead of the appender.
+    prefetch_runway_bytes: u64 = 8 * 1024 * 1024,
+
+    /// Start the background cleaner for deferred unmap/page-cache/retention work.
+    enable_cleaner: bool = true,
+
+    /// Retention in cycle files. Null means keep files indefinitely.
+    retention_cycles: ?u32 = null,
+
     /// How many milliseconds before the next roll boundary to pre-create the
     /// next cycle file, avoiding latency spikes at roll time.
     preroll_ms: u64 = 1000,
@@ -97,6 +114,10 @@ pub const QueueConfig = struct {
     /// Use io_uring for blocking tailer wakeup (the `collect` API).
     /// Falls back to poll/futex when false or when the kernel is too old.
     enable_io_uring: bool = true,
+
+    /// Notify blocking tailers from the appender. Disable for minimum append
+    /// latency when tailers use polling.
+    signal_blocking_tailers: bool = true,
 
     /// Allocator used for metadata bookkeeping (never on the hot path).
     allocator: std.mem.Allocator = std.heap.page_allocator,
@@ -147,7 +168,8 @@ pub fn Queue(comptime MessageType: type) type {
 
         /// Append a message and return the assigned index.
         /// This is the **hot path** — no allocator calls, no syscalls
-        /// (the mmap page fault is the only implicit kernel interaction).
+        /// in the polling profile, and no expected page faults when the
+        /// prefetcher keeps the writable runway prepared.
         pub fn append(self: *Self, msg: MessageType) !Index {
             _ = .{ self, msg };
             @compileError("stub");
@@ -166,6 +188,22 @@ pub fn Queue(comptime MessageType: type) type {
         /// Pass `0` to read from the very beginning of the queue.
         pub fn tailer(self: *Self, start_index: Index) !Tailer(MessageType) {
             _ = .{ self, start_index };
+            @compileError("stub");
+        }
+
+        // ── housekeeping (never called by append hot path) ─────────────
+
+        /// Request deletion of cycle files older than `cycle`.
+        /// The cleaner performs the actual unlink asynchronously.
+        pub fn truncateBefore(self: *Self, cycle: u32) !void {
+            _ = .{ self, cycle };
+            @compileError("stub");
+        }
+
+        /// Return prefetch/cleaner diagnostics such as prefetch misses,
+        /// synchronous fallback count, and cleaner reclaim counts.
+        pub fn diagnostics(self: *const Self) Diagnostics {
+            _ = self;
             @compileError("stub");
         }
 

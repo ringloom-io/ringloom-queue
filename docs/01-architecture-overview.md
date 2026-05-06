@@ -9,7 +9,7 @@
 5. [File Layout on Disk](#file-layout-on-disk)
 6. [Memory-Mapped I/O Design](#memory-mapped-io-design)
 7. [Message Framing and Header Protocol](#message-framing-and-header-protocol)
-8. [Write Arbitration (Lock-Free CAS Protocol)](#write-arbitration-lock-free-cas-protocol)
+8. [Message Publication Protocol](#message-publication-protocol)
 9. [Index Structure](#index-structure)
 10. [Roll Cycle Mechanism](#roll-cycle-mechanism)
 11. [Shared Metadata File](#shared-metadata-file)
@@ -25,7 +25,7 @@
 
 ## Introduction
 
-This document provides a comprehensive architectural description of **brz-queue**, a clean-room, high-performance, lock-free, memory-mapped IPC queue implemented in Zig. The design targets the lowest possible latency with zero allocations on the hot path. brz-queue uses fixed-layout binary structures (no self-describing wire format), tiered CAS backoff, acquire/release memory ordering, flat inline indexes, and optional `io_uring` for reader wakeup. It is designed for single-writer, multi-reader workloads across multiple OS processes communicating through shared `mmap` regions.
+This document provides a comprehensive architectural description of **brz-queue**, a clean-room, high-performance, memory-mapped IPC queue implemented in Zig 0.16. The design targets the lowest possible latency with zero allocations, no steady-state syscalls, and no expected page faults on the appender hot path. brz-queue uses fixed-layout binary structures (no self-describing wire format), a single active appender lease, acquire/release publication, flat inline indexes, background page pre-touching, optional cleanup helpers, and optional `io_uring` for reader wakeup. It is designed for single-active-writer, multi-reader workloads across OS processes communicating through shared `mmap` regions.
 
 ## Project Summary
 
@@ -93,7 +93,7 @@ This document provides a comprehensive architectural description of **brz-queue*
 │   ┌──────────┐   ┌──────────┐   ┌────────────────────────┐      │
 │   │  mmap()  │   │  open()  │   │  fallocate()           │      │
 │   │MAP_SHARED│   │ O_RDWR   │   │  madvise() / io_uring  │      │
-│   │MAP_POPULATE  │          │   │  MAP_HUGETLB           │      │
+│   │pre-touch │          │   │  MAP_HUGETLB           │      │
 │   └──────────┘   └──────────┘   └────────────────────────┘      │
 │                                                                  │
 │   ┌──────────────────────────────────────────────────────┐       │
@@ -112,11 +112,11 @@ A brz-queue is a **directory** on disk containing:
 - One shared metadata file (`metadata.brz`)
 - Zero or more queue data files (`.brz`)
 
-There is **no broker process**. The OS kernel provides persistence via `mmap` with `MAP_SHARED`, and hardware atomics provide lock-free write arbitration via CAS.
+There is **no broker process**. The OS kernel provides persistence via `mmap` with `MAP_SHARED`, and hardware atomics provide the entry publication protocol.
 
 ### Appender
 
-A writer. Appends messages to the queue and receives a 64-bit **index** identifying the write position. The appender is **single-threaded** — it is NOT thread-safe. Only one thread within a process may use the appender at a time. Multiple processes can each have their own appender to the same queue directory; cross-process arbitration is handled by CAS on the shared mmap region.
+A writer. Appends messages to the queue and receives a 64-bit **index** identifying the write position. The appender is **single-threaded** and globally exclusive per queue — it is NOT thread-safe, and only one active appender thread/process may own the appender lease at a time. This is intentional for minimum jitter: cross-process write arbitration is kept out of the hot path.
 
 ### Tailer
 
@@ -173,27 +173,20 @@ A fixed 512-byte `extern struct SharedMetadata` — just mmap and cast the point
 ```
 Offset   Size   Field                    Description
 ──────   ────   ─────                    ───────────
-0x0000   4      magic                    0x42525A51 ("BRZQ")
-0x0004   4      version                  Format version (1)
-0x0008   4      flags                    Feature flags (bitfield)
-0x000C   4      reserved_0               Padding / future use
-0x0010   4      roll_length_ms           Roll period in milliseconds
-0x0014   4      roll_epoch_ms            Epoch offset in milliseconds
-0x0018   4      index_count              Entries in flat index region
-0x001C   4      index_spacing            Index every Nth data message
-0x0020   4      cycle_shift              Bits to shift for cycle
-0x0024   4      reserved_1               Padding / future use
-0x0028   32     roll_format              Date format string (zero-terminated)
-0x0048   24     reserved_2               Future use
-
-───── 8-byte aligned atomic fields begin at offset 0x0060 ─────
-
-0x0060   8      highest_cycle            u64, atomic (acquire/release)
-0x0068   8      lowest_cycle             u64, atomic (acquire/release)
-0x0070   8      modcount                 u64, atomic (fetch_add)
-0x0078   8      write_lock               u64, atomic (CAS)
-
-0x0080   384    reserved_3               Pad to 512 bytes total
+0x0000   4      magic                    0x4D515A42 ("BZQM" bytes)
+0x0004   2      version                  Format version (1)
+0x0006   2      flags                    Feature flags (bitfield)
+0x0008   4      roll_length_secs         Roll period in seconds
+0x000C   4      index_spacing            Index every Nth data message
+0x0010   4      index_count              Entries in flat index region
+0x0014   4      padding                  u64 alignment padding
+0x0018   8      epoch_ms                 Epoch offset in milliseconds
+0x0020   8      highest_cycle            u64, atomic (acquire/release)
+0x0028   8      lowest_cycle             u64, atomic (acquire/release)
+0x0030   8      modcount                 u64, atomic (fetch_add)
+0x0038   8      write_position           u64, atomic published offset
+0x0040   8      appender_lock            u64, atomic lease; 0 = unlocked
+0x0048   440    reserved                 Pad to 512 bytes total
 ──────────────────────────────────────────────────────────────
 Total: 512 bytes (0x200)
 ```
@@ -206,13 +199,14 @@ All atomically-accessed `u64` fields are naturally 8-byte aligned. No wire encod
 Offset 0x0000
 ┌─────────────────────────────────────────────────────────────┐
 │ QueueFileHeader (64 bytes, extern struct)                     │
-│   magic: u32         = 0x42525A44 ("BRZD")                   │
-│   version: u32       = 1                                     │
-│   cycle: u64         = cycle number for this file            │
+│   magic: u32         = 0x43515A42 ("BZQC" bytes)             │
+│   version: u16       = 1                                     │
+│   flags: u16         = 0                                     │
+│   created_cycle: u32 = cycle number for this file            │
 │   index_count: u32   = number of index slots                 │
 │   index_spacing: u32 = messages between index entries        │
-│   data_offset: u64   = byte offset where data region starts │
-│   reserved: [32]u8   = zero                                  │
+│   epoch_ms: u64      = roll epoch                            │
+│   reserved: [28]u8   = zero                                  │
 ├─────────────────────────────────────────────────────────────┤
 │ Index Region: flat array of u64 (index_count entries)        │
 │   [0] → byte offset of data message at seqnum 0             │
@@ -251,7 +245,7 @@ The kernel guarantees that `MAP_SHARED` mappings of the same file region by mult
 
 ### Chunked Mapping Strategy
 
-Files are not mapped entirely. Instead, they are mapped in sliding windows of `2 × blocksize` bytes (default blocksize: 1 MiB, always a power of two):
+Files are not mapped entirely. Instead, they are mapped in sliding windows of `2 × blocksize` bytes (default blocksize: 2 MiB, always a power of two and huge-page aligned):
 
 ```
 File on disk:
@@ -278,8 +272,9 @@ Key rules:
 
 ### Appender Mapping Optimizations
 
-- **`MAP_POPULATE`:** Appender windows are mapped with `MAP_POPULATE` to pre-fault all pages into the page table at mmap time. This eliminates minor page faults on the write hot path.
-- **Pre-map next window:** When the write tip crosses 50% of the current window, the next window is pre-mapped in the background. When the tip actually reaches the boundary, the new mapping is already faulted and ready — zero latency on window transition.
+- **Background write pre-touch:** Future appender windows are prepared by a prefetcher thread before the appender reaches them. The prefetcher uses `fallocate`, `MAP_POPULATE`, `MADV_POPULATE_WRITE` when available, and a manual one-byte-per-page write-touch fallback for kernels that only populate read faults.
+- **Pre-map next window:** When the write tip crosses the configured runway threshold, the next window is pre-mapped and pre-touched in the background. When the tip reaches the boundary, the appender swaps to an already faulted mapping — zero mmap/page-fault latency on window transition if the prefetcher kept up.
+- **Optional `mlock`:** The current and next appender windows may be locked in RAM when `RLIMIT_MEMLOCK` permits. This is a tuning option, not a default, because pinning too much page cache can hurt the rest of the system.
 - **`MAP_HUGETLB` (optional):** When enabled, mappings use 2 MiB huge pages to reduce TLB pressure. This is particularly effective for large blocksize values where the working set spans many pages.
 
 ### Tailer Mapping Optimizations
@@ -294,7 +289,19 @@ When an appender needs to extend a queue file, it uses `fallocate(2)` on Linux i
 fallocate(fd, 0, current_size, extension_size)
 ```
 
-This actually allocates disk blocks so that the first write to a new region does not trigger filesystem block allocation (which would cause latency spikes). Combined with `MAP_POPULATE`, this eliminates all major page faults on the write path.
+This actually allocates disk blocks so that the first write to a new region does not trigger filesystem block allocation (which would cause latency spikes). Combined with pre-touching, this removes major faults and expected minor/write faults from the appender hot path.
+
+### Page-Fault Avoidance Strategy
+
+The appender hot path must not rely on demand paging. Synchronous `MAP_POPULATE` in `append()` only moves the latency spike from first write to the remap syscall; it is still a spike on the appender thread. brz-queue therefore treats page preparation as background work:
+
+1. The appender publishes its current `write_position`.
+2. A prefetcher watches the write position and maintains a prepared runway ahead of it.
+3. The prefetcher pre-creates future cycle files, extends current files with `fallocate`, maps future windows, faults writable pages, and optionally locks the current/next windows.
+4. The appender atomically observes a ready window and swaps pointers when it reaches the boundary.
+5. If the prefetcher falls behind, the appender may perform a synchronous fallback, but this is reported as a latency-profile miss.
+
+This is the same class of technique Chronicle Queue documents as **pre-touching**: touching pages and acquiring future cycle resources before appenders need them. Chronicle exposes manual `pretouch()` and an automatic preloader; brz-queue makes the equivalent prefetcher part of the core low-jitter design.
 
 ## Message Framing and Header Protocol
 
@@ -333,9 +340,9 @@ Maximum payload size: `0x3FFFFFFF` = 1,073,741,823 bytes (~1 GiB).
 
 **Key difference from legacy formats:** The WORKING state no longer encodes the writer's PID in the lower 30 bits. PID was decorative (never used for recovery or deadlock detection) and wasted bits. WORKING is now simply `0x80000000`.
 
-## Write Arbitration (Lock-Free CAS Protocol)
+## Message Publication Protocol
 
-Writers compete for the write position using a compare-and-swap (CAS) operation on the 4-byte header at the current tail position.
+The single active appender owns the write position. It still uses a compare-and-swap (CAS) operation on the 4-byte header at the current tail position to transition an entry from `UNALLOCATED` to `WORKING`; this protects readers from partially written payloads and gives recovery a clear incomplete-write marker. It is not a global multi-writer arbitration mechanism.
 
 ### Writer Protocol
 
@@ -348,11 +355,11 @@ Writers compete for the write position using a compare-and-swap (CAS) operation 
                  ▼
   ┌─────────────────────────────────────┐
   │ 2. CAS: UNALLOCATED → WORKING       │
-  │    @atomicRmw(.cmpxchg, ptr, ...)   │
+  │    @cmpxchgStrong(..., .monotonic)  │
   │                                      │
   │    Returns old value:                │
-  │    - If 0x0: WE WON THE LOCK ──────►├──┐
-  │    - Otherwise: LOST, backoff ──────►├──┤
+  │    - If 0x0: slot claimed ─────────►├──┐
+  │    - Otherwise: busy/recovery ──────►├──┤
   └─────────────────────────────────────┘  │
                                             │
           ┌─────────────────────────────────┘
@@ -377,8 +384,8 @@ Writers compete for the write position using a compare-and-swap (CAS) operation 
                  │
                  ▼
   ┌─────────────────────────────────────┐
-  │ 6. Signal eventfd (if io_uring      │
-  │    readers are waiting)              │
+  │ 6. Release-store write_position      │
+  │    and optionally signal waiters      │
   └─────────────────────────────────────┘
 ```
 
@@ -526,13 +533,12 @@ The cycle number maps to a time: `timestamp_ms = cycle × roll_length_ms + roll_
 current_cycle = (clock_ms - roll_epoch) / roll_length_ms
 
 if current_cycle > appender_cycle:
-    1. CAS-lock the current position
-    2. Write HD_EOF marker
-    3. Swap to pre-created next cycle file (if available)
+    1. Release-store HD_EOF at the current write position
+    2. Swap to pre-created/pre-touched next cycle file (if available)
        — OR create new queue file for current_cycle
-    4. Update highest_cycle in shared metadata (atomic store, release)
-    5. Bump modcount (atomic fetch_add)
-    6. Retry append in new file
+    3. Update highest_cycle and write_position in shared metadata (release)
+    4. Bump modcount (atomic fetch_add)
+    5. Retry append in new file
 ```
 
 ### EOF Patching
@@ -541,7 +547,7 @@ If an appender finds itself holding the write lock but the current file's cycle 
 
 ### Pre-Create Next Cycle File
 
-To eliminate the latency spike during roll transitions (which would otherwise require 8+ syscalls for file creation, allocation, and mmap), brz-queue pre-creates the next cycle file:
+To eliminate the latency spike during roll transitions (which would otherwise require 8+ syscalls for file creation, allocation, mmap, and page faults), brz-queue pre-creates and pre-touches the next cycle file:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -553,9 +559,9 @@ To eliminate the latency spike during roll transitions (which would otherwise re
 │  2. Create next cycle's .brz file:                           │
 │     a. open() + fallocate() to pre-allocate disk blocks     │
 │     b. Write QueueFileHeader + zero index region             │
-│     c. mmap() with MAP_POPULATE to pre-fault pages          │
+│     c. mmap() + writable page pre-touch                     │
 │                                                              │
-│  3. Store pre-mapped file handle in appender state           │
+│  3. Store pre-mapped file handle in prefetch handoff state   │
 │                                                              │
 │  4. When roll actually happens:                              │
 │     a. Write EOF to current file (single atomic store)       │
@@ -576,26 +582,24 @@ The shared metadata file (`metadata.brz`) is a fixed 512-byte `extern struct Sha
 ┌─────────────────────────────────────────────────────────────┐
 │ extern struct SharedMetadata (512 bytes)                      │
 │                                                              │
-│  Fixed fields (offset 0x00 – 0x5F):                          │
-│    magic .............. u32 = 0x42525A51 ("BRZQ")            │
-│    version ............ u32 = 1                               │
-│    flags .............. u32 = feature bitfield                │
-│    roll_length_ms ..... u32 = cycle duration                  │
-│    roll_epoch_ms ...... u32 = epoch offset                    │
-│    index_count ........ u32 = flat index entries              │
+│  Fixed fields (offset 0x00 – 0x1F):                          │
+│    magic .............. u32 = 0x4D515A42 ("BZQM" bytes)      │
+│    version ............ u16 = 1                               │
+│    flags .............. u16 = feature bitfield                │
+│    roll_length_secs ... u32 = cycle duration                  │
 │    index_spacing ...... u32 = index every Nth msg             │
-│    cycle_shift ........ u32 = bits for cycle in index         │
-│    roll_format ........ [32]u8 = date format string           │
-│    (reserved padding to 0x60)                                │
+│    index_count ........ u32 = flat index entries              │
+│    epoch_ms ........... u64 = roll epoch                      │
 │                                                              │
-│  Atomic fields (offset 0x60 – 0x7F, 8-byte aligned):        │
+│  Atomic fields (offset 0x20 – 0x47, 8-byte aligned):        │
 │    highest_cycle ...... u64 (atomic acquire/release)          │
 │    lowest_cycle ....... u64 (atomic acquire/release)          │
 │    modcount ........... u64 (atomic fetch_add)                │
-│    write_lock ......... u64 (atomic CAS)                      │
+│    write_position ..... u64 (atomic release/acquire)          │
+│    appender_lock ...... u64 (atomic appender lease)           │
 │                                                              │
-│  Reserved (offset 0x80 – 0x1FF):                             │
-│    384 bytes for future use                                  │
+│  Reserved (offset 0x48 – 0x1FF):                             │
+│    440 bytes for future use                                  │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -612,7 +616,8 @@ Reader/Tailer polling:
 Writer updating:
   1. @atomicStore(&metadata.highest_cycle, new_value, .release)
   2. @atomicStore(&metadata.lowest_cycle, new_value, .release)
-  3. _ = @atomicRmw(&metadata.modcount, .Add, 1, .release)
+  3. @atomicStore(&metadata.write_position, new_tip, .release)
+  4. _ = @atomicRmw(&metadata.modcount, .Add, 1, .release)
 ```
 
 ## Data Structures
@@ -622,7 +627,7 @@ Writer updating:
 ```
 const Queue = struct {
     dirname: []const u8,              // Queue directory path
-    blocksize: u32,                   // mmap chunk size (power of 2, default 1 MiB)
+    blocksize: u32,                   // mmap chunk size (power of 2, default 2 MiB)
 
     // Shared metadata (mmap'd)
     metadata_fd: std.posix.fd_t,      // File descriptor for metadata.brz
@@ -646,7 +651,11 @@ const Queue = struct {
 
     // io_uring notification (optional)
     ring: ?IoUring,                   // io_uring instance
-    eventfd: ?std.posix.fd_t,         // eventfd for writer→reader signaling
+    waiting_tailers: WaiterRegistry,  // per-tailer wakeup eventfds
+
+    // Background helpers (optional)
+    prefetcher: ?PagePrefetcher,      // prepares future appender pages/windows
+    cleaner: ?Cleaner,                // unmaps/drops/reclaims old resources
 
     // Allocator for non-hot-path allocations
     allocator: std.mem.Allocator,
@@ -670,10 +679,8 @@ const Appender = struct {
     mmap_size: u64,                   // Size of mapping
     tip: u64,                         // Byte position of next header
 
-    // Pre-rolled next cycle file
-    preroll_cycle: ?u64,              // Cycle of pre-created file (null if none)
-    preroll_fd: ?std.posix.fd_t,      // Pre-created file descriptor
-    preroll_buf: ?[*]align(4096) u8,  // Pre-mapped buffer
+    // Handoff from prefetcher
+    ready_window: ?MappedWindow,      // Pre-mapped/pre-touched next window
 };
 ```
 
@@ -736,7 +743,7 @@ Appender.append(payload)
 ┌─────────────────────────┐
 │ Check pre-roll            │  If within preroll_ms of next cycle boundary
 │ Pre-create next file      │  and preroll file not already created
-│ (fallocate + MAP_POPULATE)│
+│ (fallocate + pre-touch)  │
 └────────────┬────────────┘
              │
              ▼
@@ -752,15 +759,15 @@ Appender.append(payload)
   _ENTRY    _QUEUEFILE             DETECTED            │
      │       │          │            │                 │
      │       │          ▼            ▼                 │
-     │       │   Advance mmap     Write EOF,           │
+     │       │   Swap prepared    Write EOF,           │
      │       │   window           swap to preroll──────┤
-     │       │   (MAP_POPULATE)   (or create new file) │
+     │       │   (prefetched)     (or fallback create) │
      │       │                                         │
      │       ▼                                         │
      │   Create new .brz file:                         │
      │   1. open + fallocate                           │
      │   2. Write QueueFileHeader + zero index         │
-     │   3. mmap with MAP_POPULATE                     │
+     │   3. mmap + write pre-touch                     │
      │   4. Update highest_cycle (atomic release)      │
      │   5. Bump modcount (atomic fetch_add) ──────────┘
      │
@@ -768,7 +775,7 @@ Appender.append(payload)
   ┌──────────────────────────────────┐
   │ CAS: @cmpxchgWeak                 │
   │   (&header, UNALLOC, WORKING)     │
-  │   .success = .acq_rel             │
+  │   .success = .monotonic           │
   │   .failure = .monotonic            │
   └──────────┬───────────────────────┘
              │
@@ -801,8 +808,8 @@ Appender.append(payload)
              │
              ▼
   ┌──────────────────────────┐
-  │ Signal eventfd for        │
-  │ io_uring readers          │
+  │ Store write_position;     │
+  │ optionally signal waiters │
   └──────────┬───────────────┘
              │
              ▼
@@ -890,7 +897,7 @@ This is the core tailer read path:
 │  Wait for new data:                      │
 │  ┌────────────────────────────────┐      │
 │  │ If io_uring available:         │      │
-│  │   Submit SQE on eventfd        │      │
+│  │   Register per-tailer eventfd  │      │
 │  │   Near-zero wakeup latency     │      │
 │  │   Zero CPU during idle         │      │
 │  │ Else:                          │      │
@@ -907,19 +914,20 @@ This is the core tailer read path:
 │                    io_uring Notification                        │
 │                                                                │
 │  Setup:                                                        │
-│    - Queue creates an eventfd (EFD_NONBLOCK | EFD_SEMAPHORE)   │
 │    - Queue initializes io_uring instance                       │
+│    - Each blocking tailer owns an eventfd                      │
 │                                                                │
-│  Writer (after publishing header):                              │
-│    - write(eventfd, 1) — signal that new data is available     │
+│  Writer (after publishing header/write_position):               │
+│    - optionally write(eventfd, 1) for each registered waiter    │
 │                                                                │
 │  Reader (when no data available):                               │
-│    1. Submit io_uring SQE: IORING_OP_READ on eventfd           │
-│    2. io_uring_submit_and_wait(1) — blocks in kernel           │
-│    3. Kernel wakes reader when eventfd becomes readable         │
-│    4. Reader resumes polling immediately                        │
+│    1. Register as waiting                                      │
+│    2. Submit io_uring SQE: IORING_OP_READ on tailer eventfd    │
+│    3. io_uring_submit_and_wait(1) — blocks in kernel           │
+│    4. Kernel wakes reader when eventfd becomes readable         │
+│    5. Reader unregisters and resumes polling                    │
 │                                                                │
-│  Latency: writer publish → reader wake ≈ 1–3 μs                │
+│  Latency: low, but paid for by appender notification syscalls   │
 │  CPU during idle: 0% (blocked in kernel)                        │
 │                                                                │
 │  Fallback: If io_uring is unavailable (old kernel, no support), │
@@ -949,13 +957,14 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 | Configuration | `Queue.setRollScheme`, `Queue.setBlocksize` |
 | Metadata | `Queue.openMetadata`, `Queue.refreshModcount` |
 | File management | `Queue.createQueueFile`, `Queue.openQueueFile` |
+| Appender lease | `Queue.acquireAppenderLease`, `Queue.releaseAppenderLease` |
 
 ### `appender.zig` — Single-Writer Append Engine
 
 | Responsibility | Key Functions |
 |---|---|
 | Writing | `Appender.append`, `Appender.appendWithTimestamp` |
-| CAS + backoff | `Appender.acquireWriteLock`, `Appender.tieredBackoff` |
+| Header state | `Appender.claimEntry`, `Appender.publishEntry` |
 | Roll handling | `Appender.checkRoll`, `Appender.preCreateNextCycle` |
 | Index update | `Appender.updateIndex` |
 | Notification | `Appender.signalReaders` |
@@ -977,6 +986,25 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 | Optimization | `MappedWindow.populate`, `MappedWindow.adviseSequential` |
 | Huge pages | `MappedWindow.tryHugePages` |
 | Pre-mapping | `MappedWindow.premapNext` |
+| Pre-touching | `MappedWindow.populateWrite`, `MappedWindow.touchWritablePages` |
+
+### `prefetcher.zig` — Appender Page Preparation
+
+| Responsibility | Key Functions |
+|---|---|
+| Runway tracking | `PagePrefetcher.observeWritePosition`, `PagePrefetcher.targetWindow` |
+| Future mapping | `PagePrefetcher.prepareWindow`, `PagePrefetcher.prepareCycle` |
+| Handoff | `PagePrefetcher.tryTakeReadyWindow` |
+| Fault prevention | `PagePrefetcher.touchWritablePages`, `PagePrefetcher.tryMlock` |
+
+### `cleaner.zig` — Asynchronous Reclamation
+
+| Responsibility | Key Functions |
+|---|---|
+| Mapping cleanup | `Cleaner.deferUnmap`, `Cleaner.reapUnmaps` |
+| Page-cache pressure | `Cleaner.adviseDontNeed`, `Cleaner.posixFadviseDontNeed` |
+| Retention | `Cleaner.deleteCyclesBefore`, `Cleaner.computeRetentionFloor` |
+| Durability option | `Cleaner.flushIfConfigured` |
 
 ### `metadata.zig` — Shared Metadata Structures
 
@@ -1010,7 +1038,7 @@ brz-queue uses **acquire/release** semantics rather than sequential consistency 
 │  ─────────              ────────        ────────             │
 │  Writer: store header   .release        FREE (MOV)           │
 │  Reader: load header    .acquire        FREE (MOV)           │
-│  Writer: CAS lock       .acq_rel        LOCK CMPXCHG (same) │
+│  Writer: claim header   .monotonic      LOCK CMPXCHG        │
 │  Writer: modcount++     .release        LOCK XADD            │
 │  SeqCst store           .seq_cst        MOV + MFENCE (~33ns) │
 │                                                              │
@@ -1033,7 +1061,7 @@ brz-queue uses **acquire/release** semantics rather than sequential consistency 
 
 3. **Release semantics (writers):** The `@atomicStore(.release)` of the final header ensures that all prior writes (payload data) are visible before the header becomes visible to readers. On x86, this is a plain store (free).
 
-4. **CAS (`cmpxchg`):** Atomic compare-and-swap with implicit full barrier. Used for write lock acquisition. The `LOCK` prefix provides a full fence on x86.
+4. **CAS (`cmpxchg`):** Atomic compare-and-swap is used only to claim an entry header (`UNALLOCATED → WORKING`). Correctness does not rely on it publishing payload bytes; the final release-store of the DATA header does that.
 
 5. **`@atomicRmw(.Add, ...)` (`lock xadd`):** Atomic fetch-and-add with implicit barrier. Used for modcount increment.
 
@@ -1045,14 +1073,16 @@ brz-queue uses **acquire/release** semantics rather than sequential consistency 
 │                                                              │
 │  Within a single process:                                    │
 │    - Appender: single-threaded (NOT thread-safe)             │
+│    - Prefetcher/Cleaner: helper threads, no current mapping  │
+│      mutation from the appender hot path                     │
 │    - Tailers: each tailer is independent, can run on its     │
 │      own thread. Multiple tailer threads are safe.           │
 │    - No per-process locking needed for tailers               │
 │                                                              │
 │  Across processes:                                           │
 │    - Multiple processes can share the queue directory         │
+│    - Exactly one process may hold the appender lease          │
 │    - Each process mmaps the same files                       │
-│    - Write arbitration via CAS on shared mmap pages          │
 │    - Reader processes never interfere with writers            │
 │    - Each process has independent mmap windows               │
 │                                                              │
@@ -1060,7 +1090,7 @@ brz-queue uses **acquire/release** semantics rather than sequential consistency 
 │    ┌──────────┬──────────────┬───────────────────┐           │
 │    │          │ Same Process │ Different Process  │           │
 │    ├──────────┼──────────────┼───────────────────┤           │
-│    │ Writer   │ 1 thread only│ 1 per process, CAS│           │
+│    │ Writer   │ 1 thread only│ 1 lease globally  │           │
 │    │ Reader   │ N threads OK │ N processes OK     │           │
 │    │ W+R      │ Separate     │ Independent        │           │
 │    │          │ threads      │ mmap windows       │           │
@@ -1070,9 +1100,10 @@ brz-queue uses **acquire/release** semantics rather than sequential consistency 
 
 ### Critical Sections
 
-There are no traditional locks. The protocol is lock-free:
-- Writers use CAS on the 4-byte header as a spinlock
-- If CAS fails, the writer uses tiered backoff (spin → yield → sleep)
+There are no traditional hot-path locks:
+- The appender lease is acquired outside the append loop
+- The appender uses CAS on the 4-byte header as an entry state transition
+- If CAS fails, the entry is busy or corrupt; recovery/backoff policy handles it outside the common path
 - Readers never block writers (readers only do atomic loads)
 - The acquire ordering on header read ensures payload visibility
 
@@ -1121,8 +1152,8 @@ Errors on the hot path (CAS failure, WORKING header) are **not** represented as 
      header = len                      │  len   │ DATA                   6. atomicLoad(.acquire)
                                        ├────────┤                            → sees DATA|len
                                        │  data  │                        7. Read payload
-  8. write(eventfd, 1)                 └────────┘                            (visible due to
-     signal readers                                                          acquire ordering)
+  8. store write_position              └────────┘                            (visible due to
+     optionally signal waiters                                               acquire ordering)
                                                                          8. Dispatch callback
 ```
 
@@ -1135,7 +1166,7 @@ Errors on the hot path (CAS failure, WORKING header) are **not** represented as 
   └─────┬──────┘     └─────┬──────┘     └─────┬──────┘
         │                   │                   │
         │   mmap(SHARED)    │   mmap(SHARED)    │   mmap(SHARED)
-        │   MAP_POPULATE    │   MADV_SEQUENTIAL │   MADV_SEQUENTIAL
+        │   pre-touched     │   MADV_SEQUENTIAL │   MADV_SEQUENTIAL
         │                   │                   │
         ▼                   ▼                   ▼
   ┌─────────────────────────────────────────────────────┐
@@ -1148,12 +1179,13 @@ Errors on the hot path (CAS failure, WORKING header) are **not** represented as 
   │  │ modcount: 5  │  │ │ QueueFileHeader 64B  │ │      │
   │  │ highest: 42  │  │ ├──────────────────────┤ │      │
   │  │ lowest: 40   │  │ │ Index Region 32 KiB  │ │      │
-  │  │ write_lock:0 │  │ ├──────────────────────┤ │      │
+  │  │ app_lock:tok │  │ ├──────────────────────┤ │      │
+  │  │ write_pos:.. │  │ │                      │ │      │
   │  └──────────────┘  │ │ [HDR][DATA]          │ │      │
   │                     │ │ [HDR][DATA]          │ │      │
   │  ┌──────────────┐   │ │ [UNALLOC...]        │ │      │
-  │  │ eventfd      │  │ └──────────────────────┘ │      │
-  │  │ (io_uring)   │  └──────────────────────────┘      │
+  │  │ tailer       │  │ └──────────────────────┘ │      │
+  │  │ eventfds     │  └──────────────────────────┘      │
   │  └──────────────┘                                     │
   └─────────────────────────────────────────────────────┘
         │                   │                   │
@@ -1188,7 +1220,7 @@ Cycle N                               Cycle N+1
                                           preroll_ms (1000ms)
   Index: 0x4A050000_00000000              of roll boundary.
          to 0x4A050000_0000000N           Already fallocate'd
-                                          and MAP_POPULATE'd.
+                                          and pre-touched.
                                           Roll = pointer swap,
                                           zero syscalls.
 ```
@@ -1237,4 +1269,4 @@ Cycle N                               Cycle N+1
 
 ---
 
-*This document describes the architecture of brz-queue, a clean-room lock-free memory-mapped IPC queue implemented in Zig. For protocol changes between versions, see `CHANGES.md`.*
+*This document describes the architecture of brz-queue, a clean-room memory-mapped IPC queue implemented in Zig 0.16. For protocol changes between versions, see `CHANGES.md`.*
