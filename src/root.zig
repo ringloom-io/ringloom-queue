@@ -34,9 +34,13 @@ pub const Cleaner = cleaner.Cleaner;
 pub const RingloomError = errors.RingloomError;
 
 pub const Codec = codec.Codec;
+pub const CodecError = codec.CodecError;
 pub const Dispatcher = codec.Dispatcher;
 pub const DispatchAction = codec.DispatchAction;
+pub const RawCodec = codec.RawCodec;
+pub const TextCodec = codec.TextCodec;
 pub const DefaultRawCodec = codec.DefaultRawCodec;
+pub const StructCodec = codec.StructCodec;
 pub const RuntimeCodec = codec.RuntimeCodec;
 
 test {

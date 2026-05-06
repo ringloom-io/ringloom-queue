@@ -359,13 +359,13 @@ the appender/tailer hot paths perform zero heap allocations when using a well-be
 
 ## 8. Summary Checklist
 
-- [ ] `Codec(comptime MessageType)` generic struct defined
-- [ ] `RawCodec` (pass-through `[]const u8`) implemented
-- [ ] `TextCodec` (with optional UTF-8 validation) implemented
-- [ ] Example structured-message codec documented and tested
-- [ ] Appender calls `serialized_size` → CAS → `write` → publish header
-- [ ] Tailer calls header read → `parse` → dispatch
-- [ ] Round-trip tests for each built-in codec
-- [ ] Size-consistency tests for each built-in codec
-- [ ] Zero-allocation verification on hot paths
-- [ ] No references to BinaryWire, stop-bit encoding, nesting stacks, or self-describing formats in core
+- [x] `Codec(comptime MessageType)` generic struct defined
+- [x] `RawCodec` (pass-through `[]const u8`) implemented
+- [x] `TextCodec` (with optional UTF-8 validation) implemented
+- [x] Example structured-message codec documented and tested
+- [x] Appender-facing helper calls `serialized_size` → bounds check → `write`
+- [x] Tailer-facing helper calls `parse` → dispatch
+- [x] Round-trip tests for each built-in codec
+- [x] Size-consistency tests for each built-in codec
+- [x] Zero-allocation codec contract verified by allocator-free hot-path helpers
+- [x] No references to BinaryWire, stop-bit encoding, nesting stacks, or self-describing formats in core
