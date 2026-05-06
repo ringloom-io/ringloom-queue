@@ -14,10 +14,10 @@ This document specifies:
 1. **mmap primitives** — `mapFile`, `unmapFile`, `remapFile`
 2. **Sliding window strategy** — blocksize-aligned 2× windows with pre-mapping
 3. **Appender pre-touching** — pre-fault writable pages before the appender reaches them
-4. **madvise(MADV_SEQUENTIAL)** — aggressive read-ahead for tailers
-5. **MAP_HUGETLB** — optional 2 MiB huge pages for reduced TLB pressure
+4. **Tailer read prefetching** — pre-map and read-ahead future published pages
+5. **MAP_HUGETLB** — optional Linux 2 MiB huge pages for reduced TLB pressure
 6. **Pre-mapping the next window** — overlap mmap/page faults with write I/O
-7. **fallocate(2)** — reserve real disk blocks instead of lseek+write
+7. **Platform preallocation** — reserve real disk blocks (`fallocate` on Linux, `F_PREALLOCATE` + `ftruncate` on macOS)
 8. **Atomic operations** — CAS, loads, stores with acquire/release ordering
 9. **Tiered CAS backoff** — spin → yield → exponential sleep
 10. **Shared metadata** — 512-byte `metadata.brz`, mmap and cast
@@ -70,8 +70,9 @@ pub fn mapFile(
     };
 
     var mmap_flags: u32 = @intFromEnum(flags.TYPE);
-    if (flags.POPULATE) mmap_flags |= posix.system.MAP.POPULATE;
-    if (flags.HUGETLB) mmap_flags |= posix.system.MAP.HUGETLB;
+    // Platform layer only sets these on systems that expose them.
+    if (flags.POPULATE) mmap_flags |= platform.mapPopulateFlag() orelse 0;
+    if (flags.HUGETLB) mmap_flags |= platform.mapHugeTlbFlag() orelse 0;
 
     const result = posix.mmap(
         null,
@@ -147,8 +148,8 @@ page fault**: the kernel allocates a physical frame, wires it into the page
 table, and returns control. For a 2 MiB window with 4 KiB pages, that's
 **512 individual minor faults** scattered across the write path.
 
-With `MAP_POPULATE`, the kernel performs all 512 page faults during the `mmap`
-call itself, as a single bulk operation. The cost is:
+With `MAP_POPULATE` on Linux, the kernel performs all page faults during the
+`mmap` call itself, as a single bulk operation. The cost is:
 
 - **Remap is slightly slower** — the `mmap` call blocks while faulting pages
 - **Writes are jitter-free** — no per-write page faults, ever
@@ -168,9 +169,11 @@ profile also needs writable pre-touching.
 
 For every future appender window:
 
-1. `fallocate(fd, offset, len)` for the target range.
-2. `posix_fadvise(POSIX_FADV_WILLNEED)` where available.
-3. `mmap(PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE)`.
+1. Preallocate the target range (`fallocate` on Linux; `F_PREALLOCATE` followed
+   by `ftruncate` on macOS).
+2. Issue a write/read-ahead hint where available (`posix_fadvise` on Linux).
+3. `mmap(PROT_READ | PROT_WRITE, MAP_SHARED)` with `MAP_POPULATE` on Linux when
+   available.
 4. Prefer `madvise(MADV_POPULATE_WRITE)` on Linux kernels that expose it.
 5. Otherwise, manually write-touch one byte per page in future unallocated space.
 6. Optionally `mlock` the prepared current/next windows if configured.
@@ -180,9 +183,9 @@ of the appender's claimed/published write position. It must never touch a page
 that can contain committed or in-progress data.
 
 ```zig
-pub fn touchWritablePages(buf: []align(std.mem.page_size) u8) void {
+pub fn touchWritablePages(buf: []align(page_size) u8, page_size: usize) void {
     var off: usize = 0;
-    while (off < buf.len) : (off += std.mem.page_size) {
+    while (off < buf.len) : (off += page_size) {
         @as(*volatile u8, @ptrCast(&buf[off])).* = 0;
     }
 }
@@ -194,13 +197,16 @@ Chronicle Queue calls this idea **pre-touching**. Its public docs describe
 touching storage resources and possibly acquiring future cycle files before the
 appender needs them; it exposes manual `ExcerptAppender.pretouch()` and an
 automatic preloader. brz-queue should implement the same principle as a
-`PagePrefetcher` thread with explicit handoff to the appender.
+`Prefetcher` state machine with explicit handoff to the appender.
 
 ---
 
-## 3. madvise for Tailers
+## 3. Tailer Read Prefetching
 
-After mapping a tailer window, call `madvise(MADV_SEQUENTIAL)`:
+Tailers also need page-fault avoidance. The tailer hot path should not be the
+first code to fault the next read window. After mapping a tailer window, call
+`madvise(MADV_SEQUENTIAL)` and maintain a read-prefetch runway ahead of the
+tailer's current tip.
 
 ```zig
 pub fn adviseSequential(buf: []align(std.mem.page_size) u8) MmapError!void {
@@ -213,6 +219,36 @@ Usage in the tailer:
 ```zig
 const buf = try mapFile(fd, offset, size, .read_only, .{ .TYPE = .SHARED });
 try adviseSequential(buf);
+```
+
+### Read prefetch flow
+
+For every future tailer read window:
+
+1. Acquire-load `metadata.write_position` and the relevant cycle metadata.
+2. Clamp the prefetch range to bytes that have been published. Do not prefetch
+   fallocated-but-unwritten space and do not open a next cycle until its header
+   is published.
+3. Map the future window read-only if it is not already mapped.
+4. Issue platform read-ahead hints:
+   - Linux: `posix_fadvise(POSIX_FADV_WILLNEED)` and/or
+     `madvise(MADV_WILLNEED | MADV_SEQUENTIAL)`.
+   - macOS: `fcntl(F_RDADVISE)` and/or `madvise(MADV_WILLNEED | MADV_SEQUENTIAL)`.
+5. Optionally read-touch one byte per page inside the bounded published range.
+
+Read prefetch must not compete with the appender's write runway. A conservative
+default is to prefetch only pages at least one block behind the acquire-loaded
+`write_position`, unless the page is already known to hold published DATA. This
+avoids warming zero-filled future pages and avoids extra pressure on pages the
+appender is about to write-touch.
+
+```zig
+pub fn touchReadablePages(buf: []align(page_size) const u8, page_size: usize) void {
+    var off: usize = 0;
+    while (off < buf.len) : (off += page_size) {
+        _ = @as(*const volatile u8, @ptrCast(&buf[off])).*;
+    }
+}
 ```
 
 ### What MADV_SEQUENTIAL does
@@ -291,8 +327,10 @@ pub const QueueConfig = struct {
 };
 ```
 
-When `use_huge_pages` is `true`, the `mapFile` call adds `MAP_HUGETLB` to the
-flags. If the kernel can't satisfy the request, we retry without the flag.
+When `use_huge_pages` is `true` on Linux, the `mapFile` call adds
+`MAP_HUGETLB` to the flags. If the kernel can't satisfy the request, we retry
+without the flag. This option is disabled on macOS because Darwin superpages do
+not apply to file-backed shared queue mappings.
 
 ---
 
@@ -491,7 +529,7 @@ hidden behind normal write operations. The hot path never blocks on a fresh
 
 ---
 
-## 7. File Extension with fallocate
+## 7. File Extension with Platform Preallocation
 
 ### The old way (lseek + write)
 
@@ -500,16 +538,23 @@ writing a zero byte. This creates a **sparse file**: the filesystem metadata
 says the file is large, but no disk blocks are actually allocated. The first
 write to each page triggers a **major page fault** (block allocation + I/O).
 
-### The new way (fallocate)
+### The new way (platform preallocation)
 
 ```zig
 pub fn extendFile(fd: posix.fd_t, new_size: u64) !void {
-    const rc = std.os.linux.fallocate(fd, 0, 0, @intCast(new_size));
-    if (rc != 0) return error.FallocateFailed;
+    try platform.preallocate(fd, 0, new_size);
+    try posix.ftruncate(fd, @intCast(new_size));
 }
 ```
 
-`fallocate` actually reserves disk blocks. After `fallocate`:
+The platform preallocation step reserves disk blocks where the OS supports it.
+Linux should use `fallocate`. macOS should use `fcntl(F_PREALLOCATE)` and then
+`ftruncate`, because `F_PREALLOCATE` reserves space but does not extend the file
+length. Some macOS filesystems can reject preallocation; that must be reported
+through diagnostics and either fall back to a weaker extension mode or fail in
+strict low-jitter configurations.
+
+After successful preallocation:
 
 - The file is non-sparse — all blocks are allocated
 - First write to each page is at worst a **minor fault** (no block allocation)
@@ -649,14 +694,13 @@ pub fn casBackoff(attempt: u32) void {
     if (attempt < 64) {
         // Tier 1: spin — pure CPU spin with a PAUSE hint.
         // Cost: ~1 ns per iteration.
-        // Used for: very brief contention (other writer is in the middle
-        //           of a CAS on the same cache line).
+        // Used for: very brief contention or observation of a transient
+        //           WORKING header during recovery/testing.
         std.atomic.spinLoopHint();
     } else if (attempt < 256) {
         // Tier 2: yield — give up the CPU timeslice.
         // Cost: ~1–10 µs (depends on scheduler).
-        // Used for: moderate contention (other writer is doing a memcpy
-        //           of payload data).
+        // Used for: moderate stalls while a WORKING header remains visible.
         std.Thread.yield() catch {};
     } else {
         // Tier 3: exponential backoff sleep, capped at 1 ms.
@@ -691,14 +735,13 @@ pub fn appendWithBackoff(header_ptr: *volatile u32, desired: u32) void {
 
 | Tier | Attempts | Latency | When it fires |
 |------|----------|---------|---------------|
-| Spin | 0–63 | ~1 ns/iter | Cache-line bouncing between cores |
-| Yield | 64–255 | ~1–10 µs | Writer is mid-memcpy on payload |
+| Spin | 0–63 | ~1 ns/iter | Brief transient WORKING observation |
+| Yield | 64–255 | ~1–10 µs | WORKING remains visible for several retries |
 | Sleep | 256+ | 1 µs → 1 ms (exp) | Writer crashed, or system under load |
 
-The spin tier covers >99% of contention in practice (2 cores racing on the
-same cache line). The yield tier handles the case where the other writer is
-doing actual work. The sleep tier is a safety valve — if we're still spinning
-after 256 attempts, something is wrong and we should back off hard.
+The spin tier covers brief transient states. The yield tier handles a longer
+in-progress write or recovery race. The sleep tier is a safety valve — if we're
+still spinning after 256 attempts, something is wrong and we should back off hard.
 
 ---
 
@@ -770,7 +813,7 @@ Section 5, but with role-specific optimizations:
 ### Appender
 
 ```zig
-// Appender: MAP_POPULATE, read-write, pre-map next window
+// Appender: platform populate/pre-touch, read-write, pre-map next window
 const flags = MapFlags{ .TYPE = .SHARED, .POPULATE = true };
 try window.ensureMapped(params, .read_write, flags);
 ```
@@ -794,9 +837,9 @@ try adviseSequential(window.buf.?);
 
 ```
 1. Check needsExtension(tip, file_size, blocksize)
-   → If yes: fallocate to extend the file
+   → If yes: platform preallocation to extend the file
 2. Check needsRemap(current window, computeWindow(tip))
-   → If yes: swap in pre-mapped window or do fresh mmap with MAP_POPULATE
+   → If yes: swap in pre-mapped window or do fresh mmap with platform populate/pre-touch
 3. Check shouldPremap(tip_in_window, window_size)
    → If yes: pre-map the next window in the background
 4. CAS the header: UNALLOCATED → WORKING (with tiered backoff on failure)
@@ -811,10 +854,11 @@ try adviseSequential(window.buf.?);
 1. Acquire-load write_position from metadata
 2. If tip >= write_position → no new data, return
 3. Check needsRemap(current window, computeWindow(tip))
-   → If yes: remap with PROT_READ, call madvise(MADV_SEQUENTIAL)
-4. Acquire-load the header at tip
-5. If header indicates data → read payload, advance tip
-6. If header indicates EOF → advance to next cycle
+   → If yes: swap in read-prefetched window or remap with PROT_READ
+4. Request/drive read prefetch for the next published window
+5. Acquire-load the header at tip
+6. If header indicates data → read payload, advance tip
+7. If header indicates EOF → advance to next cycle
 ```
 
 ---
@@ -841,12 +885,12 @@ const buf = mapFile(fd, offset, size, prot, huge_flags) catch |err| {
 };
 ```
 
-### fallocate failures
+### Preallocation failures
 
 | Error | Cause | Recovery |
 |-------|-------|----------|
 | `ENOSPC` | Disk full | Return error; appender must stop |
-| `EOPNOTSUPP` | Filesystem doesn't support fallocate | Fall back to lseek+write |
+| `EOPNOTSUPP` | Filesystem doesn't support strict preallocation | Fail in strict low-jitter mode or fall back if configured |
 
 ### madvise failures
 
@@ -875,14 +919,15 @@ test "mapFile and unmapFile round-trip" {
 }
 ```
 
-### MAP_POPULATE verification
+### Page-population verification
 
-Test that `MAP_POPULATE` actually pre-faults pages by checking
-`/proc/self/smaps` for the Rss (resident set size) of the mapping
-immediately after mmap, before any access:
+On Linux, test that `MAP_POPULATE` or `MADV_POPULATE_WRITE` actually pre-faults
+pages by checking `/proc/self/smaps` for the Rss (resident set size) of the
+mapping immediately after mmap, before any access. On macOS, verify the manual
+touch fallback by checking page-fault counters around the touch loop.
 
 ```zig
-test "MAP_POPULATE pre-faults pages" {
+test "platform populate pre-faults pages" {
     // Map with POPULATE
     const buf = try mapFile(fd, 0, 2 * 1024 * 1024, .read_write, .{
         .TYPE = .SHARED,
@@ -897,12 +942,12 @@ test "MAP_POPULATE pre-faults pages" {
 }
 ```
 
-### fallocate verification
+### Preallocation verification
 
-Test that `fallocate` creates non-sparse files by checking the block count:
+Test that platform preallocation creates non-sparse files by checking the block count:
 
 ```zig
-test "fallocate allocates real blocks" {
+test "platform preallocation allocates real blocks" {
     const file = try std.fs.cwd().createFile("test.brz", .{ .read = true });
     defer std.fs.cwd().deleteFile("test.brz") catch {};
     defer file.close();
@@ -915,10 +960,11 @@ test "fallocate allocates real blocks" {
 }
 ```
 
-### CAS correctness under contention
+### CAS primitive correctness
 
-Multi-process test: fork N children, each tries to CAS a header in a
-shared mmap'd file. Verify that exactly one succeeds per slot.
+Primitive test: fork N children, each tries to CAS a header in a shared mmap'd
+file. Verify that exactly one succeeds per slot. This validates the atomic
+primitive; normal queue operation still allows only one active appender lease.
 
 ```zig
 test "CAS single-winner under contention" {
@@ -995,7 +1041,8 @@ src/
     ├── atomic_ops.zig      — CAS, atomic load/store, fetch-add, backoff
     ├── mmap_ops.zig        — mapFile, unmapFile, remapFile, adviseSequential
     ├── window.zig          — MmapWindow, PremappedWindow, computeWindow
-    ├── file_ops.zig        — extendFile (fallocate), ensureFileSize
+    ├── file_ops.zig        — extendFile (platform preallocation), ensureFileSize
+    ├── platform.zig        — Linux/macOS capability wrappers
     ├── metadata.zig        — SharedMetadata struct, metadata mmap helpers
     └── queue.zig           — top-level queue, appender/tailer coordination
 ```
@@ -1007,22 +1054,22 @@ src/
 | Component | Zig module | Key detail | Status |
 |-----------|------------|------------|--------|
 | `mapFile` / `unmapFile` / `remapFile` | `mmap_ops.zig` | Wraps `std.posix.mmap`/`munmap` | ☐ |
-| MAP_POPULATE (appender) | `mmap_ops.zig` | Pre-fault all pages on remap | ☐ |
-| madvise MADV_SEQUENTIAL (tailer) | `mmap_ops.zig` | Aggressive read-ahead | ☐ |
-| MAP_HUGETLB support | `mmap_ops.zig` | 2 MiB pages, fallback to 4K | ☐ |
+| Platform populate (appender) | `mmap_ops.zig` | Pre-fault all pages on remap where available | ☐ |
+| Tailer read prefetch | `mmap_ops.zig` / `prefetcher.zig` | Aggressive read-ahead and optional read-touch | ☐ |
+| MAP_HUGETLB support | `mmap_ops.zig` | Linux 2 MiB pages, fallback to regular pages | ☐ |
 | `computeWindow` / `needsRemap` | `window.zig` | 2× blocksize sliding window | ☐ |
 | `shouldPremap` / `PremappedWindow` | `window.zig` | Pre-map at 50% boundary | ☐ |
-| `extendFile` (fallocate) | `file_ops.zig` | Real block allocation | ☐ |
+| `extendFile` (platform preallocation) | `file_ops.zig` | Real block allocation | ☐ |
 | `cmpxchg32` (monotonic) | `atomic_ops.zig` | CAS for entry header claim | ☐ |
 | `atomicLoad64` / `atomicStore64` | `atomic_ops.zig` | Acquire/release ordering | ☐ |
 | `atomicFetchAdd64` | `atomic_ops.zig` | Modcount bump | ☐ |
 | `casBackoff` (tiered) | `atomic_ops.zig` | Spin → yield → exp sleep | ☐ |
 | `SharedMetadata` (512 B) | `metadata.zig` | mmap + cast, no parsing | ☐ |
-| Queue file mmap (appender) | `queue.zig` | POPULATE + pre-map + fallocate | ☐ |
-| Queue file mmap (tailer) | `queue.zig` | PROT_READ + MADV_SEQUENTIAL | ☐ |
+| Queue file mmap (appender) | `queue.zig` | populate/pre-touch + pre-map + preallocation | ☐ |
+| Queue file mmap (tailer) | `queue.zig` | PROT_READ + read-prefetch | ☐ |
 | Huge page fallback | `mmap_ops.zig` | Retry without HUGETLB on failure | ☐ |
-| Error handling | all modules | mmap, fallocate, madvise failures | ☐ |
+| Error handling | all modules | mmap, preallocation, madvise failures | ☐ |
 | Unit tests (atomics) | `atomic_ops.zig` | CAS correctness, ordering | ☐ |
 | Unit tests (window) | `window.zig` | Geometry, pre-map trigger | ☐ |
-| Integration tests | test harness | MAP_POPULATE smaps, fallocate blocks | ☐ |
-| Multi-process tests | test harness | CAS contention, acquire/release | ☐ |
+| Integration tests | test harness | page population, preallocation blocks | ☐ |
+| Multi-process tests | test harness | appender lease, CAS primitive, acquire/release | ☐ |

@@ -508,7 +508,11 @@ filename = dirname + "/" + strftime(time_seconds + epoch_secs, converted_format)
 
 ## File Pre-Allocation
 
-Queue data files are pre-allocated at creation time using `fallocate(2)` on Linux. Unlike the `lseek` + `write` approach, `fallocate` actually reserves disk blocks in the filesystem, eliminating block allocation faults during writes.
+Queue data files are pre-allocated at creation time using the platform's real
+allocation primitive: `fallocate(2)` on Linux, and `fcntl(F_PREALLOCATE)`
+followed by `ftruncate` on macOS. Unlike the `lseek` + `write` approach, this
+reserves disk blocks in the filesystem where supported, eliminating block
+allocation faults during writes.
 
 | Property | Value |
 |----------|-------|
@@ -520,9 +524,9 @@ The entire pre-allocated region is zero-filled, which is recognized as `HD_UNALL
 
 Pre-allocation alone does not remove every page-fault source. It prevents filesystem block allocation from occurring on first write, but the process can still take minor faults when page-table entries are installed, and on some kernels the first write can still fault if a page was populated read-only. For the appender latency profile, each future writable window must be prepared before the appender reaches it:
 
-1. `fallocate` the file range.
-2. Map the future window in a background prefetcher.
-3. Prefer `madvise(MADV_POPULATE_WRITE)` where available; otherwise use `MAP_POPULATE` plus a manual write-touch of one byte per page in still-unallocated space.
+1. Preallocate the file range with the platform implementation.
+2. Map the future window in a prefetcher (helper thread in native Zig, caller-driven poll in the C ABI).
+3. Prefer `madvise(MADV_POPULATE_WRITE)` where available; otherwise use `MAP_POPULATE` where available plus a manual write-touch of one byte per page in still-unallocated space.
 4. Optionally `mlock` the current and next appender windows when `RLIMIT_MEMLOCK` allows it.
 5. Hand the ready mapping to the appender for pointer swap.
 

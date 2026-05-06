@@ -16,10 +16,10 @@ Key testing concerns specific to brz-queue:
 
 - **Fixed struct layouts** — `SharedMetadata` (512 bytes) and `QueueFileHeader` (64 bytes)
   must have exact sizes and field offsets for mmap-and-cast to work across processes.
-- **Lock-free correctness** — CAS-based write arbitration, acquire/release ordering, and
-  tiered backoff must be correct under contention.
-- **io_uring wakeup** — reader notification via `io_uring` + `eventfd` must be reliable
-  and low-latency.
+- **Publication correctness** — appender lease enforcement, entry header state transitions,
+  acquire/release ordering, and tiered backoff/recovery must be correct.
+- **Polling and prefetching** — non-blocking readers, read-side prefetch, and
+  pollable maintenance helpers must be reliable, bounded, and low-jitter.
 - **Codec round-trips** — user-supplied codecs must serialize and deserialize without
   loss or allocation.
 - **File format invariants** — `.brz` files and `metadata.brz` must conform to the spec.
@@ -74,7 +74,7 @@ src/
 ├── appender.zig
 ├── appender_test.zig       # Appender + CAS tests
 ├── tailer.zig
-├── tailer_test.zig         # Tailer + io_uring tests
+├── tailer_test.zig         # Tailer polling + read-prefetch tests
 ├── metadata.zig            # SharedMetadata, QueueFileHeader, header constants
 ├── metadata_test.zig       # Struct layout tests, header encoding tests
 ├── index.zig
@@ -85,8 +85,12 @@ src/
 ├── roll_scheme_test.zig    # Roll scheme tests
 ├── mmap.zig
 ├── mmap_test.zig           # Memory mapping tests
-└── uring.zig
-    uring_test.zig          # io_uring notification tests
+├── platform.zig
+├── platform_test.zig       # Linux/macOS preallocation/advice capability tests
+├── prefetcher.zig
+├── prefetcher_test.zig     # Write/read prefetch tests
+├── cleaner.zig
+└── cleaner_test.zig        # Pollable cleanup/retention tests
 ```
 
 Running tests:
@@ -776,16 +780,15 @@ test "multiple reader threads on same queue" {
 }
 ```
 
-### 4.3 CAS Contention (Multi-Process)
+### 4.3 Appender Lease Contention (Multi-Process)
 
 ```zig
-test "multi-process appender contention" {
-    const tmp = try test_util.makeTempDir("brz.cas.");
+test "multi-process appender lease allows only one active appender" {
+    const tmp = try test_util.makeTempDir("brz.lease.");
     defer test_util.removeTempDir(tmp);
 
-    const num_writers = 4;
-    const msgs_per_writer = 250;
-    var pids: [num_writers]std.posix.pid_t = undefined;
+    const contenders = 4;
+    var pids: [contenders]std.posix.pid_t = undefined;
 
     // Create queue first
     {
@@ -798,11 +801,10 @@ test "multi-process appender contention" {
         queue.deinit();
     }
 
-    // Fork multiple writers
-    for (0..num_writers) |w| {
+    // Fork multiple would-be appenders. Exactly one should acquire the lease.
+    for (0..contenders) |w| {
         const pid = try std.posix.fork();
         if (pid == 0) {
-            // Child: write its range of messages
             var queue = try brz.Queue([]const u8).open(.{
                 .dir = tmp.path,
                 .create = false,
@@ -810,28 +812,46 @@ test "multi-process appender contention" {
             }, brz.RawBytesCodec);
             defer queue.deinit();
 
-            var appender = try queue.appender();
-            defer appender.deinit();
-
-            var i: u32 = 0;
-            while (i < msgs_per_writer) : (i += 1) {
-                var buf: [64]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "w{d}-{d}", .{ w, i }) catch unreachable;
-                appender.append(msg) catch {};
+            if (queue.appender()) |appender| {
+                defer appender.deinit();
+                appender.append("lease-owner") catch {};
+                std.time.sleep(100 * std.time.ns_per_ms);
+                std.posix.exit(0);
+            } else |err| {
+                if (err == error.AppenderAlreadyOpen) std.posix.exit(2);
+                std.posix.exit(3);
             }
-            std.posix.exit(0);
         } else {
             pids[w] = pid;
         }
     }
 
-    // Wait for all children
-    for (pids) |pid| _ = std.posix.waitpid(pid, 0);
+    var owners: u32 = 0;
+    var rejected: u32 = 0;
+    for (pids) |pid| {
+        const status = std.posix.waitpid(pid, 0);
+        if (status.status == 0) owners += 1;
+        if (status.status == 2) rejected += 1;
+    }
 
-    // Verify: no messages lost, no duplicates
+    try testing.expectEqual(@as(u32, 1), owners);
+    try testing.expectEqual(@as(u32, contenders - 1), rejected);
+}
+```
+
+---
+
+## 5. Polling, Read-Prefetch, and Maintenance Tests
+
+```zig
+test "tailer poll returns null then message without blocking" {
+    const tmp = try test_util.makeTempDir("brz.poll.");
+    defer test_util.removeTempDir(tmp);
+
     var queue = try brz.Queue([]const u8).open(.{
         .dir = tmp.path,
-        .create = false,
+        .roll_scheme = .FAST_DAILY,
+        .create = true,
         .allocator = testing.allocator,
     }, brz.RawBytesCodec);
     defer queue.deinit();
@@ -839,122 +859,61 @@ test "multi-process appender contention" {
     var tailer = try queue.tailer(.start);
     defer tailer.deinit();
 
-    var seen = std.StringHashMap(void).init(testing.allocator);
-    defer seen.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try tailer.poll());
 
-    var total: u32 = 0;
-    while (try tailer.poll()) |msg| {
-        const key = try testing.allocator.dupe(u8, msg);
-        const result = try seen.getOrPut(key);
-        try testing.expect(!result.found_existing); // no duplicates
-        total += 1;
-    }
-
-    try testing.expectEqual(@as(u32, num_writers * msgs_per_writer), total);
-}
-```
-
----
-
-## 5. io_uring Tests
-
-```zig
-test "io_uring wakeup: reader blocks then receives message" {
-    if (!brz.UringNotifier.isAvailable()) return error.SkipZigTest;
-
-    const tmp = try test_util.makeTempDir("brz.uring.");
-    defer test_util.removeTempDir(tmp);
-
-    var queue = try brz.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .roll_scheme = .FAST_DAILY,
-        .create = true,
-        .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
-    defer queue.deinit();
-
-    var received: ?[]const u8 = null;
-    var wakeup_latency_ns: i128 = 0;
-
-    // Spawn reader thread that calls collect() (blocks)
-    const reader_thread = try std.Thread.spawn(.{}, struct {
-        fn run(q: *brz.Queue([]const u8), out: *?[]const u8, latency: *i128) void {
-            var tailer = q.tailer(.start) catch return;
-            defer tailer.deinit();
-
-            const before = std.time.nanoTimestamp();
-            // collect() blocks until a message arrives via io_uring wakeup
-            if (tailer.collect(5_000)) |msg| { // 5 second timeout
-                out.* = msg;
-                latency.* = std.time.nanoTimestamp() - before;
-            } else |_| {}
-        }
-    }.run, .{ &queue, &received, &wakeup_latency_ns });
-
-    // Give reader time to enter blocking wait
-    std.time.sleep(100 * std.time.ns_per_ms);
-
-    // Main thread appends a message
     var appender = try queue.appender();
     defer appender.deinit();
-    try appender.append("wakeup-test");
+    try appender.append("poll-test");
 
-    reader_thread.join();
-
-    // Verify reader woke up and received correct message
-    try testing.expect(received != null);
-    try testing.expectEqualStrings("wakeup-test", received.?);
-
-    // Wakeup latency should be reasonable (< 10ms)
-    try testing.expect(wakeup_latency_ns < 10 * std.time.ns_per_ms);
+    const msg = (try tailer.poll()).?;
+    try testing.expectEqualStrings("poll-test", msg);
 }
 
-test "io_uring: multiple readers wake up on same event" {
-    if (!brz.UringNotifier.isAvailable()) return error.SkipZigTest;
-
-    const tmp = try test_util.makeTempDir("brz.uring.multi.");
+test "tailer read prefetch never passes published write position" {
+    const tmp = try test_util.makeTempDir("brz.read-prefetch.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try openTestQueue(.{
         .dir = tmp.path,
-        .roll_scheme = .FAST_DAILY,
-        .create = true,
-        .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+        .read_prefetch_runway_bytes = 4 * 1024 * 1024,
+        .spawn_helper_threads = false,
+    });
     defer queue.deinit();
 
-    const num_readers = 3;
-    var received: [num_readers]bool = [_]bool{false} ** num_readers;
-    var threads: [num_readers]std.Thread = undefined;
+    try appendBytes(&queue, 1024 * 1024);
 
-    // Multiple tailers blocking on collect
-    for (0..num_readers) |r| {
-        threads[r] = try std.Thread.spawn(.{}, struct {
-            fn run(q: *brz.Queue([]const u8), flag: *bool) void {
-                var tailer = q.tailer(.start) catch return;
-                defer tailer.deinit();
+    var tailer = try queue.tailer(.start);
+    defer tailer.deinit();
 
-                if (tailer.collect(5_000)) |_| {
-                    flag.* = true;
-                } else |_| {}
-            }
-        }.run, .{ &queue, &received[r] });
-    }
+    const published = queue.diagnostics().published_write_position;
+    _ = try tailer.prefetchPoll(256);
 
-    // Give readers time to block
-    std.time.sleep(200 * std.time.ns_per_ms);
+    try testing.expect(tailer.diagnostics().last_prefetch_end <= published);
+}
 
-    // Single write should wake all of them
-    var appender = try queue.appender();
-    defer appender.deinit();
-    try appender.append("broadcast");
+test "maintenance poll is bounded and reports more work" {
+    var queue = try openTestQueue(.{
+        .spawn_helper_threads = false,
+        .enable_prefetcher = true,
+        .enable_cleaner = true,
+    });
+    defer queue.deinit();
 
-    for (&threads) |*t| t.join();
+    const result = try queue.maintenancePoll(1);
+    try testing.expect(result == .idle or result == .made_progress or result == .more_work);
+}
 
-    // All readers should have woken up
-    for (received) |r| {
-        try testing.expect(r);
-    }
+test "C ABI open does not spawn helper threads" {
+    var opts = brz_c_default_options();
+    opts.spawn_helper_threads = false;
+    opts.enable_prefetcher = true;
+    opts.enable_cleaner = true;
+
+    var q: ?*brz_queue_t = null;
+    try testing.expectEqual(BRZ_OK, brz_queue_open(&opts, &q));
+    defer brz_queue_close(q.?);
+
+    try testing.expectEqual(@as(u32, 0), brz_debug_thread_count(q.?));
 }
 ```
 
@@ -1047,61 +1006,42 @@ test "benchmark: sustained throughput" {
 }
 ```
 
-### 6.3 io_uring Wakeup Latency
+### 6.3 Tailer Poll and Read-Prefetch Latency
 
 ```zig
-test "benchmark: io_uring wakeup latency" {
-    if (!brz.UringNotifier.isAvailable()) return error.SkipZigTest;
-
-    const tmp = try test_util.makeTempDir("brz.bench.uring.");
+test "benchmark: tailer poll latency with read prefetch" {
+    const tmp = try test_util.makeTempDir("brz.bench.poll-prefetch.");
     defer test_util.removeTempDir(tmp);
 
     var queue = try brz.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
+        .read_prefetch_runway_bytes = 8 * 1024 * 1024,
         .allocator = testing.allocator,
     }, brz.RawBytesCodec);
     defer queue.deinit();
 
+    try prefillQueue(&queue, 10_000);
+
+    var tailer = try queue.tailer(.start);
+    defer tailer.deinit();
+
     const iterations = 10_000;
-    var wakeup_latencies: [iterations]u64 = undefined;
+    var poll_latencies: [iterations]u64 = undefined;
 
-    var i: usize = 0;
-    while (i < iterations) : (i += 1) {
-        var received_ts: i128 = 0;
-
-        const reader_thread = try std.Thread.spawn(.{}, struct {
-            fn run(q: *brz.Queue([]const u8), ts: *i128) void {
-                var tailer = q.tailer(.end) catch return;
-                defer tailer.deinit();
-                if (tailer.collect(1_000)) |_| {
-                    ts.* = std.time.nanoTimestamp();
-                } else |_| {}
-            }
-        }.run, .{ &queue, &received_ts });
-
-        std.time.sleep(1 * std.time.ns_per_ms); // let reader block
-
-        var appender = try queue.appender();
-        const publish_ts = std.time.nanoTimestamp();
-        try appender.append("ping");
-        appender.deinit();
-
-        reader_thread.join();
-
-        if (received_ts > publish_ts) {
-            wakeup_latencies[i] = @intCast(received_ts - publish_ts);
-        } else {
-            wakeup_latencies[i] = 0;
-        }
+    for (&poll_latencies) |*lat| {
+        _ = try tailer.prefetchPoll(256);
+        const before = std.time.nanoTimestamp();
+        _ = try tailer.poll();
+        lat.* = @intCast(std.time.nanoTimestamp() - before);
     }
 
-    std.sort.sort(u64, &wakeup_latencies, {}, std.sort.asc(u64));
+    std.sort.sort(u64, &poll_latencies, {}, std.sort.asc(u64));
 
-    const p50 = wakeup_latencies[iterations / 2];
-    const p99 = wakeup_latencies[iterations * 99 / 100];
-    std.debug.print("\nio_uring wakeup latency: p50={d}ns p99={d}ns\n", .{ p50, p99 });
+    const p50 = poll_latencies[iterations / 2];
+    const p99 = poll_latencies[iterations * 99 / 100];
+    std.debug.print("\ntailer poll latency: p50={d}ns p99={d}ns\n", .{ p50, p99 });
 }
 ```
 
@@ -1119,7 +1059,7 @@ test "benchmark: appender has no steady-state page faults with prefetcher" {
     try runAppendBenchmark(.{
         .enable_prefetcher = true,
         .prefetch_runway_bytes = 16 * 1024 * 1024,
-        .signal_blocking_tailers = false,
+        .spawn_helper_threads = true,
     });
 
     const after = try test_util.readTaskFaultCounters();
@@ -1489,7 +1429,7 @@ P3 = nice to have).
 | **Cycle roll** | P1 | P1 | P1 |
 | **Pre-roll** | P1 | — | P1 |
 | **Multi-thread read** | P1 | — | P1 |
-| **io_uring wakeup** | P1 | — | P1 |
+| **Read prefetch** | P1 | — | P1 |
 | **Index seeking** | P1 | — | P1 |
 
 ### 10.2 Cycle Rolling Tests
@@ -1540,19 +1480,20 @@ Test `cycleToFilename()` for every defined roll scheme:
 |---|---|---|
 | Single writer, single reader (separate processes) | P1 | Fork, parent writes, child reads via tailer polling |
 | Writer creates new cycle file, reader follows | P1 | Reader detects modcount change and opens new file |
-| Multiple writers to same queue (CAS contention) | P1 | Fork N writers, verify no lost/duplicate messages |
+| Multiple appenders to same queue | P1 | Fork N would-be appenders, verify only one acquires the appender lease |
 | Reader starts before writer | P2 | Reader polls until data appears |
 | Writer crash recovery | P3 | Writer dies mid-write (WORKING bit set), reader skips stale entry |
 
-### 10.6 io_uring Tests
+### 10.6 Polling, Prefetch, and C ABI Tests
 
 | Scenario | Priority | Description |
 |---|---|---|
-| Single reader wakeup | P1 | Reader blocks on `collect()`, writer publishes, reader wakes |
-| Multiple reader wakeup | P1 | Multiple tailers block, single write wakes all |
-| io_uring not available fallback | P1 | Falls back to polling when io_uring unavailable |
-| Wakeup latency benchmark | P2 | Measure writer-to-reader notification latency |
-| Reader timeout | P1 | `collect()` with timeout returns `null` if no data |
+| Poll empty queue | P1 | `Tailer.poll()` returns not-ready/null without blocking |
+| Poll after publish | P1 | Writer publishes, reader observes via acquire loads |
+| Read prefetch bounds | P1 | Prefetch never passes published write position or unpublished cycle headers |
+| Multi-tailer prefetch budget | P1 | Overlapping prefetch work is coalesced or bounded |
+| C ABI no threads | P1 | C ABI open does not spawn helper threads |
+| C ABI maintenance poll | P1 | Prefetcher/cleaner work advances only when caller polls |
 
 ---
 
@@ -1633,7 +1574,10 @@ pub fn build(b: *std.Build) void {
         "src/appender_test.zig",
         "src/tailer_test.zig",
         "src/mmap_test.zig",
-        "src/uring_test.zig",
+        "src/platform_test.zig",
+        "src/prefetcher_test.zig",
+        "src/cleaner_test.zig",
+        "src/c_api_test.zig",
     };
 
     for (test_files) |test_file| {
@@ -1680,14 +1624,14 @@ pub fn build(b: *std.Build) void {
 | Alignment padding | 2 | Formula, 4-byte alignment invariant |
 | Queue lifecycle (integration) | 4 | Create/write/reopen/read, metadata, file structure, error cases |
 | Cycle rolling (integration) | 4 | Roll, EOF, pre-roll, multi-cycle read |
-| Multi-process | 3 | Writer/reader, multi-thread, CAS contention |
-| io_uring wakeup | 3 | Single reader, multi reader, timeout/fallback |
-| Performance benchmarks | 3 | Latency, throughput, io_uring latency |
+| Multi-process | 3 | Writer/reader, multi-thread, appender lease contention |
+| Polling/read prefetch/C ABI | 6 | Poll readiness, prefetch bounds, no internal C ABI threads |
+| Performance benchmarks | 3 | Append latency, poll latency, throughput/page faults |
 | Property-based (random) | 3 | Codec round-trip, index monotonicity, header round-trip |
 | Fuzz targets | 5 | Codec, header, queue file, index, metadata |
 | Memory safety | 4 | Leak detection, zero-alloc append, zero-alloc poll, mmap |
 | Error handling | 4 | Invalid dir, corrupt file, bad magic, missing metadata |
-| **Total** | **~91** | |
+| **Total** | **~97** | |
 
 All tests run in under 5 seconds in debug mode (excluding fuzz and multi-process I/O
 wait tests). Benchmarks run in `ReleaseFast` mode and are opt-in. Fuzz tests run for a

@@ -14,7 +14,7 @@ latency and zero allocations on the hot path.
 | Zero hot-path allocations | All data lives in mmap'd `.brz` files; the append and poll paths never call an allocator |
 | Error unions | Every fallible operation returns `!T`; no error codes, no global error string |
 | No global state | Each `Queue` instance is fully independent |
-| No C ABI layer | Pure Zig library — a C-compatible shim can be added later if needed |
+| C ABI shim | Opaque handles, stable error codes, borrowed message views, and bounded poll functions for non-Zig clients |
 
 ---
 
@@ -101,8 +101,15 @@ pub const QueueConfig = struct {
     /// Minimum prepared writable runway ahead of the appender.
     prefetch_runway_bytes: u64 = 8 * 1024 * 1024,
 
+    /// Minimum read-prefetched runway ahead of each tailer, bounded by published data.
+    read_prefetch_runway_bytes: u64 = 4 * 1024 * 1024,
+
     /// Start the background cleaner for deferred unmap/page-cache/retention work.
     enable_cleaner: bool = true,
+
+    /// Native Zig convenience: spawn helper threads for prefetcher/cleaner.
+    /// The C ABI forces this off and exposes pollable maintenance instead.
+    spawn_helper_threads: bool = true,
 
     /// Retention in cycle files. Null means keep files indefinitely.
     retention_cycles: ?u32 = null,
@@ -110,14 +117,6 @@ pub const QueueConfig = struct {
     /// How many milliseconds before the next roll boundary to pre-create the
     /// next cycle file, avoiding latency spikes at roll time.
     preroll_ms: u64 = 1000,
-
-    /// Use io_uring for blocking tailer wakeup (the `collect` API).
-    /// Falls back to poll/futex when false or when the kernel is too old.
-    enable_io_uring: bool = true,
-
-    /// Notify blocking tailers from the appender. Disable for minimum append
-    /// latency when tailers use polling.
-    signal_blocking_tailers: bool = true,
 
     /// Allocator used for metadata bookkeeping (never on the hot path).
     allocator: std.mem.Allocator = std.heap.page_allocator,
@@ -143,7 +142,7 @@ pub fn Queue(comptime MessageType: type) type {
         version: Version,
         roll: RollScheme,
         codec: Codec(MessageType),
-        // … mmap bookkeeping, ring pointers, io_uring fd, etc.
+        // … mmap bookkeeping, platform helpers, prefetcher/cleaner state, etc.
 
         // ── lifecycle ─────────────────────────────────────────────────
 
@@ -154,7 +153,7 @@ pub fn Queue(comptime MessageType: type) type {
             // 1. Resolve / create directory
             // 2. Read or write metadata.brz
             // 3. mmap the current cycle file
-            // 4. Optionally initialise io_uring
+            // 4. Initialise platform helper state
             _ = .{ config, codec };
             @compileError("stub");
         }
@@ -204,6 +203,13 @@ pub fn Queue(comptime MessageType: type) type {
         /// synchronous fallback count, and cleaner reclaim counts.
         pub fn diagnostics(self: *const Self) Diagnostics {
             _ = self;
+            @compileError("stub");
+        }
+
+        /// Drive queue-level prefetcher and cleaner work without requiring
+        /// library-owned helper threads.
+        pub fn maintenancePoll(self: *Self, max_work_units: u32) !StepResult {
+            _ = .{ self, max_work_units };
             @compileError("stub");
         }
 
@@ -265,10 +271,16 @@ pub fn Tailer(comptime MessageType: type) type {
             @compileError("stub");
         }
 
-        /// Blocking wait using io_uring (or fallback).  Returns the next
-        /// message, sleeping until one is appended.
-        pub fn collect(self: *Self) !Entry {
-            _ = self;
+        /// Convenience blocking loop around poll() using caller-selected backoff.
+        /// The queue core itself has no kernel notification dependency.
+        pub fn collect(self: *Self, backoff: BackoffPolicy) !Entry {
+            _ = .{ self, backoff };
+            @compileError("stub");
+        }
+
+        /// Drive read-side prefetch for this tailer within a bounded work budget.
+        pub fn prefetchPoll(self: *Self, max_work_units: u32) !StepResult {
+            _ = .{ self, max_work_units };
             @compileError("stub");
         }
 
@@ -444,7 +456,7 @@ pub fn main() !void {
 }
 ```
 
-### 7c. Reading — blocking with io_uring
+### 7c. Reading — application-owned backoff
 
 ```zig
 const std = @import("std");
@@ -453,7 +465,6 @@ const brz = @import("brz-queue");
 pub fn main() !void {
     var queue = try brz.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
-        .enable_io_uring = true,
     }, brz.RawCodec);
     defer queue.deinit();
 
@@ -461,7 +472,7 @@ pub fn main() !void {
     defer t.deinit();
 
     while (true) {
-        const entry = try t.collect(); // blocks until message available
+        const entry = try t.collect(.low_latency_spin_then_sleep);
         std.log.info("[0x{x}] {s}", .{ entry.index, entry.message });
     }
 }
@@ -527,7 +538,7 @@ const saved_index: brz.Index = 0x4A0500000003;
 var t = try queue.tailer(saved_index);
 defer t.deinit();
 
-const entry = try t.collect();
+const entry = try t.collect(.low_latency_spin_then_sleep);
 std.log.info("resumed at [0x{x}] {s}", .{ entry.index, entry.message });
 ```
 
@@ -556,8 +567,8 @@ pub const QueueError = error{
     StatFailed,
     /// The codec's parse function returned null (corrupt or truncated message).
     ParseFailed,
-    /// io_uring setup failed (kernel too old, resource limit).
-    IoUringInitFailed,
+    /// Platform preallocation/read-ahead/population failed.
+    PlatformIoFailed,
     /// Attempted to write when another writer is active (detected via header flag).
     WriterConflict,
     /// The requested index is beyond the end of the queue.
@@ -660,13 +671,88 @@ functions are inlined directly into `append` and `poll`, eliminating all
 function-pointer overhead and enabling the optimiser to reason about the full
 call chain.
 
-### 10.2 Why no C ABI
+### 10.2 C ABI shim
 
-brz-queue is a **pure Zig** library.  Exposing a C ABI adds constraints
-(stable struct layout, manual memory management, global error state) that
-conflict with idiomatic Zig design.  If C/Python/kdb interop is needed in
-the future, a thin wrapper crate can be written on top without polluting the
-core API.
+The C ABI is a thin, stable, polling-first shim over the same queue core. It is
+intended for clients written in C, C++, Python extensions, JVM/JNI, kdb+, Rust
+FFI, and other runtimes.
+
+Key rules:
+
+| Rule | Contract |
+|---|---|
+| Handles | All objects are opaque pointers (`brz_queue_t`, `brz_tailer_t`, `brz_appender_t`) |
+| Errors | Stable integer `brz_error_t`; never expose Zig error-set ordinals |
+| ABI version | `brz_abi_version()` and struct `size` fields support forward compatibility |
+| Threads | The C ABI must not create library-owned threads; builds should hard-disable spawn paths |
+| Maintenance | The embedder drives prefetcher/pretoucher/cleaner work via bounded poll calls |
+| Message lifetime | Returned message views borrow mmap memory until the next call on the same tailer or tailer close |
+| Panics | C-callable paths must convert failures to error codes; no Zig panic may cross FFI |
+| Allocator | Use explicit init options for allocator hooks, or the documented default C allocator |
+
+```c
+typedef struct brz_queue brz_queue_t;
+typedef struct brz_tailer brz_tailer_t;
+typedef struct brz_appender brz_appender_t;
+
+typedef enum brz_step_result {
+    BRZ_STEP_IDLE = 0,
+    BRZ_STEP_PROGRESS = 1,
+    BRZ_STEP_MORE_WORK = 2,
+} brz_step_result_t;
+
+typedef struct brz_message_view {
+    uint32_t size;       /* sizeof(brz_message_view) */
+    uint64_t index;
+    const void *data;    /* borrowed mmap pointer */
+    size_t data_len;
+} brz_message_view_t;
+
+uint32_t brz_abi_version(void);
+const char *brz_strerror(int err);
+
+int brz_queue_open(const struct brz_queue_options *opts, brz_queue_t **out);
+void brz_queue_close(brz_queue_t *q);
+
+int brz_appender_open(brz_queue_t *q, brz_appender_t **out);
+int brz_appender_append(brz_appender_t *a, const void *data, size_t len, uint64_t *index_out);
+void brz_appender_close(brz_appender_t *a);
+
+int brz_tailer_open(brz_queue_t *q, uint64_t start_index, brz_tailer_t **out);
+int brz_tailer_poll(brz_tailer_t *t, brz_message_view_t *out); /* BRZ_OK_NOT_READY when empty */
+int brz_tailer_prefetch_poll(brz_tailer_t *t, uint32_t max_work_units, brz_step_result_t *out);
+void brz_tailer_close(brz_tailer_t *t);
+
+int brz_queue_prefetch_poll(brz_queue_t *q, uint32_t max_work_units, brz_step_result_t *out);
+int brz_queue_cleaner_poll(brz_queue_t *q, uint32_t max_work_units, brz_step_result_t *out);
+int brz_queue_maintenance_poll(brz_queue_t *q, uint32_t max_work_units, brz_step_result_t *out);
+```
+
+The borrowed `brz_message_view.data` pointer is valid until the next
+`brz_tailer_poll`, `brz_tailer_close`, or any other API call that explicitly
+advances/remaps the same tailer. Queue-level maintenance must not unmap a window
+currently owned by a live local tailer cursor. If an embedding needs longer
+lifetimes, it must copy the bytes before polling that tailer again.
+
+Example C-style event loop:
+
+```c
+for (;;) {
+    brz_message_view_t msg = { .size = sizeof(msg) };
+    int rc = brz_tailer_poll(tailer, &msg);
+    if (rc == BRZ_OK) {
+        handle_message(msg.data, msg.data_len);
+        continue;
+    }
+    if (rc != BRZ_OK_NOT_READY) fail(rc);
+
+    brz_step_result_t step;
+    fail_if_error(brz_tailer_prefetch_poll(tailer, 256, &step));
+    fail_if_error(brz_queue_maintenance_poll(queue, 256, &step));
+
+    app_sleep_or_wait();
+}
+```
 
 ### 10.3 Memory ownership model
 
@@ -701,11 +787,11 @@ sequential consistency (`seq_cst`) fences on x86 and ARM.
 
 | Aspect | brz-queue approach |
 |---|---|
-| Language | Pure Zig, no C ABI |
+| Language | Zig API plus C ABI shim |
 | Generics | `Queue(comptime MessageType)` — comptime monomorphisation |
 | Codec | User-supplied `Codec(T)` struct; built-in `RawCodec`, `TextCodec` |
 | Writer | Single-threaded `append` / `appendWithTimestamp` |
-| Reader | `Tailer.poll` (non-blocking) or `Tailer.collect` (io_uring blocking) |
+| Reader | `Tailer.poll` (non-blocking) or optional Zig `Tailer.collect` backoff loop |
 | File format | `.brz` cycle files, `metadata.brz` |
 | Error handling | Zig error unions (`!T`) |
 | Allocations | Zero on hot path; allocator used only during open/close |

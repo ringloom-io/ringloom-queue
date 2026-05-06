@@ -25,7 +25,7 @@
 
 ## Introduction
 
-This document provides a comprehensive architectural description of **brz-queue**, a clean-room, high-performance, memory-mapped IPC queue implemented in Zig 0.16. The design targets the lowest possible latency with zero allocations, no steady-state syscalls, and no expected page faults on the appender hot path. brz-queue uses fixed-layout binary structures (no self-describing wire format), a single active appender lease, acquire/release publication, flat inline indexes, background page pre-touching, optional cleanup helpers, and optional `io_uring` for reader wakeup. It is designed for single-active-writer, multi-reader workloads across OS processes communicating through shared `mmap` regions.
+This document provides a comprehensive architectural description of **brz-queue**, a clean-room, high-performance, memory-mapped IPC queue implemented in Zig 0.16. The design targets the lowest possible latency with zero allocations on the hot path, no expected page faults on the appender hot path, and portable polling-first readers. brz-queue uses fixed-layout binary structures (no self-describing wire format), a single active appender lease, acquire/release publication, flat inline indexes, background or externally driven page pre-touching, optional cleanup helpers, and no core kernel notification dependency. It is designed for single-active-writer, multi-reader workloads across OS processes communicating through shared `mmap` regions.
 
 ## Project Summary
 
@@ -40,7 +40,7 @@ This document provides a comprehensive architectural description of **brz-queue*
 | **File Extension** | `.brz` (data files), `metadata.brz` (shared metadata) |
 | **Backoff Strategy** | Tiered: spin → yield → exponential (capped 1 ms) |
 | **Index** | Flat inline array of `u64` offsets after file header |
-| **Wakeup** | `io_uring` + `eventfd` (falls back to polling) |
+| **Reader waiting** | Non-blocking polling in core; application-owned wait/backoff/notifier outside core |
 | **Huge Pages** | Optional `MAP_HUGETLB` (2 MiB) support |
 | **Pre-allocation** | `fallocate(2)` on Linux |
 | **Test Framework** | Zig built-in test runner |
@@ -80,8 +80,8 @@ This document provides a comprehensive architectural description of **brz-queue*
 │  └─────────────────────────┼──────────────────────────────┘      │
 │                            │                                     │
 │  ┌─────────────────────────┼──────────────────────────────┐      │
-│  │             io_uring notification layer                 │      │
-│  │     (eventfd writer→reader wakeup, optional)           │      │
+│  │             application-owned wait/backoff layer         │      │
+│  │      (outside queue core; polling is the only contract) │      │
 │  └─────────────────────────┬──────────────────────────────┘      │
 │                            │                                     │
 └────────────────────────────┼─────────────────────────────────────┘
@@ -92,7 +92,7 @@ This document provides a comprehensive architectural description of **brz-queue*
 │                                                                  │
 │   ┌──────────┐   ┌──────────┐   ┌────────────────────────┐      │
 │   │  mmap()  │   │  open()  │   │  fallocate()           │      │
-│   │MAP_SHARED│   │ O_RDWR   │   │  madvise() / io_uring  │      │
+│   │MAP_SHARED│   │ O_RDWR   │   │  madvise()/prefetch    │      │
 │   │pre-touch │          │   │  MAP_HUGETLB           │      │
 │   └──────────┘   └──────────┘   └────────────────────────┘      │
 │                                                                  │
@@ -272,14 +272,31 @@ Key rules:
 
 ### Appender Mapping Optimizations
 
-- **Background write pre-touch:** Future appender windows are prepared by a prefetcher thread before the appender reaches them. The prefetcher uses `fallocate`, `MAP_POPULATE`, `MADV_POPULATE_WRITE` when available, and a manual one-byte-per-page write-touch fallback for kernels that only populate read faults.
+- **Background or externally driven write pre-touch:** Future appender windows are prepared by a prefetcher before the appender reaches them. Native Zig may run this as a helper thread; C ABI users drive the same state machine through bounded polling calls. The prefetcher uses the best platform primitive available (`fallocate`/`F_PREALLOCATE`, `MAP_POPULATE`, `MADV_POPULATE_WRITE`, read/write hints) and a manual one-byte-per-page write-touch fallback.
 - **Pre-map next window:** When the write tip crosses the configured runway threshold, the next window is pre-mapped and pre-touched in the background. When the tip reaches the boundary, the appender swaps to an already faulted mapping — zero mmap/page-fault latency on window transition if the prefetcher kept up.
 - **Optional `mlock`:** The current and next appender windows may be locked in RAM when `RLIMIT_MEMLOCK` permits. This is a tuning option, not a default, because pinning too much page cache can hurt the rest of the system.
-- **`MAP_HUGETLB` (optional):** When enabled, mappings use 2 MiB huge pages to reduce TLB pressure. This is particularly effective for large blocksize values where the working set spans many pages.
+- **Linux `MAP_HUGETLB` (optional):** When enabled on Linux, mappings use 2 MiB huge pages to reduce TLB pressure. This is particularly effective for large blocksize values where the working set spans many pages. macOS file-backed shared mappings do not have an equivalent superpage option.
 
 ### Tailer Mapping Optimizations
 
 - **`madvise(MADV_SEQUENTIAL)`:** Tailer windows use `MADV_SEQUENTIAL` to hint the kernel that access is sequential. This enables aggressive read-ahead prefetching, keeping data pages hot ahead of the read tip.
+- **Read-side prefetch:** Tailers maintain a read runway ahead of `qf_tip`. A prefetch step maps or advises future windows and may read-touch one byte per page so the tailer does not take page faults at the next window boundary.
+- **Published-data bound:** Read prefetch is strictly bounded by an acquire load of the published write position and published cycle headers. It must not read into fallocated-but-unwritten space, not chase a not-yet-published next cycle, and should stay at least one block behind the appender write runway unless the pages are already known to be published.
+
+### Platform Capability Matrix
+
+The file format and hot-path protocol are portable; only preparation hints differ by OS.
+
+| Capability | Linux | macOS |
+|---|---|---|
+| Shared mapping | `mmap(MAP_SHARED)` | `mmap(MAP_SHARED)` |
+| File preallocation | `fallocate` preferred; `posix_fallocate` if available | `fcntl(F_PREALLOCATE)` followed by `ftruncate`; fallback may be weaker on unsupported filesystems |
+| Appender populate | `MAP_POPULATE`, `MADV_POPULATE_WRITE` when available, manual write-touch fallback | Manual write-touch fallback; no `MAP_POPULATE` or `MADV_POPULATE_WRITE` |
+| Tailer read-ahead | `posix_fadvise(POSIX_FADV_WILLNEED)`, `madvise(MADV_WILLNEED/SEQUENTIAL)`, optional read-touch | `fcntl(F_RDADVISE)`, `madvise(MADV_WILLNEED/SEQUENTIAL)`, optional read-touch |
+| Drop cold pages | `MADV_DONTNEED`, `POSIX_FADV_DONTNEED` | `MADV_DONTNEED`/`msync(MS_INVALIDATE)` are advisory and may not evict immediately |
+| Huge pages | `MAP_HUGETLB` optional Linux optimization | Not supported for file-backed `MAP_SHARED` queue files |
+| Page size | Runtime page size; do not assume 4 KiB | Runtime page size; Apple Silicon commonly uses 16 KiB |
+| Memory locking | `mlock`, constrained by limits | `mlock`, usually constrained by small limits |
 
 ### File Pre-allocation (`fallocate`)
 
@@ -297,11 +314,15 @@ The appender hot path must not rely on demand paging. Synchronous `MAP_POPULATE`
 
 1. The appender publishes its current `write_position`.
 2. A prefetcher watches the write position and maintains a prepared runway ahead of it.
-3. The prefetcher pre-creates future cycle files, extends current files with `fallocate`, maps future windows, faults writable pages, and optionally locks the current/next windows.
+3. The prefetcher pre-creates future cycle files, extends current files with platform preallocation, maps future windows, faults writable pages, and optionally locks the current/next windows.
 4. The appender atomically observes a ready window and swaps pointers when it reaches the boundary.
 5. If the prefetcher falls behind, the appender may perform a synchronous fallback, but this is reported as a latency-profile miss.
 
 This is the same class of technique Chronicle Queue documents as **pre-touching**: touching pages and acquiring future cycle resources before appenders need them. Chronicle exposes manual `pretouch()` and an automatic preloader; brz-queue makes the equivalent prefetcher part of the core low-jitter design.
+
+### Why `io_uring` is not in the core design
+
+`io_uring` does not materially improve steady-state append or `poll()` latency because brz-queue's data path is already memory mapped: the hot path is pointer arithmetic, payload copy/read, and acquire/release atomic loads/stores, not kernel I/O submission. `io_uring` can help an idle reader sleep until notified, but that requires Linux-only machinery and usually shifts a syscall onto the appender for each waiting reader or wakeup batch. The core spec therefore keeps notification out of the queue and exposes polling. Applications that need blocking readers can layer their own wait strategy (spin/yield/sleep, condition variables inside one process, kqueue/epoll/eventfd, language runtime schedulers, or a custom reactor) around `Tailer.poll()`.
 
 ## Message Framing and Header Protocol
 
@@ -649,12 +670,8 @@ const Queue = struct {
     cycle_shift: u6,                  // Bits to shift for cycle
     seqnum_mask: u64,                 // Mask for seqnum
 
-    // io_uring notification (optional)
-    ring: ?IoUring,                   // io_uring instance
-    waiting_tailers: WaiterRegistry,  // per-tailer wakeup eventfds
-
-    // Background helpers (optional)
-    prefetcher: ?PagePrefetcher,      // prepares future appender pages/windows
+    // Pollable helpers (optional native Zig threads wrap these state machines)
+    prefetcher: ?Prefetcher,          // prepares future appender/tailer pages/windows
     cleaner: ?Cleaner,                // unmaps/drops/reclaims old resources
 
     // Allocator for non-hot-path allocations
@@ -674,7 +691,7 @@ const Appender = struct {
     seqnum: u64,                      // Next sequence number to write
 
     // Current mmap window (PROT_READ | PROT_WRITE)
-    buf: [*]align(4096) u8,          // mmap base address
+    buf: [*]align(page_size) u8,     // mmap base address
     mmap_offset: u64,                 // Offset from file start
     mmap_size: u64,                   // Size of mapping
     tip: u64,                         // Byte position of next header
@@ -697,15 +714,15 @@ const Tailer = struct {
     fd: std.posix.fd_t,               // File descriptor
 
     // Current mmap window (PROT_READ only)
-    buf: [*]align(4096) const u8,     // mmap base address
+    buf: [*]align(page_size) const u8, // mmap base address
     mmap_offset: u64,                 // Offset from file start
     mmap_size: u64,                   // Size of mapping
 
     tip: u64,                         // Byte position of next header
     index: u64,                       // Full 64-bit index (cycle << shift | seqnum)
 
-    // io_uring wakeup (optional)
-    waiting_on_uring: bool,           // Whether an SQE is submitted
+    // Read prefetch state
+    read_prefetch: ReadPrefetchState, // next published range to advise/touch
 };
 ```
 
@@ -809,7 +826,7 @@ Appender.append(payload)
              ▼
   ┌──────────────────────────┐
   │ Store write_position;     │
-  │ optionally signal waiters │
+  │ increment modcount        │
   └──────────┬───────────────┘
              │
              ▼
@@ -830,7 +847,7 @@ tailer = Tailer.init(queue, start_index);
 2. Clamps cycle to `[lowest_cycle, highest_cycle]`
 3. Sets `dispatch_after = start_index - 1`
 4. Sets `index` to the start of the cycle's file (seqnum 0)
-5. If io_uring is available, prepares eventfd SQE for wakeup
+5. Initializes read-prefetch state for the starting cycle/window
 
 ### Polling (`Tailer.poll`)
 
@@ -873,7 +890,7 @@ This is the core tailer read path:
 │  ┌─────────────────────────┐             │
 │  │ Calculate mmap window    │             │
 │  │ mmapoff = tip & mask     │             │
-│  │ madvise(MADV_SEQUENTIAL) │             │
+│  │ take prefetch if ready   │             │
 │  │ mmap 2×blocksize chunk   │             │
 │  └──────────┬──────────────┘             │
 │             │                            │
@@ -894,56 +911,38 @@ This is the core tailer read path:
 │     │         ──────────────────────────►│
 │     │                                    │
 │     ▼                                    │
-│  Wait for new data:                      │
+│  No data available:                      │
 │  ┌────────────────────────────────┐      │
-│  │ If io_uring available:         │      │
-│  │   Register per-tailer eventfd  │      │
-│  │   Near-zero wakeup latency     │      │
-│  │   Zero CPU during idle         │      │
-│  │ Else:                          │      │
-│  │   Tiered backoff polling        │      │
+│  │ Return null / awaiting state   │      │
+│  │ Caller decides spin/yield/sleep│      │
+│  │ or external OS notification    │      │
 │  └────────────────────────────────┘      │
 │                                          │
 └──────────────────────────────────────────┘
 ```
 
-### io_uring Wakeup Protocol
+### Waiting and Collect Mode
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    io_uring Notification                        │
-│                                                                │
-│  Setup:                                                        │
-│    - Queue initializes io_uring instance                       │
-│    - Each blocking tailer owns an eventfd                      │
-│                                                                │
-│  Writer (after publishing header/write_position):               │
-│    - optionally write(eventfd, 1) for each registered waiter    │
-│                                                                │
-│  Reader (when no data available):                               │
-│    1. Register as waiting                                      │
-│    2. Submit io_uring SQE: IORING_OP_READ on tailer eventfd    │
-│    3. io_uring_submit_and_wait(1) — blocks in kernel           │
-│    4. Kernel wakes reader when eventfd becomes readable         │
-│    5. Reader unregisters and resumes polling                    │
-│                                                                │
-│  Latency: low, but paid for by appender notification syscalls   │
-│  CPU during idle: 0% (blocked in kernel)                        │
-│                                                                │
-│  Fallback: If io_uring is unavailable (old kernel, no support), │
-│  readers use tiered backoff polling (same as CAS backoff).      │
-└───────────────────────────────────────────────────────────────┘
-```
+The core API exposes non-blocking `Tailer.poll()`. A convenience `collect()`
+may exist in the Zig API as a thin loop around `poll()` plus a configured
+backoff policy, but it is not part of the correctness protocol and does not
+require a queue-owned kernel notifier. This keeps the core portable to Linux and
+macOS and avoids moving notification syscalls onto the appender.
 
-### Collect Mode
+Applications that need idle blocking can layer an external strategy around
+`poll()`:
 
-`Tailer.collect()` provides a synchronous blocking interface:
+1. Spin or yield for a short latency budget.
+2. Sleep/back off when idle.
+3. Use process-local condition variables when writer and reader are in one
+   process.
+4. Use an application-owned OS reactor (`epoll`, `kqueue`, timers, eventfd, or
+   language runtime scheduler) if cross-component wakeup is needed.
 
-1. Polls in a loop calling `Tailer.poll()`
-2. If io_uring is available, blocks efficiently in kernel between polls
-3. Otherwise uses tiered backoff
-4. When a DATA message is found, returns the payload slice
-5. The slice points directly into the mmap region (zero-copy)
+When a DATA message is found, the returned payload slice points directly into
+the mmap region. The pointer is valid until the next call that can advance or
+remap that same tailer, unless the C ABI uses a stronger explicit-release
+contract.
 
 ## Module Decomposition
 
@@ -967,15 +966,15 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 | Header state | `Appender.claimEntry`, `Appender.publishEntry` |
 | Roll handling | `Appender.checkRoll`, `Appender.preCreateNextCycle` |
 | Index update | `Appender.updateIndex` |
-| Notification | `Appender.signalReaders` |
+| Publication | `Appender.publishWritePosition`, `Appender.updateModcount` |
 
 ### `tailer.zig` — Multi-Reader Engine
 
 | Responsibility | Key Functions |
 |---|---|
-| Reading | `Tailer.poll`, `Tailer.collect` |
+| Reading | `Tailer.poll`, optional Zig `Tailer.collect` backoff loop |
 | Seeking | `Tailer.seekToIndex`, `Tailer.binarySearchIndex` |
-| Wakeup | `Tailer.waitForData`, `Tailer.submitUringRead` |
+| Read prefetch | `Tailer.prefetchPoll`, `Tailer.prepareReadWindow` |
 | State | `Tailer.state`, `Tailer.currentIndex` |
 
 ### `mmap.zig` — Memory Mapping Utilities
@@ -983,19 +982,21 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 | Responsibility | Key Functions |
 |---|---|
 | Mapping | `MappedWindow.init`, `MappedWindow.remap` |
-| Optimization | `MappedWindow.populate`, `MappedWindow.adviseSequential` |
-| Huge pages | `MappedWindow.tryHugePages` |
+| Optimization | `MappedWindow.populate`, `MappedWindow.adviseSequential`, `MappedWindow.adviseWillNeed` |
+| Huge pages | `MappedWindow.tryHugePages` (Linux only) |
 | Pre-mapping | `MappedWindow.premapNext` |
-| Pre-touching | `MappedWindow.populateWrite`, `MappedWindow.touchWritablePages` |
+| Pre-touching | `MappedWindow.populateWrite`, `MappedWindow.touchWritablePages`, `MappedWindow.touchReadablePages` |
 
-### `prefetcher.zig` — Appender Page Preparation
+### `prefetcher.zig` — Write and Read Page Preparation
 
 | Responsibility | Key Functions |
 |---|---|
-| Runway tracking | `PagePrefetcher.observeWritePosition`, `PagePrefetcher.targetWindow` |
-| Future mapping | `PagePrefetcher.prepareWindow`, `PagePrefetcher.prepareCycle` |
-| Handoff | `PagePrefetcher.tryTakeReadyWindow` |
-| Fault prevention | `PagePrefetcher.touchWritablePages`, `PagePrefetcher.tryMlock` |
+| Write runway tracking | `Prefetcher.observeWritePosition`, `Prefetcher.targetWriteWindow` |
+| Read runway tracking | `Prefetcher.observeTailerPosition`, `Prefetcher.targetReadWindow` |
+| Future mapping | `Prefetcher.prepareWriteWindow`, `Prefetcher.prepareReadWindow`, `Prefetcher.prepareCycle` |
+| Handoff | `Prefetcher.tryTakeReadyWriteWindow`, `Prefetcher.tryTakeReadyReadWindow` |
+| Fault prevention | `Prefetcher.touchWritablePages`, `Prefetcher.touchReadablePages`, `Prefetcher.tryMlock` |
+| Pollable work | `Prefetcher.poll(max_work_units)` |
 
 ### `cleaner.zig` — Asynchronous Reclamation
 
@@ -1005,6 +1006,7 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 | Page-cache pressure | `Cleaner.adviseDontNeed`, `Cleaner.posixFadviseDontNeed` |
 | Retention | `Cleaner.deleteCyclesBefore`, `Cleaner.computeRetentionFloor` |
 | Durability option | `Cleaner.flushIfConfigured` |
+| Pollable work | `Cleaner.poll(max_work_units)` |
 
 ### `metadata.zig` — Shared Metadata Structures
 
@@ -1015,14 +1017,25 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 | Header constants | `HD_UNALLOCATED`, `HD_WORKING`, `HD_EOF`, etc. |
 | Roll schemes | `RollScheme`, builtin scheme table |
 
-### `uring.zig` — io_uring Integration (Optional)
+### `platform.zig` — OS Capability Layer
 
 | Responsibility | Key Functions |
 |---|---|
-| Setup | `UringNotifier.init`, `UringNotifier.deinit` |
-| Writer signal | `UringNotifier.signal` |
-| Reader wait | `UringNotifier.waitForSignal` |
-| Fallback | `UringNotifier.isAvailable` |
+| File preallocation | `Platform.preallocate`, `Platform.extendFile` |
+| Write population | `Platform.populateWrite`, `Platform.touchWritableFallback` |
+| Read-ahead | `Platform.adviseReadAhead`, `Platform.touchReadableFallback` |
+| Drop cold pages | `Platform.adviseDontNeed` |
+| Capability detection | `Platform.capabilities` |
+
+### `c_api.zig` — Thread-Free C ABI Shim
+
+| Responsibility | Key Functions |
+|---|---|
+| Opaque handles | `brz_queue_open`, `brz_queue_close`, `brz_tailer_open` |
+| Stable errors | `brz_error_t`, `brz_strerror`, no Zig error-set ordinals |
+| Borrowed messages | `brz_message_view`, lifetime until next same-tailer poll/remap |
+| Pollable helpers | `brz_queue_prefetch_poll`, `brz_queue_cleaner_poll`, `brz_tailer_prefetch_poll` |
+| ABI versioning | `brz_abi_version`, struct `size` fields |
 
 ## Concurrency and Memory Ordering
 
@@ -1116,13 +1129,13 @@ pub const QueueError = error{
     InvalidMagic,
     UnsupportedVersion,
     MmapFailed,
-    FallocateFailed,
+    PreallocateFailed,
     FileOpenFailed,
     MetadataCorrupted,
     MessageTooLarge,
     BlocksizeExceeded,
     RollFailed,
-    IoUringSetupFailed,
+    PlatformCapabilityUnavailable,
 };
 ```
 
@@ -1184,8 +1197,8 @@ Errors on the hot path (CAS failure, WORKING header) are **not** represented as 
   │  └──────────────┘  │ │ [HDR][DATA]          │ │      │
   │                     │ │ [HDR][DATA]          │ │      │
   │  ┌──────────────┐   │ │ [UNALLOC...]        │ │      │
-  │  │ tailer       │  │ └──────────────────────┘ │      │
-  │  │ eventfds     │  └──────────────────────────┘      │
+  │  │ tailer read  │  │ └──────────────────────┘ │      │
+  │  │ prefetch     │  └──────────────────────────┘      │
   │  └──────────────┘                                     │
   └─────────────────────────────────────────────────────┘
         │                   │                   │

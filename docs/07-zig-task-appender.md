@@ -13,7 +13,7 @@
 5. [Cycle Roll Handling](#5-cycle-roll-handling)
 6. [Pre-Roll Integration](#6-pre-roll-integration)
 7. [Flat Index Updates](#7-flat-index-updates)
-8. [eventfd Signaling](#8-eventfd-signaling)
+8. [Publication Without Core Wakeup](#8-publication-without-core-wakeup)
 9. [File Extension](#9-file-extension)
 10. [EOF Patching](#10-eof-patching)
 11. [Performance Characteristics](#11-performance-characteristics)
@@ -32,8 +32,8 @@ The design prioritizes:
 
 - **Zero allocations on the hot path** — all memory is pre-mapped; payload is written directly
   into the mmap region via the comptime codec interface.
-- **Minimal syscalls on the hot path** — zero in the polling profile, except for optional
-  per-waiting-tailer eventfd writes when blocking readers are enabled.
+- **Minimal syscalls on the hot path** — zero in the steady-state polling profile. The queue
+  core does not signal blocking readers; applications that need wakeup own that policy.
 - **Predictable latency** — a background prefetcher prepares future mappings/pages and pre-roll
   ensures cycle transitions don't stall the writer when the prefetcher keeps up.
 
@@ -124,11 +124,7 @@ This is the most performance-critical code in the entire library. Every nanoseco
 9. **Update flat index** — every `index_spacing` messages, atomically store the current
    byte offset as a `u64` into the index region. Single atomic store, no syscall.
 
-10. **Signal waiters** — optionally write 8 bytes (`u64` value 1) to each registered
-    waiting tailer's eventfd. This is the only steady-state syscall source, and it can be
-    disabled or batched.
-
-11. **Advance tip and seqnum** — pure arithmetic on local state, followed by a release-store
+10. **Advance tip and seqnum** — pure arithmetic on local state, followed by a release-store
     of `metadata.write_position`.
 
 ### Syscall analysis (steady state)
@@ -144,9 +140,8 @@ This is the most performance-critical code in the entire library. Every nanoseco
 | 7 | Payload write | 0 (mmap write) |
 | 8 | Header publish | 0 (mmap write) |
 | 9 | Index update | 0 (mmap write, every N) |
-| 10 | waiter signal | **0–N** `write(eventfd, ...)`, depending on waiting tailers |
-| 11 | Tip/seqnum advance | 0 |
-| **Total** | | **0–1** |
+| 10 | Tip/seqnum advance | 0 |
+| **Total** | | **0** |
 
 ### Full implementation sketch
 
@@ -188,10 +183,7 @@ pub fn append(self: *Appender, msg: anytype) !void {
     // Step 9: flat index update
     self.maybeUpdateIndex();
 
-    // Step 10: signal eventfd
-    try self.signalReaders();
-
-    // Step 11: advance tip and seqnum
+    // Step 10: advance tip and seqnum
     self.tailer.tip += total;
     self.tailer.seqnum += 1;
     @atomicStore(u64, &self.queue.metadata.?.write_position, self.tailer.tip, .release);
@@ -348,12 +340,12 @@ If the pre-roll system hasn't prepared the next file (e.g., rapid successive rol
 pre-roll window was missed), the appender must create the file synchronously:
 
 1. Compute the filename: `{cycle_number}.brz`.
-2. Create the file with `fallocate` to pre-allocate disk blocks.
-3. `mmap` with `MAP_POPULATE` to pre-fault pages.
+2. Create the file with platform preallocation to reserve disk blocks.
+3. `mmap` and pre-touch using the best available platform populate path.
 4. Write the file header.
 5. Continue with the roll as above.
 
-This path involves multiple syscalls (`open`, `fallocate`, `fstat`, `mmap`) and is
+This path involves multiple syscalls (`open`, preallocation, `fstat`, `mmap`) and is
 significantly slower. The pre-roll system exists specifically to avoid this on the hot path.
 
 ---
@@ -397,9 +389,10 @@ fn maybePreroll(queue: *Queue, now_ms: i64) !void {
 
     // Create and pre-allocate the file
     const fd = try std.posix.open(filename, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
-    _ = std.os.linux.fallocate(fd, 0, 0, @intCast(queue.initial_file_size));
+    try queue.platform.preallocate(fd, 0, queue.initial_file_size);
+    try std.posix.ftruncate(fd, queue.initial_file_size);
 
-    // mmap with MAP_POPULATE to pre-fault pages
+    // mmap with platform populate/pre-touch support
     const mmap_ptr = try std.posix.mmap(
         null,
         queue.initial_file_size,
@@ -461,43 +454,32 @@ the nearest indexed offset. This avoids a full linear scan from the start of the
 
 ---
 
-## 8. eventfd Signaling
+## 8. Publication Without Core Wakeup
 
-After publishing the header and `write_position`, the appender may signal readers that new
-data is available. This is optional because every signal is a syscall paid by the appender.
-The minimum-latency profile disables signaling and uses polling readers; blocking readers
-trade a small appender cost for zero idle CPU.
+After publishing the header and `write_position`, the appender increments
+`metadata.modcount` and returns. It does not signal readers in the core design.
+This preserves the zero-syscall steady-state append path and keeps the queue
+portable across Linux and macOS.
 
-```zig
-fn signalReaders(self: *Appender) !void {
-    var it = self.queue.waiting_tailers.iterator();
-    while (it.next()) |tailer| {
-        const efd = tailer.wakeup_eventfd orelse continue;
-        const val: u64 = 1;
-        _ = try std.posix.write(efd, std.mem.asBytes(&val));
-    }
-}
-```
+Applications that need blocking reader wakeup can layer it outside the queue:
 
-This is one `write` syscall per waiting tailer, not per configured tailer. The waiter
-registry is updated when a tailer enters/leaves blocking `collect()`. If signal latency is
-less important than append latency, use batching or disable signaling.
+- Same-process readers can use application condition variables after the appender
+  call returns.
+- Event-loop users can combine `Tailer.poll()` with timers or runtime-specific
+  reactors.
+- Cross-process notification can be provided by an application-owned mechanism,
+  but it is not part of the queue correctness protocol.
 
-### Optimization options
-
-- **Polling readers**: If all readers use a pure spin-poll loop, eventfd signaling can be
-  disabled entirely (`signal_blocking_tailers = false`), reducing steady-state syscalls to **zero**.
-- **Batched signaling**: Signal only every N messages instead of every message. This trades
-  latency for throughput in high-volume scenarios.
-- **Waiting-only signaling**: Signal only tailers that have explicitly registered as parked.
-  This avoids O(number of tailers) work when readers are actively polling.
+Any external wakeup should be treated as "poll again", not as proof that exactly
+one message is available. Readers must tolerate coalesced, stale, or spurious
+wakeups.
 
 ---
 
 ## 9. File Extension
 
 When the remaining space in the current mmap window drops below `2 × blocksize`, the
-prefetcher should already have extended the file using `fallocate` and prepared the next
+prefetcher should already have extended the file using platform preallocation and prepared the next
 mapping. The appender function below is a correctness fallback and should increment a
 prefetch-miss diagnostic because it can add jitter.
 
@@ -510,13 +492,12 @@ fn extendFileIfNeeded(self: *Appender) !void {
         const new_size = self.tailer.file_size + self.queue.qf_disk_size;
 
         // Pre-allocate disk blocks (avoids ENOSPC on later writes)
-        const rc = std.os.linux.fallocate(
+        try self.queue.platform.preallocate(
             self.tailer.fd,
-            0,    // mode: default (allocate)
             @intCast(self.tailer.file_size),
             @intCast(new_size - self.tailer.file_size),
         );
-        if (rc != 0) return error.FallocateFailed;
+        try std.posix.ftruncate(self.tailer.fd, new_size);
 
         // Update cached file size (fstat)
         const stat = try std.posix.fstat(self.tailer.fd);
@@ -529,9 +510,11 @@ fn extendFileIfNeeded(self: *Appender) !void {
 }
 ```
 
-`fallocate` pre-allocates disk blocks without writing zeros, which is faster than
-`ftruncate` and avoids `ENOSPC` surprises during later mmap writes. The remap uses
-`MAP_POPULATE` to pre-fault pages in the new region.
+Platform preallocation reserves disk blocks without relying on sparse-file
+growth, avoiding `ENOSPC` surprises during later mmap writes. Linux should use
+`fallocate`; macOS should use `F_PREALLOCATE` followed by `ftruncate`. The remap
+uses the best available platform populate/pre-touch path to pre-fault pages in
+the new region.
 
 ---
 
@@ -598,9 +581,8 @@ small number (e.g., 2–4 cycles) to avoid scanning ancient files on startup.
 | Payload write | `memcpy` into mmap (or inline codec write) |
 | Header publish | Release store (plain `MOV` on x86) |
 | Index update | Atomic `u64` store (every N messages) |
-| eventfd signal | Optional/batched `write` syscalls to waiting tailers |
 | Padding | 0–3 zero bytes |
-| **Total syscalls (steady state)** | **0** in polling profile, **0–N waiting tailers** when signaling |
+| **Total syscalls (steady state)** | **0** |
 | **Allocations (steady state)** | **0** |
 
 ### Memory ordering summary
@@ -626,7 +608,7 @@ the compiler would emit `stlr` / `ldar` as needed.
 | Error | Cause | Recovery |
 |---|---|---|
 | `MmapFailed` | Kernel refuses mmap (OOM, address space exhaustion) | Return error to caller; caller can retry |
-| `FallocateFailed` | Disk full or filesystem doesn't support fallocate | Return error; queue cannot extend |
+| `PreallocateFailed` | Disk full or filesystem doesn't support strict preallocation | Return error in strict low-jitter mode; weaker fallback may be configured |
 | `FileCreateFailed` | Permission denied, path doesn't exist | Return error; queue directory misconfigured |
 | `CycleRollFailed` | Failed to create new cycle file during slow-path roll | Return error; pre-roll avoids this in normal operation |
 
@@ -641,7 +623,7 @@ the compiler would emit `stlr` / `ldar` as needed.
 
 The `append()` function returns `!void` — it propagates errors to the caller via Zig's
 error union. The hot path itself does not allocate error objects. Errors from file operations
-(fallocate, mmap, open) are propagated as-is from `std.posix`.
+(preallocation, mmap, open) are propagated as-is from `std.posix` or the platform layer.
 
 ---
 
@@ -656,11 +638,12 @@ error union. The hot path itself does not allocate error objects. Errors from fi
 - **Padding correctness**: Verify that entries are always 4-byte aligned and padding bytes
   are zero.
 
-### CAS contention tests
+### Lease and header-state tests
 
-- **Multi-process writers**: Fork two processes, each with an appender on the same queue
-  directory. Verify that all messages from both processes appear exactly once in the queue
-  with no corruption.
+- **Multi-process appender lease**: Fork two processes and verify exactly one can acquire
+  the appender lease; the other receives `AppenderAlreadyOpen`.
+- **WORKING recovery/backoff**: Seed a WORKING header and verify retry/backoff or recovery
+  policy does not corrupt adjacent entries.
 - **Backoff timing**: Instrument the backoff function and verify that tier transitions happen
   at the correct iteration counts (64, 256).
 

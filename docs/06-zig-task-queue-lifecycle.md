@@ -9,9 +9,9 @@
 5. [Metadata File Creation](#5-metadata-file-creation)
 6. [Queue File Creation](#6-queue-file-creation)
 7. [Pre-Roll File Creation](#7-pre-roll-file-creation)
-8. [PagePrefetcher Lifecycle](#8-pageprefetcher-lifecycle)
+8. [Prefetcher Lifecycle](#8-prefetcher-lifecycle)
 9. [Cleaner Lifecycle](#9-cleaner-lifecycle)
-10. [io_uring Setup](#10-io_uring-setup)
+10. [Pollable Maintenance and Platform Setup](#10-pollable-maintenance-and-platform-setup)
 11. [Queue File Enumeration](#11-queue-file-enumeration)
 12. [Configuration](#12-configuration)
 13. [Queue Cleanup (deinit)](#13-queue-cleanup-deinit)
@@ -29,16 +29,16 @@ a queue through to tearing it down:
 - **Version detection** — probe for `metadata.brz` to determine format version
 - **Metadata file creation/reading** — create or mmap the fixed 512-byte
   `SharedMetadata` extern struct (zero parsing — direct pointer cast)
-- **Queue file management** — create `.brz` data files with `fallocate(2)`
-  pre-allocation, write the 64-byte `QueueFileHeader`
+- **Queue file management** — create `.brz` data files with platform
+  preallocation, write the 64-byte `QueueFileHeader`
 - **Roll scheme configuration** — set roll period, index count, index spacing
 - **Pre-roll file preparation** — pre-create the next cycle's `.brz` file
   within a configurable `preroll_ms` window so the hot-path roll is a pointer
   swap with zero syscalls
-- **io_uring setup** — initialize an io_uring context and per-tailer eventfds for
-  writer→reader notification
-- **Cleanup** — tear down all mappings, fds, and io_uring state in reverse
-  order
+- **Pollable helpers** — initialize prefetcher/cleaner state machines; native Zig
+  may wrap them in helper threads, while C ABI users drive them manually
+- **Cleanup** — tear down all mappings, fds, helper state, and platform
+  resources in reverse order
 
 The design is **single writer, multiple readers**. All metadata is accessed
 through mmap'd `extern struct` pointers — there is no wire format, no parsing,
@@ -101,17 +101,16 @@ pub const Queue = struct {
     preroll_cycle: ?u32 = null,
     preroll_ms: u64 = 500, // pre-roll window: 500 ms before cycle end
 
-    // --- Background latency helpers ---
+    // --- Latency helpers ---
     enable_prefetcher: bool = true,
     prefetch_runway_bytes: u64 = 8 * 1024 * 1024,
+    read_prefetch_runway_bytes: u64 = 4 * 1024 * 1024,
     enable_cleaner: bool = true,
+    spawn_helper_threads: bool = true, // forced false for C ABI builds/opens
     retention_cycles: ?u32 = null,
     cleaner: ?Cleaner = null,
-    prefetcher: ?PagePrefetcher = null,
-
-    // --- io_uring (NEW) ---
-    uring_ctx: ?IoUringContext = null,
-    waiting_tailers: WaiterRegistry = .{},
+    prefetcher: ?Prefetcher = null,
+    platform: Platform = .detect(),
 
     // --- Huge page config (NEW) ---
     use_huge_pages: bool = false,
@@ -185,7 +184,7 @@ If `metadata.brz` does not exist, the directory is not a brz-queue.
 ## 4. Queue Opening
 
 Opening an existing queue reads and validates the metadata file, scans for
-existing data files, and initializes io_uring.
+existing data files, and initializes platform/helper state.
 
 ### Steps
 
@@ -195,9 +194,10 @@ existing data files, and initializes io_uring.
 4. Validate magic number (`0x4D515A42`)
 5. Read roll config directly from struct fields (zero parsing!)
 6. Scan directory for existing `.brz` data files
-7. Initialize io_uring context and waiter registry
+7. Detect platform capabilities and initialize prefetcher/cleaner state machines
 8. Set up pre-roll state
-9. Validate configuration consistency
+9. Start helper threads only for the native Zig API when configured
+10. Validate configuration consistency
 
 ### Zig implementation sketch
 
@@ -263,15 +263,22 @@ pub fn open(self: *Self) !void {
     // 6. Scan directory for existing .brz data files
     try self.refreshQueueFiles();
 
-    // 7. Initialize io_uring context and waiter registry
-    try self.initIoUring();
+    // 7. Initialize platform and pollable helper state
+    self.platform = Platform.detect();
+    try self.initPrefetcher();
+    try self.initCleaner();
 
     // 8. Pre-roll state starts empty — will be filled by maybePreroll()
     self.preroll_fd = null;
     self.preroll_mmap = null;
     self.preroll_cycle = null;
 
-    // 9. Validate configuration
+    // 9. Optionally start native Zig helper threads
+    if (self.spawn_helper_threads) {
+        try self.startHelperThreads();
+    }
+
+    // 10. Validate configuration
     if (self.roll_length_secs == 0) return error.InvalidRollConfig;
     if (self.index_count == 0) return error.InvalidRollConfig;
 }
@@ -311,7 +318,7 @@ pub fn releaseAppenderLease(self: *Self, owner_token: u64) !void {
 }
 ```
 
-The lease CAS happens outside the append hot path. It prevents multiple writers
+The lease CAS happens outside the append hot path. It prevents multiple appenders
 from corrupting `write_position` without adding per-message synchronization.
 
 ---
@@ -324,7 +331,7 @@ all fields at known offsets.
 ### Steps
 
 1. Create `metadata.brz` file
-2. `fallocate` 512 bytes (one disk sector)
+2. Preallocate 512 bytes (one disk sector)
 3. mmap it read-write
 4. Cast to `*SharedMetadata`, fill in fields
 5. `msync` to flush
@@ -347,9 +354,10 @@ fn metadataInit(self: *Self) !void {
     );
     errdefer std.posix.close(fd);
 
-    // 2. Pre-allocate 512 bytes with fallocate(2)
-    //    This reserves real disk blocks — no sparse file tricks
-    try std.posix.fallocate(fd, .{}, 0, Queue.metadata_file_sz);
+    // 2. Pre-allocate 512 bytes with the platform implementation.
+    //    Linux uses fallocate; macOS uses F_PREALLOCATE + ftruncate.
+    try self.platform.preallocate(fd, 0, Queue.metadata_file_sz);
+    try std.posix.ftruncate(fd, Queue.metadata_file_sz);
 
     // 3. mmap read-write
     const mmap_buf = try mapFile(
@@ -377,7 +385,7 @@ fn metadataInit(self: *Self) !void {
     @atomicStore(u64, &meta.write_position, 0, .release);
     @atomicStore(u64, &meta.appender_lock, 0, .release); // unlocked
 
-    // Zero the reserved region (fallocate already zeroed, but be explicit)
+    // Zero the reserved region (preallocation should zero, but be explicit)
     @memset(&meta._reserved, 0);
 
     // 5. msync to flush to disk
@@ -410,7 +418,7 @@ Each `.brz` data file stores messages for one cycle. The file layout is:
 ### Steps
 
 1. Create the file
-2. `fallocate(fd, 0, 0, qf_disk_sz)` — pre-allocate disk blocks
+2. `platform.preallocate(fd, 0, qf_disk_sz)` — pre-allocate disk blocks
 3. mmap the first block
 4. Cast offset 0 to `*QueueFileHeader`, fill in fields
 5. Zero-initialize the index region
@@ -428,8 +436,9 @@ fn queuefileInit(self: *Self, path: []const u8, cycle: u32) !posix.fd_t {
     );
     errdefer std.posix.close(fd);
 
-    // 2. Pre-allocate with fallocate(2) — reserves real disk blocks
-    try std.posix.fallocate(fd, .{}, 0, Queue.qf_disk_sz);
+    // 2. Pre-allocate with the platform implementation — reserves real disk blocks
+    try self.platform.preallocate(fd, 0, Queue.qf_disk_sz);
+    try std.posix.ftruncate(fd, Queue.qf_disk_sz);
 
     // 3. mmap the header + index region
     const header_plus_index_sz = 64 + @as(u64, self.index_count) * 8;
@@ -449,7 +458,7 @@ fn queuefileInit(self: *Self, path: []const u8, cycle: u32) !posix.fd_t {
     @memset(&hdr._reserved, 0);
 
     // 5. Zero-initialize the index region (offset 64 to 64 + index_count × 8)
-    //    fallocate zeros the file, but be explicit for clarity
+    //    Preallocation should zero the file, but be explicit for clarity
     const index_base = buf.ptr + 64;
     const index_byte_len = @as(usize, self.index_count) * 8;
     @memset(index_base[0..index_byte_len], 0);
@@ -485,7 +494,7 @@ yet, create and mmap the next cycle's file.
 
 When the actual roll happens (in the appender's write path), if
 `preroll_cycle` matches the new cycle, just swap the fd and mmap pointers.
-No `open()`, no `fallocate()`, no `mmap()` on the critical path.
+No `open()`, no preallocation, no `mmap()` on the critical path.
 
 ### Zig implementation sketch
 
@@ -518,7 +527,7 @@ pub fn maybePreroll(self: *Queue, current_time_ms: u64) !void {
             0,
             @intCast(map_sz),
             .read_write,
-            .{ .TYPE = .SHARED, .POPULATE = true },
+            .{ .TYPE = .SHARED, .POPULATE = self.platform.supports_map_populate },
         );
     }
 }
@@ -560,41 +569,54 @@ pre-roll starts halfway through every cycle.
 
 ---
 
-## 8. PagePrefetcher Lifecycle
+## 8. Prefetcher Lifecycle
 
-The prefetcher is the component that keeps page faults out of the appender hot
-path. It is optional for simple deployments, but enabled by default in the
-low-jitter profile.
+The prefetcher is the component that keeps page faults out of the appender and
+tailer hot paths. It is optional for simple deployments, but enabled by default
+in the low-jitter native Zig profile. The prefetcher is a pollable state machine:
+native Zig may run it in a helper thread, while the C ABI exposes only bounded
+`poll` calls so the embedding application owns scheduling.
 
 ### Responsibilities
 
 1. Watch `metadata.write_position` and the appender's current cycle.
 2. Keep at least `prefetch_runway_bytes` of writable, pre-touched space ahead of
    the appender.
-3. Extend files with `fallocate` before the appender reaches the extension
-   threshold.
+3. Extend files with platform preallocation before the appender reaches the
+   extension threshold.
 4. Map the next appender window and populate writable PTEs using
    `MADV_POPULATE_WRITE` when available or manual write-touch otherwise.
 5. Pre-create, preallocate, map, and touch the next cycle file inside the
    pre-roll window.
 6. Publish a ready window/cycle through a single-producer/single-consumer handoff
    slot. The appender may swap the ready mapping without blocking.
+7. Track registered local tailer positions and prepare read-only future windows
+   using read-ahead hints and optional read-touch.
+8. Bound read prefetch by acquire-loaded published write positions and published
+   cycle headers; never prefetch unwritten future space.
 
 The prefetcher may map and touch future regions, but it must never mutate the
 appender's current mapping or write at/behind the appender's claimed write
 position.
 
 ```zig
-pub const PagePrefetcher = struct {
+pub const Prefetcher = struct {
     queue: *Queue,
     stop: std.atomic.Value(bool) = .init(false),
-    ready_window: SpscHandoff(MappedWindow) = .{},
+    ready_write_window: SpscHandoff(MappedWindow) = .{},
+    ready_read_windows: ReadPrefetchRegistry = .{},
 
-    pub fn run(self: *PagePrefetcher) !void {
+    pub fn poll(self: *Prefetcher, max_work_units: u32) !StepResult {
+        const pos = @atomicLoad(u64, &self.queue.metadata.?.write_position, .acquire);
+        try self.ensureWriteRunway(pos, max_work_units);
+        try self.ensureReadRunways(pos, max_work_units);
+        try self.maybePreroll(self.queue.clockMs(), max_work_units);
+        return self.nextStepResult();
+    }
+
+    pub fn run(self: *Prefetcher) !void {
         while (!self.stop.load(.acquire)) {
-            const pos = @atomicLoad(u64, &self.queue.metadata.?.write_position, .acquire);
-            try self.ensureRunway(pos);
-            try self.maybePreroll(self.queue.clockMs());
+            _ = try self.poll(1024);
             std.time.sleep(50 * std.time.ns_per_us);
         }
     }
@@ -606,13 +628,19 @@ required window as a correctness fallback. That path should increment a
 diagnostic counter such as `prefetch_miss_count` so benchmarks can prove the hot
 path stayed on the intended profile.
 
+For C ABI use, `run()` is not linked or not reachable; only `poll()` is exported.
+Each poll call must be bounded by `max_work_units` or a deadline so an embedding
+event loop cannot be stalled by a large manual page-touch operation.
+
 ---
 
 ## 9. Cleaner Lifecycle
 
-A cleaner thread is useful, but it is not part of message publication. Its job is
-to make the system more predictable by moving resource cleanup, page-cache hints,
-and retention work away from the appender.
+A cleaner is useful, but it is not part of message publication. Its job is to
+make the system more predictable by moving resource cleanup, page-cache hints,
+and retention work away from the appender. Like the prefetcher, it is a pollable
+state machine; native Zig may run it in a helper thread, while C ABI users call
+its bounded poll function from application-owned threads.
 
 ### Responsibilities
 
@@ -636,11 +664,16 @@ pub const Cleaner = struct {
     queue: *Queue,
     pending_unmaps: LockFreeQueue(MappedWindow),
 
+    pub fn poll(self: *Cleaner, max_work_units: u32) !StepResult {
+        self.reapDeferredUnmaps(max_work_units);
+        self.dropColdPageCache(max_work_units);
+        try self.applyRetention(max_work_units);
+        return self.nextStepResult();
+    }
+
     pub fn run(self: *Cleaner) !void {
         while (!self.queue.closing.load(.acquire)) {
-            self.reapDeferredUnmaps();
-            self.dropColdPageCache();
-            try self.applyRetention();
+            _ = try self.poll(1024);
             std.time.sleep(10 * std.time.ns_per_ms);
         }
     }
@@ -653,61 +686,40 @@ pressure are less likely to evict the appender's prepared runway, and slow
 
 ---
 
-## 10. io_uring Setup
+## 10. Pollable Maintenance and Platform Setup
 
-io_uring provides an efficient notification mechanism for writer→reader
-communication. Instead of polling, blocking readers submit an io_uring SQE to
-wait on their own eventfd, and receive a completion when a message may be
-available.
+The queue core does not initialize a kernel notification backend. Instead, it
+initializes:
 
-### Initialization
+1. A `Platform` capability record describing available preallocation,
+   population, read-ahead, page-cache, huge-page, and locking primitives.
+2. A `Prefetcher` state machine for write and read page preparation.
+3. A `Cleaner` state machine for deferred unmap/page-cache/retention work.
 
 ```zig
-fn initIoUring(self: *Queue) !void {
-    // Initialize io_uring context
-    self.uring_ctx = try IoUringContext.init(.{
-        .queue_depth = 64,
-        .flags = 0,
+pub const StepResult = enum(u8) {
+    idle,
+    made_progress,
+    more_work,
+};
+
+fn initMaintenance(self: *Queue) !void {
+    self.platform = Platform.detect();
+    self.prefetcher = try Prefetcher.init(self, .{
+        .write_runway_bytes = self.prefetch_runway_bytes,
+        .read_runway_bytes = self.read_prefetch_runway_bytes,
+    });
+    self.cleaner = try Cleaner.init(self, .{
+        .retention_cycles = self.retention_cycles,
     });
 }
 ```
 
-### How it works
-
-| Actor | Operation |
-|-------|-----------|
-| **Writer** | After publishing a message and `write_position`, optionally writes `1` to each registered waiting tailer's eventfd |
-| **Reader** | Creates a per-tailer eventfd, registers as waiting, submits an io_uring `POLL_ADD` SQE, then polls after wakeup |
-
-This avoids busy-spinning in readers when no messages are available. The
-eventfd write is an explicit latency tradeoff on the appender: use it for
-blocking readers, batch it for throughput, or disable it for the minimum-latency
-polling profile.
-
-### IoUringContext struct
-
-```zig
-pub const IoUringContext = struct {
-    ring: std.os.linux.IoUring,
-
-    pub fn init(opts: struct {
-        queue_depth: u13 = 64,
-        flags: u32 = 0,
-    }) !IoUringContext {
-        const ring = try std.os.linux.IoUring.init(opts.queue_depth, opts.flags);
-        return .{ .ring = ring };
-    }
-
-    pub fn deinit(self: *IoUringContext) void {
-        self.ring.deinit();
-    }
-
-    pub fn submitPollEventfd(self: *IoUringContext, efd: posix.fd_t) !void {
-        _ = try self.ring.poll_add(0, efd, std.os.linux.POLL.IN);
-        _ = try self.ring.submit();
-    }
-};
-```
+Native Zig may call `startHelperThreads()` after initialization when
+`spawn_helper_threads` is true. The C ABI build/path must force
+`spawn_helper_threads = false` and export only bounded polling functions. This is
+preferably enforced structurally: `Prefetcher.poll()` and `Cleaner.poll()` are the
+core implementation, while thread spawning is a Zig-only wrapper.
 
 ---
 
@@ -817,9 +829,9 @@ pub fn setUseHugePages(self: *Self, enabled: bool) void {
 }
 ```
 
-When enabled, mmap calls include `MAP_HUGETLB` for 2 MiB huge pages. Falls
-back to 4 KiB pages if the kernel can't satisfy the request. Requires the
-blocksize to be 2 MiB-aligned.
+When enabled on Linux, mmap calls include `MAP_HUGETLB` for 2 MiB huge pages.
+Falls back to regular pages if the kernel can't satisfy the request. Requires
+the blocksize to be 2 MiB-aligned. This option is ignored on macOS.
 
 ### setPrefetcher (NEW)
 
@@ -833,6 +845,30 @@ pub fn setPrefetcher(self: *Self, enabled: bool, runway_bytes: u64) void {
 The prefetcher should be enabled for the minimum-jitter profile. `runway_bytes`
 must be large enough to cover the worst expected burst while the prefetcher is
 scheduled out; 8-64 MiB is a reasonable starting range depending on throughput.
+
+### setReadPrefetcher (NEW)
+
+```zig
+pub fn setReadPrefetcher(self: *Self, runway_bytes: u64) void {
+    self.read_prefetch_runway_bytes = runway_bytes;
+}
+```
+
+Read prefetch is bounded by published data and should be budgeted for fan-out
+workloads. A value of `0` disables read-touching but still allows normal tailer
+mapping and `MADV_SEQUENTIAL` hints.
+
+### setHelperThreads (NEW)
+
+```zig
+pub fn setHelperThreads(self: *Self, enabled: bool) void {
+    self.spawn_helper_threads = enabled;
+}
+```
+
+Native Zig can enable helper threads for convenience. The C ABI path must force
+this to `false`; embedding applications drive `prefetcher.poll()` and
+`cleaner.poll()` themselves.
 
 ### setCleaner (NEW)
 
@@ -876,16 +912,18 @@ pub fn deinit(self: *Self) void {
         self.appender = null;
     }
 
-    // 3. Cancel pending io_uring operations and tear down ring
-    if (self.uring_ctx) |*ctx| {
-        ctx.deinit();
-        self.uring_ctx = null;
+    // 3. Stop native helper threads if they were started, then deinit helper state
+    self.stopHelperThreads();
+    if (self.prefetcher) |*prefetcher| {
+        prefetcher.deinit();
+        self.prefetcher = null;
+    }
+    if (self.cleaner) |*cleaner| {
+        cleaner.deinit();
+        self.cleaner = null;
     }
 
-    // 4. Assert waiter registry is empty; tailers own/close their eventfds
-    std.debug.assert(self.waiting_tailers.isEmpty());
-
-    // 5. Unmap and close pre-roll fd/mmap if present
+    // 4. Unmap and close pre-roll fd/mmap if present
     if (self.preroll_mmap) |buf| {
         unmapFile(buf) catch {};
         self.preroll_mmap = null;
@@ -896,7 +934,7 @@ pub fn deinit(self: *Self) void {
     }
     self.preroll_cycle = null;
 
-    // 6. Unmap and close metadata
+    // 5. Unmap and close metadata
     if (self.metadata_mmap) |buf| {
         unmapFile(buf) catch {};
         self.metadata_mmap = null;
@@ -907,13 +945,13 @@ pub fn deinit(self: *Self) void {
         self.metadata_fd = null;
     }
 
-    // 7. Free all allocated queue file path strings
+    // 6. Free all allocated queue file path strings
     for (self.queuefile_paths.items) |p| {
         self.allocator.free(p);
     }
     self.queuefile_paths.deinit();
 
-    // 8. Free dirname if owned
+    // 7. Free dirname if owned
     self.allocator.free(self.dirname);
 }
 ```
@@ -924,10 +962,9 @@ pub fn deinit(self: *Self) void {
 |------|----------------|
 | Tailers first | Tailers hold read-only mappings into data files; close before files |
 | Appender second | Appender may hold write mappings; must flush before closing |
-| io_uring third | Cancel in-flight SQEs before closing the fds they reference |
-| Waiter registry fourth | Tailers own eventfds; registry must be empty after tailers close |
-| Pre-roll fifth | Independent fd/mmap, safe to close after appender |
-| Metadata sixth | Other components may reference metadata pointer; close last |
+| Helpers third | Prefetcher/cleaner may hold mappings or fds; stop them before closing shared resources |
+| Pre-roll fourth | Independent fd/mmap, safe to close after appender/helpers |
+| Metadata fifth | Other components may reference metadata pointer; close last |
 | Strings last | Path strings may be referenced by error messages during teardown |
 
 ---
@@ -964,14 +1001,10 @@ pub const QueueError = error{
     MunmapFailed,
     MsyncFailed,
 
-    // fallocate errors
-    FallocateFailed,
+    // Preallocation/platform errors
+    PreallocateFailed,
+    PlatformCapabilityUnavailable,
     DiskFull,
-
-    // io_uring errors
-    IoUringInitFailed,
-    IoUringSubmitFailed,
-    EventfdCreateFailed,
 
     // Pre-roll errors
     PrerollFailed,
@@ -1048,7 +1081,7 @@ test "metadata read-back via pointer cast" {
     try testing.expectEqual(@as(u32, 256), q.metadata.?.index_spacing);
 }
 
-test "queue file creation with fallocate" {
+test "queue file creation with platform preallocation" {
     const tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 

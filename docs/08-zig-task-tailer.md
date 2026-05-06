@@ -6,7 +6,7 @@
 2. [Tailer Struct](#2-tailer-struct)
 3. [Thread Safety Model](#3-thread-safety-model)
 4. [The Hot Path: `poll()`](#4-the-hot-path-poll)
-5. [io_uring Wakeup — `collect()`](#5-io_uring-wakeup--collect)
+5. [Waiting and Read Prefetch](#5-waiting-and-read-prefetch)
 6. [Index-Based Seeking](#6-index-based-seeking)
 7. [Collect Mode (Blocking Iterator)](#7-collect-mode-blocking-iterator)
 8. [Modcount Protocol](#8-modcount-protocol)
@@ -26,14 +26,14 @@ read-only by tailers with memory ordering handled by acquire loads.
 The design supports two consumption patterns:
 
 - **Polling (non-blocking)** — call `poll()` which returns immediately with a message or `null`.
-- **Blocking (io_uring)** — call `collect()` which uses io_uring with eventfd to wait for the next message with near-zero wakeup latency and zero CPU usage while idle.
+- **Application-owned waiting** — callers that need blocking behavior wrap `poll()` with their own spin/yield/sleep or OS/runtime notification policy.
 
 Key design principles:
 
 - **Zero syscalls on the hot path** — steady-state reads are pure mmap pointer arithmetic.
 - **Zero allocations on the hot path** — all buffers are pre-mapped; payloads are zero-copy slices into the mmap window.
 - **Acquire loads only** — on x86 (TSO), acquire loads compile to plain MOV instructions. No fence instructions are ever emitted.
-- **Pre-mapped windows** — when the read tip crosses 50% of the current mmap window, the next window is pre-mapped to avoid stalls at block boundaries.
+- **Pre-mapped/read-prefetched windows** — when the read tip crosses the configured runway, the next published window is pre-mapped and read-prefetched to avoid stalls at block boundaries.
 - **O(log n) seeking** — the flat inline index supports binary search for fast resume from a saved position.
 
 ---
@@ -67,8 +67,8 @@ pub const Tailer = struct {
     next_mmapoff: u64 = 0,
     next_mmapsz: u64 = 0,
 
-    // io_uring wakeup
-    uring_registered: bool = false,
+    // Read prefetch state
+    read_prefetch: ReadPrefetchState = .{},
 };
 ```
 
@@ -92,7 +92,7 @@ pub const Tailer = struct {
 | `next_buf` | Pointer to the pre-mapped next window (or `null` if not yet mapped) |
 | `next_mmapoff` | File offset where the pre-mapped next window starts |
 | `next_mmapsz` | Size of the pre-mapped next window |
-| `uring_registered` | Whether this tailer has registered its eventfd with io_uring |
+| `read_prefetch` | Tracks the next published range to pre-map, advise, and optionally read-touch |
 
 ---
 
@@ -162,8 +162,8 @@ if (cycle != self.qf_cycle_open) {
 Three cases, in order of likelihood:
 
 1. **Tip is within current window** — continue (no syscall). This is the common case.
-2. **Pre-mapped window covers the tip** — swap windows (pointer swap, unmap old). One `munmap` syscall, but the new mapping is already live.
-3. **Neither covers the tip** — full remap: `munmap` + `mmap` + `madvise(MADV_SEQUENTIAL)`.
+2. **Read-prefetched window covers the tip** — swap windows (pointer swap, defer old unmap). The new mapping has already received read-ahead hints and optional read-touch.
+3. **Neither covers the tip** — full remap: `munmap` + `mmap` + read-ahead hints. This is a read-prefetch miss.
 
 ```zig
 if (self.tipInWindow()) {
@@ -229,14 +229,15 @@ memcpy. The comptime codec's `parse` function returns a value that may reference
 slice — the caller must consume or copy the data before the next `poll()` call (which
 may remap the window).
 
-### Step 7: Pre-map Next Window Check
+### Step 7: Read-Prefetch Next Window Check
 
-When the tip crosses 50% of the current window, pre-map the next block so that the
-transition is a cheap pointer swap rather than a blocking `mmap` call:
+When the tip crosses the configured read-prefetch runway, request preparation of
+the next published block so that the transition is a cheap pointer swap rather
+than a blocking `mmap` plus page faults:
 
 ```zig
 if (shouldPremap(self.qf_tip - self.qf_mmapoff, self.qf_mmapsz)) {
-    self.premapNextWindow();
+    self.prefetchReadWindow();
 }
 ```
 
@@ -246,9 +247,11 @@ fn shouldPremap(offset_in_window: u64, window_size: u64) bool {
 }
 ```
 
-The pre-mapped window uses `mmap` + `madvise(MADV_SEQUENTIAL)` on the next aligned
-block. When Step 3 later detects that the tip has moved past the current window, it
-swaps to the pre-mapped window in O(1) and unmaps the old one.
+The read-prefetched window uses `mmap` + platform read-ahead hints on the next
+aligned block. It is bounded by an acquire load of `metadata.write_position` and
+published cycle headers; it must never read into fallocated-but-unwritten space.
+When Step 3 later detects that the tip has moved past the current window, it
+swaps to the pre-mapped window in O(1) and defers old-window unmap to the cleaner.
 
 ### Step 8: Advance Tip
 
@@ -267,34 +270,18 @@ fn pad4(sz: u32) u32 {
 
 ---
 
-## 5. io_uring Wakeup — `collect()`
+## 5. Waiting and Read Prefetch
 
-The blocking read API can use io_uring with eventfd to wait efficiently for new data.
-Each blocking tailer owns its own eventfd. When a tailer enters `collect()`, it registers
-itself in the queue's waiter registry; after publishing data, the appender signals only
-registered waiters. This avoids relying on a single shared eventfd, which would not provide
-reliable broadcast semantics for multiple tailers.
+The core tailer API is non-blocking. `poll()` returns `null` when no data is
+currently available. This is deliberate: the queue data path is memory mapped, so
+kernel I/O submission does not improve steady-state read latency, and appender
+notification syscalls would add jitter to the writer.
 
 ```zig
-pub fn collect(self: *Tailer) !Entry {
-    // 1. Try polling first (non-blocking fast path)
-    if (try self.poll()) |entry| return entry;
-
-    // 2. No data available — wait on io_uring
+pub fn collect(self: *Tailer, backoff: BackoffPolicy) !Entry {
     while (true) {
-        // Register as parked, then submit a read on this tailer's eventfd
-        try self.queue.waiting_tailers.register(self);
-        defer self.queue.waiting_tailers.unregister(self);
-        var sqe = try self.queue.uring_ctx.?.getSubmitEntry();
-        sqe.prepareRead(self.wakeup_eventfd.?, ...);
-        try self.queue.uring_ctx.?.submit();
-
-        // Wait for completion (blocks in kernel, zero CPU usage)
-        const cqe = try self.queue.uring_ctx.?.waitCompletion();
-
-        // 3. Woken up — try polling again
         if (try self.poll()) |entry| return entry;
-        // If still no data (spurious wakeup), loop back
+        backoff.wait();
     }
 }
 ```
@@ -303,30 +290,41 @@ pub fn collect(self: *Tailer) !Entry {
 
 | Scenario | Behavior |
 |---|---|
-| Data already available | Same as `poll()` — no io_uring overhead at all |
-| Waiting for data | Low wakeup latency, with one appender syscall per waiting tailer unless batched |
-| CPU usage while waiting | Zero (thread is blocked in kernel on `io_uring_enter`) |
+| Data already available | `poll()` returns it with no waiting overhead |
+| No data available | `poll()` returns `null`; caller controls spin/yield/sleep/notifier |
+| Blocking convenience | Optional Zig `collect()` is just a `poll()` loop with caller-selected backoff |
 
-### Why io_uring Instead of Spin-Loop
+### Why no core kernel wakeup
 
-Traditional queue implementations use a spin-loop with progressive sleep backoff
-(`usleep(1)` → `usleep(10)` → `usleep(100)` → ...). This trades latency for CPU:
+The queue avoids a built-in kernel wakeup path for three reasons:
 
-- Tight spin burns 100% CPU on one core.
-- Progressive backoff adds milliseconds of latency in the worst case.
+- The mmap read path does not submit I/O, so kernel async I/O APIs do not improve
+  steady-state `poll()` latency.
+- Cross-platform support is simpler: Linux and macOS both support mmap and
+  polling, while notification mechanisms differ.
+- Any writer-to-reader wakeup syscall paid by the appender is a latency tradeoff
+  that some deployments explicitly do not want.
 
-With io_uring + per-tailer eventfd:
+Applications can still layer their own waiting strategy around `poll()`, such as
+short spinning, `std.Thread.yield`, timers, condition variables within one
+process, or application-owned `epoll`/`kqueue` integration.
 
-- **Zero CPU** while waiting — the thread is fully parked in the kernel.
-- **Low wakeup latency** — eventfd write completes an io_uring CQE quickly.
-- **Explicit tradeoff** — blocking readers save CPU but add appender notification syscalls. For minimum append latency, use polling readers or batched signaling.
+### Read-prefetch poll
 
-### Spurious and Coalesced Wakeups
+Tailer read prefetch may be driven by the queue prefetcher or by a per-tailer
+poll call:
 
-Eventfd counters coalesce writes. A wakeup means "poll the queue again", not "exactly one
-message is available". `collect()` must always loop through `poll()` after wakeup and must
-tolerate spurious wakeups, stale registrations, and batched signals. If `poll()` still finds
-no data, the tailer re-registers and waits again.
+```zig
+pub fn prefetchPoll(self: *Tailer, max_work_units: u32) !StepResult {
+    const published = @atomicLoad(u64, &self.queue.metadata.?.write_position, .acquire);
+    const target = self.computeReadPrefetchTarget(published);
+    return try self.prepareReadWindow(target, max_work_units);
+}
+```
+
+The prefetch range is clamped to published bytes, and repeated requests from
+many tailers should be coalesced or budgeted so a fan-out workload does not issue
+duplicate read-ahead/touch work for the same pages.
 
 ---
 
@@ -430,7 +428,7 @@ queue reads with other operations.
 
 ```zig
 while (true) {
-    const entry = try tailer.collect(); // blocks via io_uring until data is available
+    const entry = try tailer.collect(.low_latency_spin_then_sleep);
     processMessage(entry.message, entry.index);
 }
 ```
@@ -478,7 +476,7 @@ if the writer rolled to a new cycle file.
 | Pre-map check | Single comparison |
 | **Total syscalls (steady state)** | **0** |
 | **Total allocations (steady state)** | **0** |
-| **io_uring wait (when idle)** | 1 syscall (blocks in kernel) |
+| **Idle wait** | Outside core; depends on caller's backoff/notifier |
 
 ### When Syscalls Occur
 
@@ -490,7 +488,7 @@ Syscalls are **not** on the hot path. They occur only during infrequent transiti
 | mmap window remap | `munmap`, `mmap`, `madvise` |
 | Pre-map window creation | `mmap`, `madvise` |
 | Pre-map window swap | `munmap` (old window only) |
-| io_uring wait (idle) | `io_uring_enter` |
+| Caller-owned blocking wait | `sleep`, condvar, epoll/kqueue, runtime scheduler, etc. |
 
 In a typical workload where messages arrive faster than the consumer processes them,
 the tailer runs entirely in userspace with zero syscalls per message.
@@ -507,7 +505,7 @@ Errors are propagated via Zig's error union mechanism. The tailer distinguishes 
 |---|---|
 | `poll()` returns `null` | No data available — caller decides whether to retry or wait |
 | `.busy` state | Writer is mid-write — caller should retry shortly |
-| Spurious io_uring wakeup | `collect()` loops internally and retries |
+| Spurious external wakeup | Caller or `collect()` loop retries `poll()` |
 
 ### Fatal Errors
 
@@ -516,7 +514,7 @@ Errors are propagated via Zig's error union mechanism. The tailer distinguishes 
 | `error.MmapFailed` | `mmap` returned `MAP_FAILED` — out of address space or bad fd |
 | `error.OpenFailed` | Could not open `.brz` cycle file — missing or permissions |
 | `error.ParseFailed` | Codec could not parse payload — data corruption or version mismatch |
-| `error.UringSubmitFailed` | io_uring submission failed — kernel resource exhaustion |
+| `error.PrefetchFailed` | Read prefetch/advice failed unexpectedly |
 
 Fatal errors bubble up to the caller. The tailer does not attempt automatic recovery
 from fatal errors — the caller is responsible for deciding whether to retry, skip, or
@@ -529,7 +527,7 @@ When a tailer encounters a fatal error or is explicitly closed:
 1. Unmap current window (`qf_buf`)
 2. Unmap pre-mapped window (`next_buf`) if present
 3. Close file descriptor (`qf_fd`)
-4. Deregister from io_uring if registered
+4. Unregister from queue read-prefetch bookkeeping if registered
 
 ---
 
@@ -547,11 +545,11 @@ When a tailer encounters a fatal error or is explicitly closed:
 - **Multi-reader concurrent access** — spawn multiple tailer threads reading the same queue, verify each sees all entries in order with no corruption.
 - **Writer-reader interleaving** — writer and reader running concurrently, verify acquire/release ordering guarantees are upheld.
 
-### io_uring Tests
+### Waiting and Read-Prefetch Tests
 
-- **Wakeup latency** — measure time from writer publish to tailer `collect()` return. Target: < 10 μs p99.
-- **Spurious wakeup handling** — verify `collect()` correctly retries on spurious eventfd signals.
-- **Multiple waiters** — multiple tailers blocked on `collect()`, verify all wake up when writer publishes.
+- **Backoff collect** — verify optional Zig `collect()` returns when data arrives and does not change queue correctness.
+- **Read-prefetch bounds** — verify prefetch never reads beyond acquire-loaded published write position.
+- **Multi-tailer coalescing/budgets** — verify overlapping read-prefetch work is bounded.
 
 ### Seeking Tests
 

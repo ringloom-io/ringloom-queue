@@ -5,8 +5,9 @@
 This document specifies the core types, constants, and foundational data structures
 for **brz-queue** — a clean-room, high-performance, lock-free, memory-mapped IPC queue
 in Zig. It covers the 4-byte header protocol, tailer state machine, fixed-layout
-`extern struct` file headers, flat inline index, io_uring integration, roll scheme
-table, and the primary structs (`Queue`, `Tailer`, `IoUringContext`).
+`extern struct` file headers, flat inline index, roll scheme table, platform
+capabilities, pollable helper state machines, and the primary structs (`Queue`,
+`Tailer`, `Prefetcher`, `Cleaner`).
 
 All designs follow idiomatic Zig patterns: error unions, optional types, slices,
 explicit allocator passing, and comptime generics. No wire protocol (BinaryWire) is
@@ -20,7 +21,8 @@ mmap'd memory with zero parsing overhead.
 - Tiered CAS backoff: spin → yield → exponential sleep (capped at 1 ms).
 - Zero allocations on the hot path.
 - File extensions: `.brz` for data files, `metadata.brz` for shared metadata.
-- Pre-roll file creation with `fallocate` for pre-allocation.
+- Pre-roll file creation with platform preallocation.
+- Non-blocking tailer polling in the core; applications own blocking/wakeup policy.
 
 ---
 
@@ -167,11 +169,10 @@ pub const TailerState = enum(u8) {
 };
 ```
 
-> **io_uring integration note:** When a tailer is in `awaiting_entry` state and
-> io_uring is enabled, the tailer registers an `IORING_OP_POLL_ADD` on its eventfd
-> rather than busy-spinning. The `IoUringContext` (see section 13) manages this
-> wakeup mechanism. When the appender writes a new entry, it signals the eventfd,
-> causing all waiting tailers to wake and re-poll.
+> **Polling note:** When a tailer is in `awaiting_entry`, `poll()` returns
+> immediately. The caller decides whether to spin, yield, sleep, or use an
+> application-owned notifier before polling again. The queue core does not own a
+> kernel wakeup mechanism.
 
 ### Parse Queue Block State
 
@@ -904,10 +905,10 @@ const TailerState = @import("tailer.zig").TailerState;
 const RollScheme = @import("roll.zig").RollScheme;
 const SharedMetadata = @import("metadata.zig").SharedMetadata;
 const QueueFileHeader = @import("metadata.zig").QueueFileHeader;
-const IoUringContext = @import("uring.zig").IoUringContext;
 const Appender = @import("appender.zig").Appender;
-const PagePrefetcher = @import("prefetcher.zig").PagePrefetcher;
+const Prefetcher = @import("prefetcher.zig").Prefetcher;
 const Cleaner = @import("cleaner.zig").Cleaner;
+const Platform = @import("platform.zig").Platform;
 
 pub const Queue = struct {
     allocator: Allocator,
@@ -963,12 +964,11 @@ pub const Queue = struct {
     /// Memory-mapped buffer for the pre-rolled file (or null).
     preroll_mmap: ?[]align(std.mem.page_size) u8 = null,
 
-    // ── io_uring ────────────────────────────────────────────────────────────
-    /// io_uring context for tailer wakeup notifications.
-    uring_ctx: ?*IoUringContext = null,
-
-    /// Optional background page prefetcher for appender windows.
-    prefetcher: ?*PagePrefetcher = null,
+    // ── Platform and latency helpers ────────────────────────────────────────
+    /// Detected OS capability layer for preallocation, advice, and page touch.
+    platform: Platform = .detect(),
+    /// Optional page prefetcher for appender and tailer windows.
+    prefetcher: ?*Prefetcher = null,
     /// Optional background cleaner for old mappings, page-cache hints, and retention.
     cleaner: ?*Cleaner = null,
 
@@ -1048,7 +1048,7 @@ pub const Queue = struct {
             self.appender = null;
         }
 
-        // Tear down io_uring context
+        // Stop and tear down helper state
         if (self.uring_ctx) |ctx| {
             ctx.deinit();
             self.allocator.destroy(ctx);
@@ -1087,8 +1087,8 @@ pub const Queue = struct {
 | Aspect | Design |
 |--------|--------|
 | Shared metadata | Single `*SharedMetadata` pointer cast from mmap — replaces `DirlistFields` and all `dirlist_*` fields |
-| Pre-roll | `preroll_fd` + `preroll_mmap` for the next-cycle file, created ahead of time via `fallocate` |
-| io_uring | `uring_ctx` field for tailer wakeup — optional, set to null when not using io_uring |
+| Pre-roll | `preroll_fd` + `preroll_mmap` for the next-cycle file, created ahead of time via platform preallocation |
+| Polling | Core readers expose non-blocking `poll()`; blocking/wakeup policy belongs to the application |
 | Writer model | Single writer — appender is NOT thread-safe, no lock needed for append path |
 | Reader model | Multiple readers — each tailer is independently thread-safe, no shared mutable state between tailers |
 | String storage | `[]const u8` slices with `allocator.dupe`/`allocator.free` |
@@ -1109,7 +1109,6 @@ scans through queue files.
 const std = @import("std");
 const posix = std.posix;
 const Queue = @import("queue.zig").Queue;
-const IoUringContext = @import("uring.zig").IoUringContext;
 
 pub const MmapProtection = enum {
     read_only,
@@ -1156,31 +1155,17 @@ pub const Tailer = struct {
     /// Size of the current mmap window.
     qf_mmapsz: u64 = 0,
 
-    // ── io_uring wakeup ─────────────────────────────────────────────────────
-    /// Per-tailer eventfd for io_uring wakeup (or null if polling).
-    wakeup_eventfd: ?posix.fd_t = null,
-    /// Whether this tailer is currently registered for io_uring wakeup.
-    uring_registered: bool = false,
+    // ── Read prefetch ───────────────────────────────────────────────────────
+    /// Next read range to pre-map/advise/touch, bounded by published data.
+    read_prefetch: ReadPrefetchState = .{},
 
     // ── Parent ──────────────────────────────────────────────────────────────
     /// Back-pointer to the owning queue.
     queue: *Queue,
 
-    /// Clean up this tailer's resources (close fd, unmap, deregister io_uring).
+    /// Clean up this tailer's resources (close fd, unmap, unregister prefetch).
     pub fn deinit(self: *Tailer) void {
-        // Deregister from io_uring if active
-        if (self.uring_registered) {
-            if (self.queue.uring_ctx) |ctx| {
-                ctx.deregisterTailer(self);
-            }
-            self.uring_registered = false;
-        }
-
-        // Close wakeup eventfd
-        if (self.wakeup_eventfd) |efd| {
-            posix.close(efd);
-            self.wakeup_eventfd = null;
-        }
+        self.queue.unregisterTailerPrefetch(self);
 
         // Unmap queue file
         if (self.qf_buf) |buf| {
@@ -1229,83 +1214,56 @@ pub const Tailer = struct {
 
 ---
 
-## 12. io_uring Context
+## 12. Platform and Pollable Helper Types
 
-The `IoUringContext` provides low-latency wakeup for tailers using Linux's io_uring
-interface. Instead of busy-spinning or sleeping when waiting for new entries, tailers
-can register for eventfd-based notifications.
+The core queue uses a small platform capability layer and pollable maintenance
+state machines. The platform layer hides Linux/macOS differences; helper state
+machines do bounded work and can either be driven by native Zig helper threads or
+by an embedding application through the C ABI.
 
 ```zig
-// src/brz/uring.zig
+// src/brz/platform.zig
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 
-pub const IoUringContext = struct {
-    /// The io_uring instance.
-    ring: linux.IoUring,
+pub const StepResult = enum(u8) {
+    idle,
+    made_progress,
+    more_work,
+};
 
-    /// Initialize the io_uring context with the given queue depth.
-    pub fn init(queue_depth: u13) !IoUringContext {
-        var ring = try linux.IoUring.init(queue_depth, 0);
-        errdefer ring.deinit();
+pub const Platform = struct {
+    supports_map_populate: bool,
+    supports_madv_populate_write: bool,
+    supports_huge_pages: bool,
+    page_size: usize,
 
-        return .{ .ring = ring };
+    pub fn detect() Platform {
+        return .{
+            .supports_map_populate = builtin.os.tag == .linux,
+            .supports_madv_populate_write = builtin.os.tag == .linux,
+            .supports_huge_pages = builtin.os.tag == .linux,
+            .page_size = std.heap.pageSize(),
+        };
     }
 
-    /// Register a tailer for wakeup via IORING_OP_POLL_ADD on its eventfd.
-    pub fn registerTailer(self: *IoUringContext, tailer: *@import("tailer.zig").Tailer) !void {
-        if (tailer.wakeup_eventfd == null) {
-            tailer.wakeup_eventfd = try posix.eventfd(0, .{ .NONBLOCK = true });
-        }
-        // Submit a poll request on the tailer's eventfd
-        _ = try self.ring.poll_add(
-            @intFromPtr(tailer),  // user_data for completion identification
-            tailer.wakeup_eventfd.?,
-            linux.POLL.IN,
-        );
-        try self.ring.submit();
-        tailer.uring_registered = true;
-    }
-
-    /// Deregister a tailer from io_uring wakeup.
-    pub fn deregisterTailer(self: *IoUringContext, tailer: *@import("tailer.zig").Tailer) void {
-        _ = self;
-        tailer.uring_registered = false;
-    }
-
-    /// Wait for completions (blocking). Returns the number of completions reaped.
-    pub fn waitForCompletions(self: *IoUringContext, timeout_ns: ?u64) !u32 {
-        if (timeout_ns) |ns| {
-            const ts = linux.kernel_timespec{
-                .tv_sec = @intCast(ns / std.time.ns_per_s),
-                .tv_nsec = @intCast(ns % std.time.ns_per_s),
-            };
-            return try self.ring.wait_cqes_timeout(1, &ts);
-        } else {
-            return try self.ring.wait_cqes(1);
-        }
-    }
-
-    /// Clean up the io_uring instance. Tailers own their eventfds.
-    pub fn deinit(self: *IoUringContext) void {
-        self.ring.deinit();
-    }
+    pub fn preallocate(self: Platform, fd: posix.fd_t, offset: u64, len: u64) !void;
+    pub fn adviseReadAhead(self: Platform, fd: posix.fd_t, offset: u64, len: u64) !void;
+    pub fn adviseDontNeed(self: Platform, fd: posix.fd_t, offset: u64, len: u64) !void;
 };
 ```
 
-### Wakeup Flow
+### Helper Poll Flow
 
-1. Tailer enters `awaiting_entry` state.
-2. Tailer calls `uring_ctx.registerTailer(self)` to register for wakeup.
-3. Tailer blocks on `uring_ctx.waitForCompletions(timeout_ns)`.
-4. Appender writes a new entry and writes `1` to each registered waiting tailer's eventfd
-   if notification is enabled.
-5. io_uring completes the poll operation, waking the tailer.
-6. Tailer re-reads the header at `qf_tip` and finds the new entry.
+1. Appender and tailers publish their current positions in process-local helper state.
+2. `Prefetcher.poll(max_work_units)` prepares write and read windows within its budget.
+3. `Cleaner.poll(max_work_units)` reclaims old local mappings and applies retention within its budget.
+4. Native Zig helper threads are thin loops around these poll calls.
+5. C ABI users call the same poll functions from application-owned threads/event loops.
 
-This eliminates busy-spin CPU waste while maintaining sub-microsecond wakeup latency.
+Each poll call returns `StepResult` so the caller can decide whether to call
+again immediately, defer, or sleep.
 
 ---
 
@@ -1325,7 +1283,7 @@ pub const queue_file_extension = ".brz";
 pub const patch_cycles: u32 = 3;
 
 /// Default initial size for new queue files on disk (bytes).
-/// Used with fallocate for pre-allocation.
+/// Used with platform preallocation.
 pub const default_qf_disk_size: u64 = 83_754_496;
 
 /// Default mmap block size (1 MiB). Must be a power of two.
@@ -1361,7 +1319,7 @@ pub const BrzError = error{
     SeekFailed,
     WriteFailed,
     RenameFailed,
-    FallocateFailed,
+    PreallocateFailed,
 
     // ── Queue state ─────────────────────────────────────────────────
     QueueIsNull,
@@ -1394,15 +1352,15 @@ pub const BrzError = error{
     IndexSlotOutOfBounds,
     IndexRegionCorrupted,
 
-    // ── io_uring ────────────────────────────────────────────────────
-    IoUringSetupFailed,
-    IoUringSubmitFailed,
-    IoUringCompletionError,
-    EventfdCreateFailed,
+    // ── Platform / helpers ──────────────────────────────────────────
+    PlatformCapabilityUnavailable,
+    PreallocateFailed,
+    PrefetchFailed,
+    CleanerFailed,
 
     // ── Pre-roll ────────────────────────────────────────────────────
     PrerollCreateFailed,
-    PrerollFallocateFailed,
+    PrerollPreallocateFailed,
 
     // ── Memory ──────────────────────────────────────────────────────
     OutOfMemory,
@@ -1440,7 +1398,9 @@ src/
     ├── codec.zig        — Codec interface, Dispatcher, DefaultRawCodec
     ├── config.zig       — Constants and tuning parameters
     ├── errors.zig       — BrzError error set
-    ├── uring.zig        — IoUringContext for tailer wakeup
+    ├── platform.zig     — Linux/macOS preallocation, advice, page touch
+    ├── prefetcher.zig   — Pollable write/read prefetch state machine
+    ├── cleaner.zig      — Pollable cleanup/retention state machine
     └── root.zig         — pub usingnamespace or re-exports
 ```
 
@@ -1463,6 +1423,8 @@ src/
 | IndexRegion (flat u64 array) | `index.zig` | ☐ |
 | Queue struct | `queue.zig` | ☐ |
 | Tailer struct | `tailer.zig` | ☐ |
-| IoUringContext | `uring.zig` | ☐ |
+| Platform capabilities | `platform.zig` | ☐ |
+| Prefetcher state machine | `prefetcher.zig` | ☐ |
+| Cleaner state machine | `cleaner.zig` | ☐ |
 | Behaviour constants | `config.zig` | ☐ |
 | Error set | `errors.zig` | ☐ |
