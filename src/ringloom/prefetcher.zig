@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const StepResult = @import("platform.zig").StepResult;
+const mmap_ops = @import("mmap_ops.zig");
+const RingloomError = @import("errors.zig").RingloomError;
 
 pub const ReadPrefetchState = struct {
     cycle: u64 = 0,
@@ -15,6 +17,11 @@ pub const ReadPrefetchState = struct {
             .published_limit = offset,
             .active = true,
         };
+    }
+
+    pub fn publishedRange(self: *const ReadPrefetchState) ?struct { start: u64, len: u64 } {
+        if (!self.active or self.published_limit <= self.next_offset) return null;
+        return .{ .start = self.next_offset, .len = self.published_limit - self.next_offset };
     }
 };
 
@@ -49,6 +56,25 @@ pub const Prefetcher = struct {
         _ = max_work_units;
         return .idle;
     }
+
+    pub fn prepareWritableWindow(
+        self: *Prefetcher,
+        buf: []align(std.heap.page_size_min) u8,
+        page_size: usize,
+    ) void {
+        _ = self;
+        mmap_ops.touchWritablePages(buf, page_size);
+    }
+
+    pub fn prepareReadableWindow(
+        self: *Prefetcher,
+        buf: []align(std.heap.page_size_min) u8,
+        page_size: usize,
+    ) RingloomError!void {
+        _ = self;
+        try mmap_ops.adviseSequential(buf);
+        mmap_ops.touchReadablePages(buf, page_size);
+    }
 };
 
 test "prefetch state machines are pollable shells" {
@@ -57,6 +83,10 @@ test "prefetch state machines are pollable shells" {
     try std.testing.expect(read.active);
     try std.testing.expectEqual(@as(u64, 7), read.cycle);
     try std.testing.expectEqual(@as(u64, 128), read.next_offset);
+    read.published_limit = 256;
+    const range = read.publishedRange().?;
+    try std.testing.expectEqual(@as(u64, 128), range.start);
+    try std.testing.expectEqual(@as(u64, 128), range.len);
 
     var prefetcher = Prefetcher.init(std.testing.allocator);
     defer prefetcher.deinit();

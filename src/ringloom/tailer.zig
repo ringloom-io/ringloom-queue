@@ -3,6 +3,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const DispatchAction = @import("codec.zig").DispatchAction;
 const Index = @import("index.zig").Index;
+const mmap_ops = @import("mmap_ops.zig");
 const Queue = @import("queue.zig").Queue;
 const ReadPrefetchState = @import("prefetcher.zig").ReadPrefetchState;
 
@@ -97,7 +98,10 @@ pub const Tailer = struct {
             self.queue.allocator.free(filename);
             self.qf_filename = null;
         }
-        self.qf_buf = null;
+        if (self.qf_buf) |buf| {
+            mmap_ops.unmapFile(buf);
+            self.qf_buf = null;
+        }
         self.qf_fd = null;
         self.queue.allocator.destroy(self);
     }

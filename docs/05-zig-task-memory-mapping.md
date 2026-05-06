@@ -1053,23 +1053,23 @@ src/
 
 | Component | Zig module | Key detail | Status |
 |-----------|------------|------------|--------|
-| `mapFile` / `unmapFile` / `remapFile` | `mmap_ops.zig` | Wraps `std.posix.mmap`/`munmap` | ☐ |
-| Platform populate (appender) | `mmap_ops.zig` | Pre-fault all pages on remap where available | ☐ |
-| Tailer read prefetch | `mmap_ops.zig` / `prefetcher.zig` | Aggressive read-ahead and optional read-touch | ☐ |
-| MAP_HUGETLB support | `mmap_ops.zig` | Linux 2 MiB pages, fallback to regular pages | ☐ |
-| `computeWindow` / `needsRemap` | `window.zig` | 2× blocksize sliding window | ☐ |
-| `shouldPremap` / `PremappedWindow` | `window.zig` | Pre-map at 50% boundary | ☐ |
-| `extendFile` (platform preallocation) | `file_ops.zig` | Real block allocation | ☐ |
-| `cmpxchg32` (monotonic) | `atomic_ops.zig` | CAS for entry header claim | ☐ |
-| `atomicLoad64` / `atomicStore64` | `atomic_ops.zig` | Acquire/release ordering | ☐ |
-| `atomicFetchAdd64` | `atomic_ops.zig` | Modcount bump | ☐ |
-| `casBackoff` (tiered) | `atomic_ops.zig` | Spin → yield → exp sleep | ☐ |
-| `SharedMetadata` (512 B) | `metadata.zig` | mmap + cast, no parsing | ☐ |
-| Queue file mmap (appender) | `queue.zig` | populate/pre-touch + pre-map + preallocation | ☐ |
-| Queue file mmap (tailer) | `queue.zig` | PROT_READ + read-prefetch | ☐ |
-| Huge page fallback | `mmap_ops.zig` | Retry without HUGETLB on failure | ☐ |
-| Error handling | all modules | mmap, preallocation, madvise failures | ☐ |
-| Unit tests (atomics) | `atomic_ops.zig` | CAS correctness, ordering | ☐ |
-| Unit tests (window) | `window.zig` | Geometry, pre-map trigger | ☐ |
-| Integration tests | test harness | page population, preallocation blocks | ☐ |
-| Multi-process tests | test harness | appender lease, CAS primitive, acquire/release | ☐ |
+| `mapFile` / `unmapFile` / `remapFile` | `mmap_ops.zig` | Wraps `std.posix.mmap`/`munmap` | ☑ |
+| Platform populate (appender) | `mmap_ops.zig` / `prefetcher.zig` | Pre-fault all pages on remap where available | ☑ |
+| Tailer read prefetch | `mmap_ops.zig` / `prefetcher.zig` | Aggressive read-ahead and optional read-touch | ☑ |
+| MAP_HUGETLB support | `mmap_ops.zig` | Linux 2 MiB pages, fallback to regular pages | ☑ |
+| `computeWindow` / `needsRemap` | `window.zig` | 2× blocksize sliding window | ☑ |
+| `shouldPremap` / `PremappedWindow` | `window.zig` | Pre-map at 50% boundary | ☑ |
+| `extendFile` (platform preallocation) | `file_ops.zig` / `platform.zig` | Real block allocation | ☑ |
+| `cmpxchg32` (monotonic) | `atomic_ops.zig` | CAS for entry header claim | ☑ |
+| `atomicLoad64` / `atomicStore64` | `atomic_ops.zig` | Acquire/release ordering | ☑ |
+| `atomicFetchAdd64` | `atomic_ops.zig` | Modcount bump | ☑ |
+| `casBackoff` (tiered) | `atomic_ops.zig` | Spin → yield → exp sleep | ☑ |
+| `SharedMetadata` (512 B) | `metadata.zig` / `mmap_ops.zig` | mmap + cast, no parsing | ☑ |
+| Queue file mmap (appender) | `appender.zig` / `window.zig` | populate/pre-touch + pre-map primitives | ☑ |
+| Queue file mmap (tailer) | `tailer.zig` / `mmap_ops.zig` | PROT_READ + read-prefetch primitives | ☑ |
+| Huge page fallback | `mmap_ops.zig` | Retry without HUGETLB on failure | ☑ |
+| Error handling | all modules | mmap, preallocation, madvise failures | ☑ |
+| Unit tests (atomics) | `atomic_ops.zig` | CAS correctness, ordering | ☑ |
+| Unit tests (window) | `window.zig` | Geometry, pre-map trigger | ☑ |
+| Integration tests | test harness | mmap, metadata mapping, file extension | ☑ |
+| Multi-process tests | later test harness | appender lease, CAS primitive, acquire/release | Deferred to Task 10 |

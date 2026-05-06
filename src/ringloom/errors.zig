@@ -5,6 +5,7 @@ pub const RingloomError = error{
     StatFailed,
     MmapFailed,
     MunmapFailed,
+    MadviseFailed,
     SeekFailed,
     WriteFailed,
     RenameFailed,

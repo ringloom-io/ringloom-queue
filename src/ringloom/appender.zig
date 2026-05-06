@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const mmap_ops = @import("mmap_ops.zig");
 const Queue = @import("queue.zig").Queue;
 
 pub const MappedWindow = struct {
@@ -25,8 +26,14 @@ pub const Appender = struct {
     }
 
     pub fn deinit(self: *Appender) void {
-        self.ready_window = null;
-        self.buf = null;
+        if (self.ready_window) |window| {
+            mmap_ops.unmapFile(window.buf);
+            self.ready_window = null;
+        }
+        if (self.buf) |buf| {
+            mmap_ops.unmapFile(buf);
+            self.buf = null;
+        }
         self.fd = null;
     }
 };

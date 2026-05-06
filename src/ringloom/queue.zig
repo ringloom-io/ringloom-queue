@@ -11,6 +11,7 @@ const Prefetcher = @import("prefetcher.zig").Prefetcher;
 const Cleaner = @import("cleaner.zig").Cleaner;
 const Platform = @import("platform.zig").Platform;
 const Tailer = @import("tailer.zig").Tailer;
+const mmap_ops = @import("mmap_ops.zig");
 
 pub const Queue = struct {
     allocator: std.mem.Allocator,
@@ -114,6 +115,16 @@ pub const Queue = struct {
             cleaner.deinit();
             self.allocator.destroy(cleaner);
             self.cleaner = null;
+        }
+
+        if (self.preroll_mmap) |buf| {
+            mmap_ops.unmapFile(buf);
+            self.preroll_mmap = null;
+        }
+        if (self.metadata_mmap) |buf| {
+            mmap_ops.unmapFile(buf);
+            self.metadata_mmap = null;
+            self.metadata = null;
         }
 
         if (self.roll_format) |f| self.allocator.free(f);
