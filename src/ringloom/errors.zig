@@ -12,15 +12,23 @@ pub const RingloomError = error{
     PreallocateFailed,
 
     QueueIsNull,
+    QueueNotFound,
     MetadataMagicMismatch,
     MetadataVersionMismatch,
+    InvalidMagic,
+    InvalidVersion,
+    MetadataCorrupt,
     QueueFileMagicMismatch,
     QueueFileVersionMismatch,
+    InvalidQueueFileHeader,
     CreateNotPermitted,
     CreateRequiresRollScheme,
     CreateRequiresEmptyDir,
 
     RollFormatNotRecognized,
+    UnknownRollScheme,
+    InvalidRollConfig,
+    RollConfigMismatch,
     RollFormatMissing,
     RollLengthMissing,
     RollEpochMissing,
@@ -43,6 +51,10 @@ pub const RingloomError = error{
 
     PrerollCreateFailed,
     PrerollPreallocateFailed,
+    PrerollFailed,
+
+    AppenderAlreadyOpen,
+    AppenderLeaseLost,
 
     OutOfMemory,
 };

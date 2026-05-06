@@ -24,6 +24,7 @@ pub const QueueFileHeader = metadata.QueueFileHeader;
 pub const Index = index.Index;
 pub const IndexRegion = index.IndexRegion;
 pub const RollScheme = roll.RollScheme;
+pub const Version = queue.Version;
 pub const Queue = queue.Queue;
 pub const Tailer = tailer.Tailer;
 pub const TailerState = tailer.TailerState;
@@ -36,6 +37,7 @@ pub const StepResult = platform.StepResult;
 pub const Prefetcher = prefetcher.Prefetcher;
 pub const Cleaner = cleaner.Cleaner;
 pub const RingloomError = errors.RingloomError;
+pub const detectVersion = queue.detectVersion;
 
 pub const cmpxchg32 = atomic_ops.cmpxchg32;
 pub const atomicLoad32 = atomic_ops.atomicLoad32;
