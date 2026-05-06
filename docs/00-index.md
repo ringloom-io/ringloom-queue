@@ -1,8 +1,8 @@
-# brz-queue Documentation
+# ringloom-queue Documentation
 
 ## Overview
 
-This documentation set provides a comprehensive reference for **brz-queue**, a high-performance, lock-free, memory-mapped IPC queue implemented in [Zig](https://ziglang.org/). brz-queue is a **clean-room implementation** — it is not based on or compatible with any existing queue protocol.
+This documentation set provides a comprehensive reference for **ringloom-queue**, a high-performance, lock-free, memory-mapped IPC queue implemented in [Zig](https://ziglang.org/). ringloom-queue is a **clean-room implementation** — it is not based on or compatible with any existing queue protocol.
 
 ### Design Goals
 
@@ -27,7 +27,7 @@ This documentation set provides a comprehensive reference for **brz-queue**, a h
 
 | # | Document | Description |
 |---|----------|-------------|
-| 01 | [Architecture Overview](01-architecture-overview.md) | Comprehensive architecture of brz-queue: fixed-layout on-disk format, CAS write protocol with tiered backoff, acquire/release memory ordering, flat inline index, roll cycle mechanism with pre-roll file creation, portable polling, prefetcher/cleaner helpers, and concurrency model. |
+| 01 | [Architecture Overview](01-architecture-overview.md) | Comprehensive architecture of ringloom-queue: fixed-layout on-disk format, CAS write protocol with tiered backoff, acquire/release memory ordering, flat inline index, roll cycle mechanism with pre-roll file creation, portable polling, prefetcher/cleaner helpers, and concurrency model. |
 
 ### Implementation Tasks
 
@@ -140,7 +140,7 @@ For a fresh implementation, the recommended approach is:
 
 ## Architectural Decisions
 
-The following design choices distinguish brz-queue from traditional shared-memory queue implementations:
+The following design choices distinguish ringloom-queue from traditional shared-memory queue implementations:
 
 1. **Fixed-layout headers over self-describing wire** — Metadata and queue file headers are fixed `extern struct` layouts. Reading them is a pointer cast, not a parse. This eliminates the entire wire protocol module from the critical path.
 
@@ -168,4 +168,4 @@ The following design choices distinguish brz-queue from traditional shared-memor
 
 ---
 
-*brz-queue — zero-allocation, lock-free, memory-mapped IPC for Zig.*
+*ringloom-queue — zero-allocation, lock-free, memory-mapped IPC for Zig.*

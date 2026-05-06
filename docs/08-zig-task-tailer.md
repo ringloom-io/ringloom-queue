@@ -18,7 +18,7 @@
 
 ## 1. Overview
 
-The tailer is the read-side of brz-queue. Multiple tailers can read from the same queue
+The tailer is the read-side of ringloom-queue. Multiple tailers can read from the same queue
 concurrently, each maintaining fully independent state. There is no shared mutable state
 between tailers — the only shared data is the queue's memory-mapped files, accessed
 read-only by tailers with memory ordering handled by acquire loads.
@@ -80,8 +80,8 @@ pub const Tailer = struct {
 | `dispatch_after` | Index threshold — entries at or below this value are skipped (used for resumption) |
 | `state` | Current tailer state (`awaiting_entry`, `busy`, `collected`, etc.) |
 | `mmap_protection` | `PROT.READ` for readers (always read-only for tailers) |
-| `qf_cycle_open` | Cycle number of the currently open `.brz` data file |
-| `qf_filename` | Path to the currently open `.brz` data file |
+| `qf_cycle_open` | Cycle number of the currently open `.ringloom` data file |
+| `qf_filename` | Path to the currently open `.ringloom` data file |
 | `qf_fd` | File descriptor for the current data file |
 | `qf_file_size` | Size of the current data file (from fstat) |
 | `qf_tip` | Byte offset within the data file where the next header is expected |
@@ -145,7 +145,7 @@ Extract the cycle number from the current index. If it differs from the currentl
 cycle:
 
 1. Close the old file (`munmap` current and pre-mapped windows, `close` fd).
-2. Open the new cycle's `.brz` data file.
+2. Open the new cycle's `.ringloom` data file.
 3. `mmap` the first window with `madvise(MADV_SEQUENTIAL)` for kernel read-ahead.
 4. Reset `qf_tip` to the start of the data region (past the file header).
 
@@ -393,7 +393,7 @@ recovery should repair missing index entries so the steady-state bound returns t
 
 ### Index Region Layout
 
-The index region is stored inline at the start of each `.brz` data file, immediately
+The index region is stored inline at the start of each `.ringloom` data file, immediately
 after the file header. Each slot is a `u64` byte offset into the data region:
 
 ```
@@ -441,7 +441,7 @@ is available and wakes up within microseconds when the writer publishes.
 
 ## 8. Modcount Protocol
 
-The modcount is a monotonically increasing counter stored in the shared `metadata.brz`
+The modcount is a monotonically increasing counter stored in the shared `metadata.ringloom`
 file. The writer increments modcount (release store) after publishing each entry. The
 tailer reads modcount (acquire load) to detect new data.
 
@@ -512,7 +512,7 @@ Errors are propagated via Zig's error union mechanism. The tailer distinguishes 
 | Error | Cause |
 |---|---|
 | `error.MmapFailed` | `mmap` returned `MAP_FAILED` — out of address space or bad fd |
-| `error.OpenFailed` | Could not open `.brz` cycle file — missing or permissions |
+| `error.OpenFailed` | Could not open `.ringloom` cycle file — missing or permissions |
 | `error.ParseFailed` | Codec could not parse payload — data corruption or version mismatch |
 | `error.PrefetchFailed` | Read prefetch/advice failed unexpectedly |
 

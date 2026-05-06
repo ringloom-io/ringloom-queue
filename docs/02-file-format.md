@@ -1,8 +1,8 @@
-# brz-queue File Format Specification
+# ringloom-queue File Format Specification
 
-This document provides a byte-level specification of the brz-queue on-disk format. It covers the v1 format and is intended to be sufficient for writing a compatible implementation from scratch.
+This document provides a byte-level specification of the ringloom-queue on-disk format. It covers the v1 format and is intended to be sufficient for writing a compatible implementation from scratch.
 
-brz-queue is a clean-room, high-performance, lock-free, memory-mapped IPC queue written in Zig. All headers are fixed-layout `extern struct` types — just `mmap` and cast. Zero parsing, zero allocations on the hot path.
+ringloom-queue is a clean-room, high-performance, lock-free, memory-mapped IPC queue written in Zig. All headers are fixed-layout `extern struct` types — just `mmap` and cast. Zero parsing, zero allocations on the hot path.
 
 ---
 
@@ -11,8 +11,8 @@ brz-queue is a clean-room, high-performance, lock-free, memory-mapped IPC queue 
 1. [Overview](#overview)
 2. [Terminology](#terminology)
 3. [Queue Directory Layout](#queue-directory-layout)
-4. [Shared Metadata File (`metadata.brz`)](#shared-metadata-file-metadatabrz)
-5. [Queue Data File (`.brz`) Format](#queue-data-file-brz-format)
+4. [Shared Metadata File (`metadata.ringloom`)](#shared-metadata-file-metadataringloom)
+5. [Queue Data File (`.ringloom`) Format](#queue-data-file-ringloom-format)
 6. [Message Framing (4-Byte Header)](#message-framing-4-byte-header)
 7. [Flat Inline Index](#flat-inline-index)
 8. [64-Bit Index Layout](#64-bit-index-layout)
@@ -27,7 +27,7 @@ brz-queue is a clean-room, high-performance, lock-free, memory-mapped IPC queue 
 
 ## Overview
 
-A brz-queue is a persistent, memory-mapped message queue stored entirely within a single filesystem directory. The format is designed so that:
+A ringloom-queue is a persistent, memory-mapped message queue stored entirely within a single filesystem directory. The format is designed so that:
 
 - Multiple threads can read and write concurrently using only `mmap` and atomic CPU instructions
 - No broker or coordinator process is required
@@ -35,8 +35,8 @@ A brz-queue is a persistent, memory-mapped message queue stored entirely within 
 - All structures are fixed-layout `extern struct` types — mmap and cast a pointer, zero parsing
 
 The format consists of:
-1. **One shared metadata file** (`metadata.brz`) — fixed 512-byte struct with roll config and atomic counters
-2. **Zero or more queue data files** (`.brz`) — message storage, one per cycle period
+1. **One shared metadata file** (`metadata.ringloom`) — fixed 512-byte struct with roll config and atomic counters
+2. **Zero or more queue data files** (`.ringloom`) — message storage, one per cycle period
 
 ---
 
@@ -44,8 +44,8 @@ The format consists of:
 
 | Term | Definition |
 |------|-----------|
-| **Queue** | A directory on disk containing `metadata.brz` and `.brz` data files |
-| **Cycle** | A time period (e.g., one day, one hour) corresponding to one `.brz` file |
+| **Queue** | A directory on disk containing `metadata.ringloom` and `.ringloom` data files |
+| **Cycle** | A time period (e.g., one day, one hour) corresponding to one `.ringloom` file |
 | **Seqnum** | The sequential message number within a single cycle/file |
 | **Index** | A 64-bit value combining cycle (upper 32 bits) and seqnum (lower 32 bits) |
 | **Appender** | A thread writing messages to the queue |
@@ -59,37 +59,37 @@ The format consists of:
 
 ```
 queue_directory/
-├── metadata.brz               # Shared metadata (fixed 512-byte struct, mmap'd)
-├── 20240115.brz               # Queue data file for cycle N
-├── 20240116.brz               # Queue data file for cycle N+1
+├── metadata.ringloom               # Shared metadata (fixed 512-byte struct, mmap'd)
+├── 20240115.ringloom               # Queue data file for cycle N
+├── 20240116.ringloom               # Queue data file for cycle N+1
 └── ...
 ```
 
-File extension is `.brz`. Metadata file is `metadata.brz`.
+File extension is `.ringloom`. Metadata file is `metadata.ringloom`.
 
 ### Filename Convention
 
 Queue data filenames are derived from the cycle number using the roll scheme's date format:
 
 ```
-filename = strftime(cycle * roll_length_secs, roll_format) + ".brz"
+filename = strftime(cycle * roll_length_secs, roll_format) + ".ringloom"
 ```
 
 Examples for different schemes:
 
 | Scheme | Cycle 0 Filename | Cycle 1 Filename |
 |--------|-----------------|-----------------|
-| `DAILY` (`yyyyMMdd`) | `19700101.brz` | `19700102.brz` |
-| `FAST_DAILY` (`yyyyMMdd'F'`) | `19700101F.brz` | `19700102F.brz` |
-| `FAST_HOURLY` (`yyyyMMdd-HH'F'`) | `19700101-00F.brz` | `19700101-01F.brz` |
-| `FIVE_MINUTELY` (`yyyyMMdd-HHmm'V'`) | `19700101-0000V.brz` | `19700101-0005V.brz` |
-| `TEST_SECONDLY` (`yyyyMMdd-HHmmss'T'`) | `19700101-000000T.brz` | `19700101-000001T.brz` |
+| `DAILY` (`yyyyMMdd`) | `19700101.ringloom` | `19700102.ringloom` |
+| `FAST_DAILY` (`yyyyMMdd'F'`) | `19700101F.ringloom` | `19700102F.ringloom` |
+| `FAST_HOURLY` (`yyyyMMdd-HH'F'`) | `19700101-00F.ringloom` | `19700101-01F.ringloom` |
+| `FIVE_MINUTELY` (`yyyyMMdd-HHmm'V'`) | `19700101-0000V.ringloom` | `19700101-0005V.ringloom` |
+| `TEST_SECONDLY` (`yyyyMMdd-HHmmss'T'`) | `19700101-000000T.ringloom` | `19700101-000001T.ringloom` |
 
 The time represented is UTC. Cycle 0 corresponds to the Unix epoch (1970-01-01T00:00:00Z) plus the configured epoch offset.
 
 ---
 
-## Shared Metadata File (`metadata.brz`)
+## Shared Metadata File (`metadata.ringloom`)
 
 The shared metadata file is a fixed 512-byte `extern struct` — all fields at known offsets. Processes mmap the file and cast the pointer directly to `*SharedMetadata`. Zero parsing.
 
@@ -138,16 +138,16 @@ pub const SharedMetadata = extern struct {
 
 - The file is exactly 512 bytes — one disk sector — ensuring atomic writeback on most hardware.
 - All atomic fields (`highest_cycle`, `lowest_cycle`, `modcount`, `write_position`, `appender_lock`) are 8-byte aligned for correct atomic access through the shared mapping.
-- The `magic` field must be `0x4D515A42` or the file is corrupt / not a brz-queue metadata file.
+- The `magic` field must be `0x4D515A42` or the file is corrupt / not a ringloom-queue metadata file.
 - The magic constants are chosen so a hex dump of the little-endian file starts with readable ASCII (`42 5A 51 4D` = `BZQM`, `42 5A 51 43` = `BZQC`).
 - `write_position` is updated with release ordering after the final message header is published; tailers read it with acquire ordering to avoid probing beyond committed data.
 - `appender_lock` is a lifecycle lease, not a per-append lock. An appender CASes it from `0` to an owner token when opened and restores `0` on close. No global lock is taken on the hot path.
 
 ---
 
-## Queue Data File (`.brz`) Format
+## Queue Data File (`.ringloom`) Format
 
-Each `.brz` queue data file stores the messages for one cycle. Its structure is:
+Each `.ringloom` queue data file stores the messages for one cycle. Its structure is:
 
 1. **File header** (offset 0, 64 bytes) — fixed `extern struct QueueFileHeader`
 2. **Index region** (offset 64, `index_count × 8` bytes) — flat array of `u64` offsets
@@ -218,7 +218,7 @@ pub const QueueFileHeader = extern struct {
 
 ### Notes
 
-- The `magic` field must be `0x43515A42` or the file is corrupt / not a brz-queue data file.
+- The `magic` field must be `0x43515A42` or the file is corrupt / not a ringloom-queue data file.
 - Roll configuration fields (`roll_length_secs`, `index_spacing`, `index_count`, `epoch_ms`) are duplicated from the shared metadata for self-describing files and integrity checking.
 
 ---
@@ -416,9 +416,9 @@ For a `FAST_DAILY` queue with `epoch_ms = 0`:
 
 | Index (hex) | Cycle | Seqnum | Date | Filename |
 |-------------|-------|--------|------|----------|
-| `0x0000_4A05_0000_0000` | 18,949 | 0 | 2021-11-18 | `20211118F.brz` |
-| `0x0000_4A05_0000_0003` | 18,949 | 3 | 2021-11-18 | `20211118F.brz` |
-| `0x0000_4A06_0000_0000` | 18,950 | 0 | 2021-11-19 | `20211119F.brz` |
+| `0x0000_4A05_0000_0000` | 18,949 | 0 | 2021-11-18 | `20211118F.ringloom` |
+| `0x0000_4A05_0000_0003` | 18,949 | 3 | 2021-11-18 | `20211118F.ringloom` |
+| `0x0000_4A06_0000_0000` | 18,950 | 0 | 2021-11-19 | `20211119F.ringloom` |
 
 ---
 
@@ -501,7 +501,7 @@ Cycle calculation is UTC-only. Local time zones and daylight-saving transitions 
 
 ```
 time_seconds = cycle × roll_length_secs
-filename = dirname + "/" + strftime(time_seconds + epoch_secs, converted_format) + ".brz"
+filename = dirname + "/" + strftime(time_seconds + epoch_secs, converted_format) + ".ringloom"
 ```
 
 ---
@@ -553,7 +553,7 @@ All multi-byte values in the entire format are **little-endian**.
 
 ## Concurrency
 
-brz-queue supports **one active writer thread/process and multiple reader threads/processes** on the same machine.
+ringloom-queue supports **one active writer thread/process and multiple reader threads/processes** on the same machine.
 
 ### Write Path
 
@@ -561,7 +561,7 @@ brz-queue supports **one active writer thread/process and multiple reader thread
 2. Writer copies payload bytes into the region after the header
 3. Writer atomically stores the final header (`DATA | payload_size`) with `.release` ordering
 4. If this message's seqnum is a multiple of `index_spacing`, atomically write the index entry
-5. Writer release-stores the new `write_position` in `metadata.brz`
+5. Writer release-stores the new `write_position` in `metadata.ringloom`
 
 ### Read Path
 
@@ -592,12 +592,12 @@ brz-queue supports **one active writer thread/process and multiple reader thread
 1. The queue directory must exist before the queue is opened
 2. All files within the queue directory are owned by the queue
 3. File I/O must use `mmap` with `MAP_SHARED`; `read()`/`write()` syscalls may see stale data
-4. `metadata.brz` must be exactly 512 bytes
+4. `metadata.ringloom` must be exactly 512 bytes
 5. Queue data files must start with a valid 64-byte `QueueFileHeader`
 
 ### Magic Numbers
 
-1. `metadata.brz` must have magic `0x4D515A42` ("BZQM" bytes) at offset 0
+1. `metadata.ringloom` must have magic `0x4D515A42` ("BZQM" bytes) at offset 0
 2. Queue data files must have magic `0x43515A42` ("BZQC" bytes) at offset 0
 3. Any other value indicates corruption or an incompatible file
 
@@ -634,4 +634,4 @@ brz-queue supports **one active writer thread/process and multiple reader thread
 
 ---
 
-*This specification defines the brz-queue v1 on-disk format. brz-queue is an independent implementation and is NOT compatible with Java Chronicle Queue or any other queue format.*
+*This specification defines the ringloom-queue v1 on-disk format. ringloom-queue is an independent implementation and is NOT compatible with Java Chronicle Queue or any other queue format.*

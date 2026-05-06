@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const brz_queue = @import("brz_queue");
+const ringloom_queue = @import("ringloom_queue");
 
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    try brz_queue.printAnotherMessage(stdout_writer);
+    try ringloom_queue.printAnotherMessage(stdout_writer);
 
     try stdout_writer.flush(); // Don't forget to flush!
 }

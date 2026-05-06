@@ -1,6 +1,6 @@
 # Task 5: Appender (Writer) Implementation
 
-> **brz-queue** — lock-free, memory-mapped IPC queue in Zig
+> **ringloom-queue** — lock-free, memory-mapped IPC queue in Zig
 
 ---
 
@@ -24,7 +24,7 @@
 
 ## 1. Overview
 
-The appender is the write-side of brz-queue. It is a **single active writer** component — only one
+The appender is the write-side of ringloom-queue. It is a **single active writer** component — only one
 thread/process may hold the appender lease for a queue at a time. No lock is taken in the append
 loop; the lifecycle lease prevents accidental concurrent appenders before the hot path starts.
 
@@ -41,8 +41,8 @@ The design prioritizes:
 
 | Artifact | Extension / Name |
 |---|---|
-| Data files | `.brz` (one per cycle) |
-| Shared metadata | `metadata.brz` |
+| Data files | `.ringloom` (one per cycle) |
+| Shared metadata | `metadata.ringloom` |
 
 ---
 
@@ -95,7 +95,7 @@ This is the most performance-critical code in the entire library. Every nanoseco
 2. **Compute total entry size**: `4 + payload + pad4`. The 4-byte header is always present.
    Padding rounds up to the next 4-byte boundary for alignment.
 
-3. **Check modcount** — volatile `u64` read from the mmap'd `metadata.brz` region. If
+3. **Check modcount** — volatile `u64` read from the mmap'd `metadata.ringloom` region. If
    modcount has changed since our last check, refresh cached queue parameters (highest
    cycle, etc.). This is a single memory read — no syscall.
 
@@ -289,7 +289,7 @@ the common case (brief contention) while still backing off gracefully under sust
 
 A cycle roll occurs when the wall-clock time crosses into a new cycle boundary (e.g., a new
 day for `DAILY` roll cycle, a new hour for `HOURLY`). The appender must close the current
-`.brz` data file and start writing to a new one.
+`.ringloom` data file and start writing to a new one.
 
 ### With pre-roll (fast path)
 
@@ -301,7 +301,7 @@ When the pre-roll system has already prepared the next cycle file, the roll is n
 3. **Check pre-roll availability**: `queue.preroll_cycle == current_cycle`.
    - If true: swap the file descriptor and mmap pointers from the pre-roll state into the
      appender's tailer. **Zero syscalls** — just pointer assignments.
-4. **Update `highest_cycle`** in `metadata.brz` — atomic store to the mmap'd metadata region.
+4. **Update `highest_cycle`** in `metadata.ringloom` — atomic store to the mmap'd metadata region.
 5. **Bump `modcount`** — atomic fetch-add on the mmap'd modcount field. This notifies readers
    that queue metadata has changed.
 6. **Reset tip** to the data start offset in the new file.
@@ -339,7 +339,7 @@ fn rollCycle(self: *Appender, current_header_ptr: *volatile u32, new_cycle: u64)
 If the pre-roll system hasn't prepared the next file (e.g., rapid successive rolls, or the
 pre-roll window was missed), the appender must create the file synchronously:
 
-1. Compute the filename: `{cycle_number}.brz`.
+1. Compute the filename: `{cycle_number}.ringloom`.
 2. Create the file with platform preallocation to reserve disk blocks.
 3. `mmap` and pre-touch using the best available platform populate path.
 4. Write the file header.
@@ -385,7 +385,7 @@ over the many thousands of appends that follow.
 ```zig
 fn maybePreroll(queue: *Queue, now_ms: i64) !void {
     const next_cycle = queue.current_cycle + 1;
-    const filename = try queue.cycleFilename(next_cycle); // e.g., "20250615.brz"
+    const filename = try queue.cycleFilename(next_cycle); // e.g., "20250615.ringloom"
 
     // Create and pre-allocate the file
     const fd = try std.posix.open(filename, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
@@ -442,7 +442,7 @@ a bitwise AND when the spacing is a power of two.
 
 ### Index region layout
 
-The index region is a contiguous array of `u64` values at a fixed offset within each `.brz`
+The index region is a contiguous array of `u64` values at a fixed offset within each `.ringloom`
 data file:
 
 ```

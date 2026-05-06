@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-The brz-queue public API is designed as an idiomatic Zig library. It exposes a
+The ringloom-queue public API is designed as an idiomatic Zig library. It exposes a
 single-writer, multiple-reader, memory-mapped IPC queue with the lowest possible
 latency and zero allocations on the hot path.
 
@@ -11,7 +11,7 @@ latency and zero allocations on the hot path.
 | Principle | How it is realised |
 |---|---|
 | Comptime generics | `Queue(MessageType)` / `Tailer(MessageType)` — monomorphised at compile time for zero function-pointer overhead |
-| Zero hot-path allocations | All data lives in mmap'd `.brz` files; the append and poll paths never call an allocator |
+| Zero hot-path allocations | All data lives in mmap'd `.ringloom` files; the append and poll paths never call an allocator |
 | Error unions | Every fallible operation returns `!T`; no error codes, no global error string |
 | No global state | Each `Queue` instance is fully independent |
 | C ABI shim | Opaque handles, stable error codes, borrowed message views, and bounded poll functions for non-Zig clients |
@@ -61,7 +61,7 @@ pub const RollScheme = struct {
     /// strftime-compatible format string for the cycle file name.
     date_format: []const u8,
     /// File extension for cycle files.
-    extension: []const u8 = ".brz",
+    extension: []const u8 = ".ringloom",
 };
 ```
 
@@ -81,10 +81,10 @@ pub const QueueConfig = struct {
     /// On-disk format version.
     version: Version = .v1,
 
-    /// Override the default roll scheme (daily, `.brz` extension).
+    /// Override the default roll scheme (daily, `.ringloom` extension).
     roll_scheme: ?RollScheme = null,
 
-    /// If true, create the directory and `metadata.brz` when they do not exist.
+    /// If true, create the directory and `metadata.ringloom` when they do not exist.
     create: bool = false,
 
     /// Request MAP_HUGETLB for cycle file mappings.
@@ -151,7 +151,7 @@ pub fn Queue(comptime MessageType: type) type {
         /// stored on disk.
         pub fn open(config: QueueConfig, codec: Codec(MessageType)) !Self {
             // 1. Resolve / create directory
-            // 2. Read or write metadata.brz
+            // 2. Read or write metadata.ringloom
             // 3. mmap the current cycle file
             // 4. Initialise platform helper state
             _ = .{ config, codec };
@@ -317,7 +317,7 @@ pub fn Tailer(comptime MessageType: type) type {
 ## 6. Codec Interface and Built-in Codecs
 
 A **codec** bridges the gap between the user's `MessageType` and the raw bytes
-on disk.  brz-queue does **not** use BinaryWire or any self-describing wire
+on disk.  ringloom-queue does **not** use BinaryWire or any self-describing wire
 format — the codec is a simple, user-supplied pair of serialize/deserialize
 functions resolved at comptime.
 
@@ -391,7 +391,7 @@ const Trade = struct {
     quantity: u32,
 };
 
-const trade_codec = brz.Codec(Trade){
+const trade_codec = ringloom.Codec(Trade){
     .parse = struct {
         fn f(buf: []const u8) ?Trade {
             if (buf.len < @sizeOf(Trade)) return null;
@@ -419,13 +419,13 @@ const trade_codec = brz.Codec(Trade){
 
 ```zig
 const std = @import("std");
-const brz = @import("brz-queue");
+const ringloom = @import("ringloom-queue");
 
 pub fn main() !void {
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
         .create = true,
-    }, brz.RawCodec);
+    }, ringloom.RawCodec);
     defer queue.deinit();
 
     const index = try queue.append("hello world");
@@ -437,12 +437,12 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const brz = @import("brz-queue");
+const ringloom = @import("ringloom-queue");
 
 pub fn main() !void {
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
-    }, brz.RawCodec);
+    }, ringloom.RawCodec);
     defer queue.deinit();
 
     var t = try queue.tailer(0);
@@ -460,12 +460,12 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const brz = @import("brz-queue");
+const ringloom = @import("ringloom-queue");
 
 pub fn main() !void {
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = "/tmp/my-queue",
-    }, brz.RawCodec);
+    }, ringloom.RawCodec);
     defer queue.deinit();
 
     var t = try queue.tailer(0);
@@ -482,7 +482,7 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const brz = @import("brz-queue");
+const ringloom = @import("ringloom-queue");
 
 const Trade = struct {
     symbol: [8]u8,
@@ -490,7 +490,7 @@ const Trade = struct {
     quantity: u32,
 };
 
-const trade_codec = brz.Codec(Trade){
+const trade_codec = ringloom.Codec(Trade){
     .parse = struct {
         fn f(buf: []const u8) ?Trade {
             if (buf.len < @sizeOf(Trade)) return null;
@@ -510,7 +510,7 @@ const trade_codec = brz.Codec(Trade){
 };
 
 pub fn main() !void {
-    var queue = try brz.Queue(Trade).open(.{
+    var queue = try ringloom.Queue(Trade).open(.{
         .dir = "/tmp/trades",
         .create = true,
     }, trade_codec);
@@ -533,7 +533,7 @@ pub fn main() !void {
 
 ```zig
 // Persist `last_index` to a file or database between runs.
-const saved_index: brz.Index = 0x4A0500000003;
+const saved_index: ringloom.Index = 0x4A0500000003;
 
 var t = try queue.tailer(saved_index);
 defer t.deinit();
@@ -546,7 +546,7 @@ std.log.info("resumed at [0x{x}] {s}", .{ entry.index, entry.message });
 
 ## 8. Error Handling
 
-brz-queue uses Zig error unions throughout.  Every fallible function returns
+ringloom-queue uses Zig error unions throughout.  Every fallible function returns
 `!T` so errors propagate naturally with `try`.
 
 ### 8.1 Error set
@@ -555,7 +555,7 @@ brz-queue uses Zig error unions throughout.  Every fallible function returns
 pub const QueueError = error{
     /// The queue directory does not exist and `create` was not set.
     DirectoryNotFound,
-    /// metadata.brz is missing or corrupt.
+    /// metadata.ringloom is missing or corrupt.
     MetadataCorrupt,
     /// On-disk version is not supported by this build.
     UnsupportedVersion,
@@ -579,15 +579,15 @@ pub const QueueError = error{
 ### 8.2 Example: handling errors explicitly
 
 ```zig
-const queue = brz.Queue([]const u8).open(.{
+const queue = ringloom.Queue([]const u8).open(.{
     .dir = "/tmp/my-queue",
-}, brz.RawCodec) catch |err| switch (err) {
+}, ringloom.RawCodec) catch |err| switch (err) {
     error.DirectoryNotFound => {
         std.log.err("queue directory does not exist", .{});
         return err;
     },
     error.MetadataCorrupt => {
-        std.log.err("metadata.brz is corrupt — delete and recreate", .{});
+        std.log.err("metadata.ringloom is corrupt — delete and recreate", .{});
         return err;
     },
     else => return err,
@@ -598,13 +598,13 @@ const queue = brz.Queue([]const u8).open(.{
 
 ## 9. Debug Output
 
-brz-queue uses `std.log.scoped` for all diagnostic output.  No `printf`,
+ringloom-queue uses `std.log.scoped` for all diagnostic output.  No `printf`,
 no global debug flags.
 
 ### 9.1 Scoped logger
 
 ```zig
-const log = std.log.scoped(.brz_queue);
+const log = std.log.scoped(.ringloom_queue);
 
 pub fn open(config: QueueConfig, codec: anytype) !Self {
     log.info("opening queue dir={s} version={}", .{ config.dir, @intFromEnum(config.version) });
@@ -642,13 +642,13 @@ pub fn hexDump(writer: anytype, label: []const u8, data: []const u8) !void {
 }
 ```
 
-Users can enable or suppress brz-queue log messages at build time using the
+Users can enable or suppress ringloom-queue log messages at build time using the
 standard Zig log level mechanism:
 
 ```zig
 pub const std_options = .{
     .log_scope_levels = &.{
-        .{ .scope = .brz_queue, .level = .debug },
+        .{ .scope = .ringloom_queue, .level = .debug },
     },
 };
 ```
@@ -681,9 +681,9 @@ Key rules:
 
 | Rule | Contract |
 |---|---|
-| Handles | All objects are opaque pointers (`brz_queue_t`, `brz_tailer_t`, `brz_appender_t`) |
-| Errors | Stable integer `brz_error_t`; never expose Zig error-set ordinals |
-| ABI version | `brz_abi_version()` and struct `size` fields support forward compatibility |
+| Handles | All objects are opaque pointers (`ringloom_queue_t`, `ringloom_tailer_t`, `ringloom_appender_t`) |
+| Errors | Stable integer `ringloom_error_t`; never expose Zig error-set ordinals |
+| ABI version | `ringloom_abi_version()` and struct `size` fields support forward compatibility |
 | Threads | The C ABI must not create library-owned threads; builds should hard-disable spawn paths |
 | Maintenance | The embedder drives prefetcher/pretoucher/cleaner work via bounded poll calls |
 | Message lifetime | Returned message views borrow mmap memory until the next call on the same tailer or tailer close |
@@ -691,45 +691,45 @@ Key rules:
 | Allocator | Use explicit init options for allocator hooks, or the documented default C allocator |
 
 ```c
-typedef struct brz_queue brz_queue_t;
-typedef struct brz_tailer brz_tailer_t;
-typedef struct brz_appender brz_appender_t;
+typedef struct ringloom_queue ringloom_queue_t;
+typedef struct ringloom_tailer ringloom_tailer_t;
+typedef struct ringloom_appender ringloom_appender_t;
 
-typedef enum brz_step_result {
-    BRZ_STEP_IDLE = 0,
-    BRZ_STEP_PROGRESS = 1,
-    BRZ_STEP_MORE_WORK = 2,
-} brz_step_result_t;
+typedef enum ringloom_step_result {
+    RINGLOOM_STEP_IDLE = 0,
+    RINGLOOM_STEP_PROGRESS = 1,
+    RINGLOOM_STEP_MORE_WORK = 2,
+} ringloom_step_result_t;
 
-typedef struct brz_message_view {
-    uint32_t size;       /* sizeof(brz_message_view) */
+typedef struct ringloom_message_view {
+    uint32_t size;       /* sizeof(ringloom_message_view) */
     uint64_t index;
     const void *data;    /* borrowed mmap pointer */
     size_t data_len;
-} brz_message_view_t;
+} ringloom_message_view_t;
 
-uint32_t brz_abi_version(void);
-const char *brz_strerror(int err);
+uint32_t ringloom_abi_version(void);
+const char *ringloom_strerror(int err);
 
-int brz_queue_open(const struct brz_queue_options *opts, brz_queue_t **out);
-void brz_queue_close(brz_queue_t *q);
+int ringloom_queue_open(const struct ringloom_queue_options *opts, ringloom_queue_t **out);
+void ringloom_queue_close(ringloom_queue_t *q);
 
-int brz_appender_open(brz_queue_t *q, brz_appender_t **out);
-int brz_appender_append(brz_appender_t *a, const void *data, size_t len, uint64_t *index_out);
-void brz_appender_close(brz_appender_t *a);
+int ringloom_appender_open(ringloom_queue_t *q, ringloom_appender_t **out);
+int ringloom_appender_append(ringloom_appender_t *a, const void *data, size_t len, uint64_t *index_out);
+void ringloom_appender_close(ringloom_appender_t *a);
 
-int brz_tailer_open(brz_queue_t *q, uint64_t start_index, brz_tailer_t **out);
-int brz_tailer_poll(brz_tailer_t *t, brz_message_view_t *out); /* BRZ_OK_NOT_READY when empty */
-int brz_tailer_prefetch_poll(brz_tailer_t *t, uint32_t max_work_units, brz_step_result_t *out);
-void brz_tailer_close(brz_tailer_t *t);
+int ringloom_tailer_open(ringloom_queue_t *q, uint64_t start_index, ringloom_tailer_t **out);
+int ringloom_tailer_poll(ringloom_tailer_t *t, ringloom_message_view_t *out); /* RINGLOOM_OK_NOT_READY when empty */
+int ringloom_tailer_prefetch_poll(ringloom_tailer_t *t, uint32_t max_work_units, ringloom_step_result_t *out);
+void ringloom_tailer_close(ringloom_tailer_t *t);
 
-int brz_queue_prefetch_poll(brz_queue_t *q, uint32_t max_work_units, brz_step_result_t *out);
-int brz_queue_cleaner_poll(brz_queue_t *q, uint32_t max_work_units, brz_step_result_t *out);
-int brz_queue_maintenance_poll(brz_queue_t *q, uint32_t max_work_units, brz_step_result_t *out);
+int ringloom_queue_prefetch_poll(ringloom_queue_t *q, uint32_t max_work_units, ringloom_step_result_t *out);
+int ringloom_queue_cleaner_poll(ringloom_queue_t *q, uint32_t max_work_units, ringloom_step_result_t *out);
+int ringloom_queue_maintenance_poll(ringloom_queue_t *q, uint32_t max_work_units, ringloom_step_result_t *out);
 ```
 
-The borrowed `brz_message_view.data` pointer is valid until the next
-`brz_tailer_poll`, `brz_tailer_close`, or any other API call that explicitly
+The borrowed `ringloom_message_view.data` pointer is valid until the next
+`ringloom_tailer_poll`, `ringloom_tailer_close`, or any other API call that explicitly
 advances/remaps the same tailer. Queue-level maintenance must not unmap a window
 currently owned by a live local tailer cursor. If an embedding needs longer
 lifetimes, it must copy the bytes before polling that tailer again.
@@ -738,17 +738,17 @@ Example C-style event loop:
 
 ```c
 for (;;) {
-    brz_message_view_t msg = { .size = sizeof(msg) };
-    int rc = brz_tailer_poll(tailer, &msg);
-    if (rc == BRZ_OK) {
+    ringloom_message_view_t msg = { .size = sizeof(msg) };
+    int rc = ringloom_tailer_poll(tailer, &msg);
+    if (rc == RINGLOOM_OK) {
         handle_message(msg.data, msg.data_len);
         continue;
     }
-    if (rc != BRZ_OK_NOT_READY) fail(rc);
+    if (rc != RINGLOOM_OK_NOT_READY) fail(rc);
 
-    brz_step_result_t step;
-    fail_if_error(brz_tailer_prefetch_poll(tailer, 256, &step));
-    fail_if_error(brz_queue_maintenance_poll(queue, 256, &step));
+    ringloom_step_result_t step;
+    fail_if_error(ringloom_tailer_prefetch_poll(tailer, 256, &step));
+    fail_if_error(ringloom_queue_maintenance_poll(queue, 256, &step));
 
     app_sleep_or_wait();
 }
@@ -785,16 +785,16 @@ sequential consistency (`seq_cst`) fences on x86 and ARM.
 
 ## 11. Summary
 
-| Aspect | brz-queue approach |
+| Aspect | ringloom-queue approach |
 |---|---|
 | Language | Zig API plus C ABI shim |
 | Generics | `Queue(comptime MessageType)` — comptime monomorphisation |
 | Codec | User-supplied `Codec(T)` struct; built-in `RawCodec`, `TextCodec` |
 | Writer | Single-threaded `append` / `appendWithTimestamp` |
 | Reader | `Tailer.poll` (non-blocking) or optional Zig `Tailer.collect` backoff loop |
-| File format | `.brz` cycle files, `metadata.brz` |
+| File format | `.ringloom` cycle files, `metadata.ringloom` |
 | Error handling | Zig error unions (`!T`) |
 | Allocations | Zero on hot path; allocator used only during open/close |
-| Logging | `std.log.scoped(.brz_queue)` |
+| Logging | `std.log.scoped(.ringloom_queue)` |
 | Atomics | Acquire/release ordering for writer↔reader synchronisation |
 | Global state | None |

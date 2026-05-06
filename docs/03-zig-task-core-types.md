@@ -3,7 +3,7 @@
 ## Overview
 
 This document specifies the core types, constants, and foundational data structures
-for **brz-queue** — a clean-room, high-performance, lock-free, memory-mapped IPC queue
+for **ringloom-queue** — a clean-room, high-performance, lock-free, memory-mapped IPC queue
 in Zig. It covers the 4-byte header protocol, tailer state machine, fixed-layout
 `extern struct` file headers, flat inline index, roll scheme table, platform
 capabilities, pollable helper state machines, and the primary structs (`Queue`,
@@ -20,7 +20,7 @@ mmap'd memory with zero parsing overhead.
 - Acquire/release atomic ordering (not SeqCst) on all shared fields.
 - Tiered CAS backoff: spin → yield → exponential sleep (capped at 1 ms).
 - Zero allocations on the hot path.
-- File extensions: `.brz` for data files, `metadata.brz` for shared metadata.
+- File extensions: `.ringloom` for data files, `metadata.ringloom` for shared metadata.
 - Pre-roll file creation with platform preallocation.
 - Non-blocking tailer polling in the core; applications own blocking/wakeup policy.
 
@@ -28,7 +28,7 @@ mmap'd memory with zero parsing overhead.
 
 ## 1. Header Constants
 
-The brz-queue protocol uses a 4-byte (32-bit) header word before every entry
+The ringloom-queue protocol uses a 4-byte (32-bit) header word before every entry
 (data or metadata). The top two bits encode the entry type, and the lower 30 bits
 encode a length.
 
@@ -51,9 +51,9 @@ bits [29:0]   bit 30    bit 31    meaning
 ### Zig Implementation
 
 ```zig
-// src/brz/header.zig
+// src/ringloom/header.zig
 
-/// The 4-byte brz-queue header constants.
+/// The 4-byte ringloom-queue header constants.
 /// This struct serves as a namespace — it is never instantiated.
 pub const Header = struct {
     pub const UNALLOCATED: u32 = 0x00000000;
@@ -133,7 +133,7 @@ between these states as they scan the queue.
 ### Zig Implementation
 
 ```zig
-// src/brz/tailer.zig
+// src/ringloom/tailer.zig
 
 /// The state of a tailer after a peek/poll operation.
 pub const TailerState = enum(u8) {
@@ -243,9 +243,9 @@ used — the codec works directly on raw byte slices from the mmap buffer.
 ### Zig Approach: Comptime Interface
 
 ```zig
-// src/brz/codec.zig
+// src/ringloom/codec.zig
 
-/// A Codec defines how to serialize and deserialize messages for brz-queue.
+/// A Codec defines how to serialize and deserialize messages for ringloom-queue.
 /// Implement this interface on your message type.
 ///
 /// Example:
@@ -348,14 +348,14 @@ pub const RuntimeCodec = struct {
 
 ## 5. Roll Scheme Table
 
-brz-queue rolls (rotates) its data files on a schedule. Each roll scheme defines:
+ringloom-queue rolls (rotates) its data files on a schedule. Each roll scheme defines:
 a name, a Java date format string (used for filename generation), a roll period,
 and index parameters.
 
 ### Zig Implementation
 
 ```zig
-// src/brz/roll.zig
+// src/ringloom/roll.zig
 
 pub const RollScheme = struct {
     name: []const u8,
@@ -431,7 +431,7 @@ pub fn findSchemeByFormat(format_str: []const u8) ?RollScheme {
 
 ## 6. Java Date Format → strftime Conversion
 
-brz-queue uses Java `SimpleDateFormat` patterns (e.g. `"yyyyMMdd-HH'F'"`) from
+ringloom-queue uses Java `SimpleDateFormat` patterns (e.g. `"yyyyMMdd-HH'F'"`) from
 the roll scheme table for filename generation. These must be converted to
 `strftime` patterns. Since all format strings are comptime-known constants, the
 conversion can happen entirely at comptime.
@@ -452,7 +452,7 @@ conversion can happen entirely at comptime.
 ### Zig Implementation
 
 ```zig
-// src/brz/roll.zig (continued)
+// src/ringloom/roll.zig (continued)
 
 pub const ConversionError = error{
     UnrecognizedToken,
@@ -579,10 +579,10 @@ pub fn comptimeJavaToStrftime(comptime java_fmt: []const u8) struct {
 
 ### Filename Generation
 
-Generate the `.brz` filename for a given cycle number:
+Generate the `.ringloom` filename for a given cycle number:
 
 ```zig
-/// Generate the .brz filename for a given cycle number.
+/// Generate the .ringloom filename for a given cycle number.
 /// cycle * roll_length_ms / 1000 = seconds since epoch → format with strftime pattern.
 pub fn getCycleFn(
     allocator: std.mem.Allocator,
@@ -612,7 +612,7 @@ pub fn getCycleFn(
         day_secs.getSecondsIntoMinute(),
     );
 
-    return std.fmt.allocPrint(allocator, "{s}/{s}.brz", .{ dirname, date_str });
+    return std.fmt.allocPrint(allocator, "{s}/{s}.ringloom", .{ dirname, date_str });
 }
 ```
 
@@ -653,7 +653,7 @@ Indices are 64-bit values with the cycle in the upper 32 bits and the
 sequence number in the lower 32 bits.
 
 ```zig
-// src/brz/index.zig
+// src/ringloom/index.zig
 
 pub const Index = struct {
     /// Number of bits to shift for the cycle. Always 32.
@@ -693,18 +693,18 @@ pub const Index = struct {
 
 ## 8. Fixed-Layout File Structures
 
-This is a key architectural element of brz-queue. Instead of a wire protocol that
+This is a key architectural element of ringloom-queue. Instead of a wire protocol that
 requires parsing, all file headers are **fixed-layout `extern struct` types** that
 map directly onto mmap'd memory. To read a field, cast the mmap pointer to the
 struct type and access the field — zero parsing, zero allocation.
 
 ### SharedMetadata (512 bytes)
 
-The shared metadata file (`metadata.brz`) is memory-mapped and shared between the
+The shared metadata file (`metadata.ringloom`) is memory-mapped and shared between the
 writer and all readers. Atomic fields are accessed with acquire/release ordering.
 
 ```zig
-// src/brz/metadata.zig
+// src/ringloom/metadata.zig
 
 pub const SharedMetadata = extern struct {
     /// Magic number: "BZQM" bytes as a little-endian u32 (0x4D515A42).
@@ -759,11 +759,11 @@ _ = @atomicRmw(u64, &metadata.modcount, .Add, 1, .release);
 
 ### QueueFileHeader (64 bytes)
 
-Each `.brz` data file starts with a 64-byte fixed header, followed by the index
+Each `.ringloom` data file starts with a 64-byte fixed header, followed by the index
 region, followed by the data region.
 
 ```zig
-// src/brz/metadata.zig (continued)
+// src/ringloom/metadata.zig (continued)
 
 pub const QueueFileHeader = extern struct {
     /// Magic number: "BZQC" bytes as a little-endian u32 (0x43515A42).
@@ -821,7 +821,7 @@ to a sequence number range and stores the byte offset of the corresponding entry
 in the data region.
 
 ```zig
-// src/brz/index.zig (continued)
+// src/ringloom/index.zig (continued)
 
 pub const IndexRegion = struct {
     /// Pointer to the base of the index array in the mmap'd file.
@@ -887,12 +887,12 @@ pub const IndexRegion = struct {
 
 ## 10. Queue Struct
 
-The `Queue` struct is the central handle for a brz-queue instance.
+The `Queue` struct is the central handle for a ringloom-queue instance.
 
 ### Zig Implementation
 
 ```zig
-// src/brz/queue.zig
+// src/ringloom/queue.zig
 
 const std = @import("std");
 const posix = std.posix;
@@ -924,9 +924,9 @@ pub const Queue = struct {
     create: bool = false,
 
     // ── Shared Metadata (replaces dirlist_* fields) ─────────────────────────
-    /// File descriptor for metadata.brz.
+    /// File descriptor for metadata.ringloom.
     metadata_fd: ?posix.fd_t = null,
-    /// Memory-mapped region for metadata.brz (512 bytes).
+    /// Memory-mapped region for metadata.ringloom (512 bytes).
     metadata_mmap: ?[]align(std.mem.page_size) u8 = null,
     /// Typed pointer into the mmap — cast of metadata_mmap. Zero-cost access.
     metadata: ?*SharedMetadata = null,
@@ -1104,7 +1104,7 @@ scans through queue files.
 ### Zig Implementation
 
 ```zig
-// src/brz/tailer.zig (continued)
+// src/ringloom/tailer.zig (continued)
 
 const std = @import("std");
 const posix = std.posix;
@@ -1222,7 +1222,7 @@ machines do bounded work and can either be driven by native Zig helper threads o
 by an embedding application through the C ABI.
 
 ```zig
-// src/brz/platform.zig
+// src/ringloom/platform.zig
 
 const std = @import("std");
 const posix = std.posix;
@@ -1270,13 +1270,13 @@ again immediately, defer, or sleep.
 ## 13. Behaviour Constants and Defaults
 
 ```zig
-// src/brz/config.zig
+// src/ringloom/config.zig
 
 /// Shared metadata filename (replaces the old directory listing file).
-pub const metadata_filename = "metadata.brz";
+pub const metadata_filename = "metadata.ringloom";
 
 /// Queue data file extension.
-pub const queue_file_extension = ".brz";
+pub const queue_file_extension = ".ringloom";
 
 /// Number of cycles to look back when patching missing EOF markers.
 /// An appender starts seeking from (highest_cycle - patch_cycles).
@@ -1306,9 +1306,9 @@ pub const max_cas_backoff_ns: u64 = 1_000_000; // 1 ms
 ## 14. Error Set
 
 ```zig
-// src/brz/errors.zig
+// src/ringloom/errors.zig
 
-pub const BrzError = error{
+pub const RingloomError = error{
     // ── File I/O ────────────────────────────────────────────────────
     DirStatFailed,
     NotADirectory,
@@ -1370,8 +1370,8 @@ pub const BrzError = error{
 ### Usage Pattern
 
 ```zig
-pub fn open(self: *Queue) BrzError!void {
-    const stat = std.posix.fstat(fd) catch return BrzError.StatFailed;
+pub fn open(self: *Queue) RingloomError!void {
+    const stat = std.posix.fstat(fd) catch return RingloomError.StatFailed;
     // ...
 }
 
@@ -1388,7 +1388,7 @@ queue.open() catch |err| {
 
 ```
 src/
-└── brz/
+└── ringloom/
     ├── header.zig       — Header constants and bit manipulation
     ├── index.zig        — 64-bit index layout (cycle/seqnum), IndexRegion
     ├── metadata.zig     — SharedMetadata, QueueFileHeader (extern structs)
@@ -1397,7 +1397,7 @@ src/
     ├── queue.zig        — Queue struct
     ├── codec.zig        — Codec interface, Dispatcher, DefaultRawCodec
     ├── config.zig       — Constants and tuning parameters
-    ├── errors.zig       — BrzError error set
+    ├── errors.zig       — RingloomError error set
     ├── platform.zig     — Linux/macOS preallocation, advice, page touch
     ├── prefetcher.zig   — Pollable write/read prefetch state machine
     ├── cleaner.zig      — Pollable cleanup/retention state machine

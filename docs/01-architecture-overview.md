@@ -1,4 +1,4 @@
-# brz-queue Architecture Overview
+# ringloom-queue Architecture Overview
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@
 
 ## Introduction
 
-This document provides a comprehensive architectural description of **brz-queue**, a clean-room, high-performance, memory-mapped IPC queue implemented in Zig 0.16. The design targets the lowest possible latency with zero allocations on the hot path, no expected page faults on the appender hot path, and portable polling-first readers. brz-queue uses fixed-layout binary structures (no self-describing wire format), a single active appender lease, acquire/release publication, flat inline indexes, background or externally driven page pre-touching, optional cleanup helpers, and no core kernel notification dependency. It is designed for single-active-writer, multi-reader workloads across OS processes communicating through shared `mmap` regions.
+This document provides a comprehensive architectural description of **ringloom-queue**, a clean-room, high-performance, memory-mapped IPC queue implemented in Zig 0.16. The design targets the lowest possible latency with zero allocations on the hot path, no expected page faults on the appender hot path, and portable polling-first readers. ringloom-queue uses fixed-layout binary structures (no self-describing wire format), a single active appender lease, acquire/release publication, flat inline indexes, background or externally driven page pre-touching, optional cleanup helpers, and no core kernel notification dependency. It is designed for single-active-writer, multi-reader workloads across OS processes communicating through shared `mmap` regions.
 
 ## Project Summary
 
@@ -33,11 +33,11 @@ This document provides a comprehensive architectural description of **brz-queue*
 |---|---|
 | **Language** | Zig |
 | **License** | Apache 2.0 |
-| **Format Version** | v1 (`brz`) |
+| **Format Version** | v1 (`ringloom`) |
 | **IPC Mechanism** | Memory-mapped files (`mmap` + `MAP_SHARED`) |
 | **Arbitration** | `cmpxchg` (atomic CAS via Zig builtins) |
 | **Memory Ordering** | Acquire/Release (not SeqCst) |
-| **File Extension** | `.brz` (data files), `metadata.brz` (shared metadata) |
+| **File Extension** | `.ringloom` (data files), `metadata.ringloom` (shared metadata) |
 | **Backoff Strategy** | Tiered: spin → yield → exponential (capped 1 ms) |
 | **Index** | Flat inline array of `u64` offsets after file header |
 | **Reader waiting** | Non-blocking polling in core; application-owned wait/backoff/notifier outside core |
@@ -59,7 +59,7 @@ This document provides a comprehensive architectural description of **brz-queue*
 ├──────────┼───────────────────┼────────────────────┼──────────────┤
 │          ▼                   ▼                    ▼              │
 │  ┌────────────────────────────────────────────────────────┐      │
-│  │                   brz-queue Public API                  │      │
+│  │                   ringloom-queue Public API                  │      │
 │  │                                                        │      │
 │  │  Queue.init()       Queue.open()                       │      │
 │  │  Appender.append()  Tailer.poll()                      │      │
@@ -99,7 +99,7 @@ This document provides a comprehensive architectural description of **brz-queue*
 │   ┌──────────────────────────────────────────────────────┐       │
 │   │              File System (queue directory)            │       │
 │   │                                                      │       │
-│   │  metadata.brz   20211118F.brz   20211119F.brz        │       │
+│   │  metadata.ringloom   20211118F.ringloom   20211119F.ringloom        │       │
 │   └──────────────────────────────────────────────────────┘       │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -108,9 +108,9 @@ This document provides a comprehensive architectural description of **brz-queue*
 
 ### Queue
 
-A brz-queue is a **directory** on disk containing:
-- One shared metadata file (`metadata.brz`)
-- Zero or more queue data files (`.brz`)
+A ringloom-queue is a **directory** on disk containing:
+- One shared metadata file (`metadata.ringloom`)
+- Zero or more queue data files (`.ringloom`)
 
 There is **no broker process**. The OS kernel provides persistence via `mmap` with `MAP_SHARED`, and hardware atomics provide the entry publication protocol.
 
@@ -153,20 +153,20 @@ Determines when a new queue file is started. The cycle value is derived from the
 cycle = (current_time_ms - roll_epoch) / roll_length_ms
 ```
 
-When the cycle advances, `seqnum` resets to zero and a new `.brz` file is created.
+When the cycle advances, `seqnum` resets to zero and a new `.ringloom` file is created.
 
 ## File Layout on Disk
 
 ```
 queue_directory/
-├── metadata.brz               # Fixed 512-byte shared metadata (mmap'd)
+├── metadata.ringloom               # Fixed 512-byte shared metadata (mmap'd)
 │
-├── 20211118F.brz              # Queue data file for cycle N
-├── 20211119F.brz              # Queue data file for cycle N+1
+├── 20211118F.ringloom              # Queue data file for cycle N
+├── 20211119F.ringloom              # Queue data file for cycle N+1
 └── ...
 ```
 
-### Metadata File (`metadata.brz`) Layout
+### Metadata File (`metadata.ringloom`) Layout
 
 A fixed 512-byte `extern struct SharedMetadata` — just mmap and cast the pointer. Zero parsing required.
 
@@ -193,7 +193,7 @@ Total: 512 bytes (0x200)
 
 All atomically-accessed `u64` fields are naturally 8-byte aligned. No wire encoding, no stop-bit encoding, no parsing.
 
-### Queue File (`.brz`) Internal Layout
+### Queue File (`.ringloom`) Internal Layout
 
 ```
 Offset 0x0000
@@ -310,7 +310,7 @@ This actually allocates disk blocks so that the first write to a new region does
 
 ### Page-Fault Avoidance Strategy
 
-The appender hot path must not rely on demand paging. Synchronous `MAP_POPULATE` in `append()` only moves the latency spike from first write to the remap syscall; it is still a spike on the appender thread. brz-queue therefore treats page preparation as background work:
+The appender hot path must not rely on demand paging. Synchronous `MAP_POPULATE` in `append()` only moves the latency spike from first write to the remap syscall; it is still a spike on the appender thread. ringloom-queue therefore treats page preparation as background work:
 
 1. The appender publishes its current `write_position`.
 2. A prefetcher watches the write position and maintains a prepared runway ahead of it.
@@ -318,11 +318,11 @@ The appender hot path must not rely on demand paging. Synchronous `MAP_POPULATE`
 4. The appender atomically observes a ready window and swaps pointers when it reaches the boundary.
 5. If the prefetcher falls behind, the appender may perform a synchronous fallback, but this is reported as a latency-profile miss.
 
-This is the same class of technique Chronicle Queue documents as **pre-touching**: touching pages and acquiring future cycle resources before appenders need them. Chronicle exposes manual `pretouch()` and an automatic preloader; brz-queue makes the equivalent prefetcher part of the core low-jitter design.
+This is the same class of technique Chronicle Queue documents as **pre-touching**: touching pages and acquiring future cycle resources before appenders need them. Chronicle exposes manual `pretouch()` and an automatic preloader; ringloom-queue makes the equivalent prefetcher part of the core low-jitter design.
 
 ### Why `io_uring` is not in the core design
 
-`io_uring` does not materially improve steady-state append or `poll()` latency because brz-queue's data path is already memory mapped: the hot path is pointer arithmetic, payload copy/read, and acquire/release atomic loads/stores, not kernel I/O submission. `io_uring` can help an idle reader sleep until notified, but that requires Linux-only machinery and usually shifts a syscall onto the appender for each waiting reader or wakeup batch. The core spec therefore keeps notification out of the queue and exposes polling. Applications that need blocking readers can layer their own wait strategy (spin/yield/sleep, condition variables inside one process, kqueue/epoll/eventfd, language runtime schedulers, or a custom reactor) around `Tailer.poll()`.
+`io_uring` does not materially improve steady-state append or `poll()` latency because ringloom-queue's data path is already memory mapped: the hot path is pointer arithmetic, payload copy/read, and acquire/release atomic loads/stores, not kernel I/O submission. `io_uring` can help an idle reader sleep until notified, but that requires Linux-only machinery and usually shifts a syscall onto the appender for each waiting reader or wakeup batch. The core spec therefore keeps notification out of the queue and exposes polling. Applications that need blocking readers can layer their own wait strategy (spin/yield/sleep, condition variables inside one process, kqueue/epoll/eventfd, language runtime schedulers, or a custom reactor) around `Tailer.poll()`.
 
 ## Message Framing and Header Protocol
 
@@ -530,7 +530,7 @@ Readers perform a binary search over the index region for `O(log n)` seek instea
 
 ### Roll Schemes
 
-brz-queue ships with multiple built-in roll schemes. Each defines:
+ringloom-queue ships with multiple built-in roll schemes. Each defines:
 
 | Field | Description |
 |---|---|
@@ -543,7 +543,7 @@ brz-queue ships with multiple built-in roll schemes. Each defines:
 ### Filename Generation
 
 ```
-filename = dirname ++ "/" ++ formatDate(cycle × roll_length_ms) ++ ".brz"
+filename = dirname ++ "/" ++ formatDate(cycle × roll_length_ms) ++ ".ringloom"
 ```
 
 The cycle number maps to a time: `timestamp_ms = cycle × roll_length_ms + roll_epoch`
@@ -568,7 +568,7 @@ If an appender finds itself holding the write lock but the current file's cycle 
 
 ### Pre-Create Next Cycle File
 
-To eliminate the latency spike during roll transitions (which would otherwise require 8+ syscalls for file creation, allocation, mmap, and page faults), brz-queue pre-creates and pre-touches the next cycle file:
+To eliminate the latency spike during roll transitions (which would otherwise require 8+ syscalls for file creation, allocation, mmap, and page faults), ringloom-queue pre-creates and pre-touches the next cycle file:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -577,7 +577,7 @@ To eliminate the latency spike during roll transitions (which would otherwise re
 │  1. When current time is within preroll_ms of roll boundary  │
 │     (configurable, default: 1000 ms)                         │
 │                                                              │
-│  2. Create next cycle's .brz file:                           │
+│  2. Create next cycle's .ringloom file:                           │
 │     a. open() + fallocate() to pre-allocate disk blocks     │
 │     b. Write QueueFileHeader + zero index region             │
 │     c. mmap() + writable page pre-touch                     │
@@ -595,7 +595,7 @@ To eliminate the latency spike during roll transitions (which would otherwise re
 
 ## Shared Metadata File
 
-The shared metadata file (`metadata.brz`) is a fixed 512-byte `extern struct SharedMetadata` that is mmap'd by all processes. There is no wire protocol, no parsing — just mmap the file and cast the pointer to the struct type.
+The shared metadata file (`metadata.ringloom`) is a fixed 512-byte `extern struct SharedMetadata` that is mmap'd by all processes. There is no wire protocol, no parsing — just mmap the file and cast the pointer to the struct type.
 
 ### Layout
 
@@ -651,7 +651,7 @@ const Queue = struct {
     blocksize: u32,                   // mmap chunk size (power of 2, default 2 MiB)
 
     // Shared metadata (mmap'd)
-    metadata_fd: std.posix.fd_t,      // File descriptor for metadata.brz
+    metadata_fd: std.posix.fd_t,      // File descriptor for metadata.ringloom
     metadata: *SharedMetadata,        // Pointer into mmap (cast from mmap base)
 
     // Observed cycle range (cached from shared metadata)
@@ -781,7 +781,7 @@ Appender.append(payload)
      │       │   (prefetched)     (or fallback create) │
      │       │                                         │
      │       ▼                                         │
-     │   Create new .brz file:                         │
+     │   Create new .ringloom file:                         │
      │   1. open + fallocate                           │
      │   2. Write QueueFileHeader + zero index         │
      │   3. mmap + write pre-touch                     │
@@ -946,7 +946,7 @@ contract.
 
 ## Module Decomposition
 
-brz-queue has a simple module structure — no wire protocol serialization layer is needed.
+ringloom-queue has a simple module structure — no wire protocol serialization layer is needed.
 
 ### `queue.zig` — Queue Management
 
@@ -1031,17 +1031,17 @@ brz-queue has a simple module structure — no wire protocol serialization layer
 
 | Responsibility | Key Functions |
 |---|---|
-| Opaque handles | `brz_queue_open`, `brz_queue_close`, `brz_tailer_open` |
-| Stable errors | `brz_error_t`, `brz_strerror`, no Zig error-set ordinals |
-| Borrowed messages | `brz_message_view`, lifetime until next same-tailer poll/remap |
-| Pollable helpers | `brz_queue_prefetch_poll`, `brz_queue_cleaner_poll`, `brz_tailer_prefetch_poll` |
-| ABI versioning | `brz_abi_version`, struct `size` fields |
+| Opaque handles | `ringloom_queue_open`, `ringloom_queue_close`, `ringloom_tailer_open` |
+| Stable errors | `ringloom_error_t`, `ringloom_strerror`, no Zig error-set ordinals |
+| Borrowed messages | `ringloom_message_view`, lifetime until next same-tailer poll/remap |
+| Pollable helpers | `ringloom_queue_prefetch_poll`, `ringloom_queue_cleaner_poll`, `ringloom_tailer_prefetch_poll` |
+| ABI versioning | `ringloom_abi_version`, struct `size` fields |
 
 ## Concurrency and Memory Ordering
 
 ### Acquire/Release Instead of SeqCst
 
-brz-queue uses **acquire/release** semantics rather than sequential consistency (`SeqCst`) for all hot-path atomic operations:
+ringloom-queue uses **acquire/release** semantics rather than sequential consistency (`SeqCst`) for all hot-path atomic operations:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1122,7 +1122,7 @@ There are no traditional hot-path locks:
 
 ## Error Handling
 
-brz-queue uses Zig's native error handling via error unions:
+ringloom-queue uses Zig's native error handling via error unions:
 
 ```
 pub const QueueError = error{
@@ -1187,7 +1187,7 @@ Errors on the hot path (CAS failure, WORKING header) are **not** represented as 
   │   (same physical pages for same file regions)        │
   │                                                      │
   │  ┌──────────────┐  ┌──────────────────────────┐      │
-  │  │metadata.brz  │  │ 20211118F.brz            │      │
+  │  │metadata.ringloom  │  │ 20211118F.ringloom            │      │
   │  │ (512 bytes)  │  │ ┌──────────────────────┐ │      │
   │  │ modcount: 5  │  │ │ QueueFileHeader 64B  │ │      │
   │  │ highest: 42  │  │ ├──────────────────────┤ │      │
@@ -1218,7 +1218,7 @@ Time ─────────────────────────
 Cycle N                               Cycle N+1
 ├─────────────────────────────────────┤──────────────────────────────┤
 
-  File: 20211118F.brz                   File: 20211119F.brz
+  File: 20211118F.ringloom                   File: 20211119F.ringloom
   ┌────────────────────────┐            ┌────────────────────────┐
   │ QueueFileHeader (64B)  │            │ QueueFileHeader (64B)  │
   │ Index Region (32 KiB)  │            │ Index Region (32 KiB)  │
@@ -1282,4 +1282,4 @@ Cycle N                               Cycle N+1
 
 ---
 
-*This document describes the architecture of brz-queue, a clean-room memory-mapped IPC queue implemented in Zig 0.16. For protocol changes between versions, see `CHANGES.md`.*
+*This document describes the architecture of ringloom-queue, a clean-room memory-mapped IPC queue implemented in Zig 0.16. For protocol changes between versions, see `CHANGES.md`.*

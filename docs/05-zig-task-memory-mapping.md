@@ -2,7 +2,7 @@
 
 ## Overview
 
-Memory-mapped I/O is the core mechanism for brz-queue IPC. All data access —
+Memory-mapped I/O is the core mechanism for ringloom-queue IPC. All data access —
 reading, writing, metadata coordination — goes through mmap'd shared memory.
 There are no read/write syscalls on the hot path, no serialization layers, no
 allocations. A writer writes bytes into a mapped region; a reader sees those
@@ -20,12 +20,12 @@ This document specifies:
 7. **Platform preallocation** — reserve real disk blocks (`fallocate` on Linux, `F_PREALLOCATE` + `ftruncate` on macOS)
 8. **Atomic operations** — CAS, loads, stores with acquire/release ordering
 9. **Tiered CAS backoff** — spin → yield → exponential sleep
-10. **Shared metadata** — 512-byte `metadata.brz`, mmap and cast
+10. **Shared metadata** — 512-byte `metadata.ringloom`, mmap and cast
 11. **Error handling and testing**
 
 The design follows a **single writer, multiple readers** model. The appender
-gets `PROT_READ|PROT_WRITE`; tailers get `PROT_READ`. All files use the `.brz`
-extension (`metadata.brz` for the shared metadata file).
+gets `PROT_READ|PROT_WRITE`; tailers get `PROT_READ`. All files use the `.ringloom`
+extension (`metadata.ringloom` for the shared metadata file).
 
 ---
 
@@ -196,7 +196,7 @@ pub fn touchWritablePages(buf: []align(page_size) u8, page_size: usize) void {
 Chronicle Queue calls this idea **pre-touching**. Its public docs describe
 touching storage resources and possibly acquiring future cycle files before the
 appender needs them; it exposes manual `ExcerptAppender.pretouch()` and an
-automatic preloader. brz-queue should implement the same principle as a
+automatic preloader. ringloom-queue should implement the same principle as a
 `Prefetcher` state machine with explicit handoff to the appender.
 
 ---
@@ -338,7 +338,7 @@ not apply to file-backed shared queue mappings.
 
 ### Concept
 
-brz-queue maps a **2× blocksize window** into the process address space,
+ringloom-queue maps a **2× blocksize window** into the process address space,
 aligned to a blocksize boundary. As the tip (read or write position) advances
 through the file, the window slides forward.
 
@@ -588,7 +588,7 @@ pub fn ensureFileSize(fd: posix.fd_t, current_size: *u64, required_size: u64) !v
 
 ## 8. Atomic Operations with Acquire/Release Ordering
 
-brz-queue uses acquire/release memory ordering instead of sequential
+ringloom-queue uses acquire/release memory ordering instead of sequential
 consistency (SeqCst). This is both correct and faster:
 
 | Architecture | SeqCst store | Release store | SeqCst load | Acquire load |
@@ -747,7 +747,7 @@ still spinning after 256 attempts, something is wrong and we should back off har
 
 ## 10. Shared Metadata mmap
 
-The metadata file (`metadata.brz`) is a fixed 512-byte struct, memory-mapped
+The metadata file (`metadata.ringloom`) is a fixed 512-byte struct, memory-mapped
 directly and cast to a pointer. No parsing, no serialization.
 
 ### SharedMetadata struct
@@ -807,7 +807,7 @@ process boundaries — they operate on the same physical page.
 
 ## 11. Queue File mmap
 
-Queue data files (`*.brz`) use the same sliding window approach described in
+Queue data files (`*.ringloom`) use the same sliding window approach described in
 Section 5, but with role-specific optimizations:
 
 ### Appender
@@ -905,8 +905,8 @@ read-ahead optimization. Log a warning and continue.
 
 ```zig
 test "mapFile and unmapFile round-trip" {
-    const tmp = try std.fs.cwd().createFile("test.brz", .{ .read = true });
-    defer std.fs.cwd().deleteFile("test.brz") catch {};
+    const tmp = try std.fs.cwd().createFile("test.ringloom", .{ .read = true });
+    defer std.fs.cwd().deleteFile("test.ringloom") catch {};
     defer tmp.close();
 
     try tmp.setEndPos(4096);
@@ -948,8 +948,8 @@ Test that platform preallocation creates non-sparse files by checking the block 
 
 ```zig
 test "platform preallocation allocates real blocks" {
-    const file = try std.fs.cwd().createFile("test.brz", .{ .read = true });
-    defer std.fs.cwd().deleteFile("test.brz") catch {};
+    const file = try std.fs.cwd().createFile("test.ringloom", .{ .read = true });
+    defer std.fs.cwd().deleteFile("test.ringloom") catch {};
     defer file.close();
 
     try extendFile(file.handle, 2 * 1024 * 1024);
@@ -1037,7 +1037,7 @@ test "casBackoff tier transitions" {
 
 ```
 src/
-└── brz/
+└── ringloom/
     ├── atomic_ops.zig      — CAS, atomic load/store, fetch-add, backoff
     ├── mmap_ops.zig        — mapFile, unmapFile, remapFile, adviseSequential
     ├── window.zig          — MmapWindow, PremappedWindow, computeWindow

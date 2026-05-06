@@ -2,7 +2,7 @@
 
 ## Overview
 
-The brz-queue on-disk format uses **fixed-layout binary structures** (`extern struct`) for all internal
+The ringloom-queue on-disk format uses **fixed-layout binary structures** (`extern struct`) for all internal
 metadata — queue headers, directory listings, message headers, and roll metadata (see docs 02 and 03).
 These structures are parsed by pointer-casting directly from the mmap'd region: zero deserialization,
 zero copies, zero overhead.

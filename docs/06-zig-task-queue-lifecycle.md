@@ -26,13 +26,13 @@ Queue lifecycle covers the full sequence of operations from creating or opening
 a queue through to tearing it down:
 
 - **Initialization** — allocate the `Queue` struct, set defaults
-- **Version detection** — probe for `metadata.brz` to determine format version
+- **Version detection** — probe for `metadata.ringloom` to determine format version
 - **Metadata file creation/reading** — create or mmap the fixed 512-byte
   `SharedMetadata` extern struct (zero parsing — direct pointer cast)
-- **Queue file management** — create `.brz` data files with platform
+- **Queue file management** — create `.ringloom` data files with platform
   preallocation, write the 64-byte `QueueFileHeader`
 - **Roll scheme configuration** — set roll period, index count, index spacing
-- **Pre-roll file preparation** — pre-create the next cycle's `.brz` file
+- **Pre-roll file preparation** — pre-create the next cycle's `.ringloom` file
   within a configurable `preroll_ms` window so the hot-path roll is a pointer
   swap with zero syscalls
 - **Pollable helpers** — initialize prefetcher/cleaner state machines; native Zig
@@ -140,27 +140,27 @@ const cycle = @atomicLoad(u64, &self.metadata.?.highest_cycle, .acquire);
 ```zig
 pub const Version = enum(u8) {
     unknown = 0,
-    v1 = 1, // brz-queue native format (.brz files, extern struct metadata)
+    v1 = 1, // ringloom-queue native format (.ringloom files, extern struct metadata)
 };
 ```
 
 Only two variants. `unknown` means no queue detected at the directory path.
-`v1` is the brz-queue native format.
+`v1` is the ringloom-queue native format.
 
 ---
 
 ## 3. Version Detection
 
-Version detection probes the queue directory for the `metadata.brz` file. If
+Version detection probes the queue directory for the `metadata.ringloom` file. If
 present, optionally validate the magic number to confirm it is a valid
-brz-queue metadata file.
+ringloom-queue metadata file.
 
 ```zig
 fn detectVersion(dirname: []const u8) !Version {
     var dir = try std.fs.cwd().openDir(dirname, .{});
     defer dir.close();
 
-    if (dir.openFile("metadata.brz", .{})) |f| {
+    if (dir.openFile("metadata.ringloom", .{})) |f| {
         defer f.close();
 
         // Optionally read and validate magic number
@@ -177,7 +177,7 @@ fn detectVersion(dirname: []const u8) !Version {
 }
 ```
 
-If `metadata.brz` does not exist, the directory is not a brz-queue.
+If `metadata.ringloom` does not exist, the directory is not a ringloom-queue.
 
 ---
 
@@ -189,11 +189,11 @@ existing data files, and initializes platform/helper state.
 ### Steps
 
 1. Validate directory exists
-2. Detect version from `metadata.brz`
-3. Open and mmap `metadata.brz` → cast to `*SharedMetadata`
+2. Detect version from `metadata.ringloom`
+3. Open and mmap `metadata.ringloom` → cast to `*SharedMetadata`
 4. Validate magic number (`0x4D515A42`)
 5. Read roll config directly from struct fields (zero parsing!)
-6. Scan directory for existing `.brz` data files
+6. Scan directory for existing `.ringloom` data files
 7. Detect platform capabilities and initialize prefetcher/cleaner state machines
 8. Set up pre-roll state
 9. Start helper threads only for the native Zig API when configured
@@ -223,8 +223,8 @@ pub fn open(self: *Self) !void {
         return error.QueueNotFound;
     }
 
-    // 3. Open and mmap metadata.brz
-    const meta_path = try std.fs.path.join(self.allocator, &.{ self.dirname, "metadata.brz" });
+    // 3. Open and mmap metadata.ringloom
+    const meta_path = try std.fs.path.join(self.allocator, &.{ self.dirname, "metadata.ringloom" });
     defer self.allocator.free(meta_path);
 
     self.metadata_fd = try std.posix.open(
@@ -260,7 +260,7 @@ pub fn open(self: *Self) !void {
     self.lowest_cycle = @atomicLoad(u64, &self.metadata.?.lowest_cycle, .acquire);
     self.modcount = @atomicLoad(u64, &self.metadata.?.modcount, .acquire);
 
-    // 6. Scan directory for existing .brz data files
+    // 6. Scan directory for existing .ringloom data files
     try self.refreshQueueFiles();
 
     // 7. Initialize platform and pollable helper state
@@ -330,7 +330,7 @@ all fields at known offsets.
 
 ### Steps
 
-1. Create `metadata.brz` file
+1. Create `metadata.ringloom` file
 2. Preallocate 512 bytes (one disk sector)
 3. mmap it read-write
 4. Cast to `*SharedMetadata`, fill in fields
@@ -342,7 +342,7 @@ all fields at known offsets.
 fn metadataInit(self: *Self) !void {
     const meta_path = try std.fs.path.join(
         self.allocator,
-        &.{ self.dirname, "metadata.brz" },
+        &.{ self.dirname, "metadata.ringloom" },
     );
     defer self.allocator.free(meta_path);
 
@@ -409,7 +409,7 @@ fn metadataInit(self: *Self) !void {
 
 ## 6. Queue File Creation
 
-Each `.brz` data file stores messages for one cycle. The file layout is:
+Each `.ringloom` data file stores messages for one cycle. The file layout is:
 
 ```
 [QueueFileHeader: 64 bytes] [Index: index_count × 8 bytes] [Data region...]
@@ -483,7 +483,7 @@ offset `64 + 4096 × 8 = 32,832` (32 KiB + 64 bytes).
 
 ## 7. Pre-Roll File Creation
 
-Pre-rolling creates the next cycle's `.brz` file **before** the current cycle
+Pre-rolling creates the next cycle's `.ringloom` file **before** the current cycle
 ends, so that the actual roll on the hot path is a pointer swap — zero syscalls.
 
 ### Concept
@@ -725,7 +725,7 @@ core implementation, while thread spawning is a Zig-only wrapper.
 
 ## 11. Queue File Enumeration
 
-Scan the queue directory for `.brz` data files (excluding `metadata.brz`),
+Scan the queue directory for `.ringloom` data files (excluding `metadata.ringloom`),
 extract cycle numbers from filenames, and sort by cycle.
 
 ```zig
@@ -745,10 +745,10 @@ fn refreshQueueFiles(self: *Self) !void {
         const name = entry.name;
 
         // Skip metadata file
-        if (std.mem.eql(u8, name, "metadata.brz")) continue;
+        if (std.mem.eql(u8, name, "metadata.ringloom")) continue;
 
-        // Must end with .brz
-        if (!std.mem.endsWith(u8, name, ".brz")) continue;
+        // Must end with .ringloom
+        if (!std.mem.endsWith(u8, name, ".ringloom")) continue;
 
         const owned = try self.allocator.dupe(u8, name);
         try self.queuefile_paths.append(owned);
@@ -771,8 +771,8 @@ stored in the filename itself. To get the cycle from a path:
 ```zig
 fn cycleFromPath(self: *Self, filename: []const u8) !u32 {
     // Parse the strftime-formatted portion of the filename
-    // e.g. "20250101F.brz" → parse with "%Y%m%dF" → epoch seconds → cycle
-    const stem = filename[0 .. filename.len - 4]; // strip ".brz"
+    // e.g. "20250101F.ringloom" → parse with "%Y%m%dF" → epoch seconds → cycle
+    const stem = filename[0 .. filename.len - 4]; // strip ".ringloom"
     const epoch_secs = try parseStrftime(stem, self.roll_strftime);
     const cycle = (epoch_secs * 1000 - self.roll_epoch) / self.roll_length_ms;
     return @intCast(cycle);
@@ -1018,7 +1018,7 @@ pub const QueueError = error{
 ### Logging
 
 ```zig
-const log = std.log.scoped(.brz_queue);
+const log = std.log.scoped(.ringloom_queue);
 
 // In open():
 log.info("opening queue at {s}", .{self.dirname});
@@ -1028,7 +1028,7 @@ log.debug("roll scheme: {s} ({}s cycles, {} index entries)", .{
 });
 
 // In metadataInit():
-log.info("creating metadata.brz ({} bytes)", .{Queue.metadata_file_sz});
+log.info("creating metadata.ringloom ({} bytes)", .{Queue.metadata_file_sz});
 
 // In queuefileInit():
 log.info("creating queue file: {s} (cycle {})", .{ path, cycle });
@@ -1059,7 +1059,7 @@ test "metadata creation produces 512-byte file" {
     try q.open();
 
     // Verify file size
-    const stat = try tmp.dir.statFile("metadata.brz");
+    const stat = try tmp.dir.statFile("metadata.ringloom");
     try testing.expectEqual(@as(u64, 512), stat.size);
 }
 
@@ -1092,7 +1092,7 @@ test "queue file creation with platform preallocation" {
     try q.open();
 
     const fd = try q.queuefileInit(
-        try std.fs.path.join(testing.allocator, &.{ tmp.path, "20250101F.brz" }),
+        try std.fs.path.join(testing.allocator, &.{ tmp.path, "20250101F.ringloom" }),
         0,
     );
     defer std.posix.close(fd);
@@ -1125,22 +1125,22 @@ test "pre-roll file creation timing" {
     try testing.expectEqual(@as(u32, 1), q.preroll_cycle.?);
 }
 
-test "cycle enumeration with .brz files" {
+test "cycle enumeration with .ringloom files" {
     const tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Create some fake .brz files
-    _ = try tmp.dir.createFile("20250101F.brz", .{});
-    _ = try tmp.dir.createFile("20250102F.brz", .{});
-    _ = try tmp.dir.createFile("20250103F.brz", .{});
-    _ = try tmp.dir.createFile("metadata.brz", .{});
+    // Create some fake .ringloom files
+    _ = try tmp.dir.createFile("20250101F.ringloom", .{});
+    _ = try tmp.dir.createFile("20250102F.ringloom", .{});
+    _ = try tmp.dir.createFile("20250103F.ringloom", .{});
+    _ = try tmp.dir.createFile("metadata.ringloom", .{});
 
     var q = try Queue.init(testing.allocator, tmp.path);
     defer q.deinit();
 
     try q.refreshQueueFiles();
 
-    // Should find 3 data files (metadata.brz excluded)
+    // Should find 3 data files (metadata.ringloom excluded)
     try testing.expectEqual(@as(usize, 3), q.queuefile_paths.items.len);
 
     // Should be sorted
@@ -1148,12 +1148,12 @@ test "cycle enumeration with .brz files" {
     try testing.expect(std.mem.lessThan(u8, q.queuefile_paths.items[1], q.queuefile_paths.items[2]));
 }
 
-test "version detection finds v1 from metadata.brz" {
+test "version detection finds v1 from metadata.ringloom" {
     const tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // Write a minimal valid metadata file
-    const f = try tmp.dir.createFile("metadata.brz", .{});
+    const f = try tmp.dir.createFile("metadata.ringloom", .{});
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, 0x4D515A42, .little);
     _ = try f.write(&buf);
@@ -1187,7 +1187,7 @@ test "no memory leaks on full lifecycle" {
     }
     const allocator = gpa.allocator();
 
-    var q = try Queue.init(allocator, "/tmp/brz-queue-leak-test");
+    var q = try Queue.init(allocator, "/tmp/ringloom-queue-leak-test");
     defer q.deinit();
     q.setCreate(true);
     try q.open();

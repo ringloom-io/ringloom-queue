@@ -2,17 +2,17 @@
 
 ## Overview
 
-This task defines the comprehensive testing strategy for brz-queue — a clean-room,
+This task defines the comprehensive testing strategy for ringloom-queue — a clean-room,
 high-performance, lock-free, memory-mapped IPC queue in Zig. The testing strategy covers
 unit tests, integration tests, concurrency tests, performance benchmarks, fuzzing, and
 property-based testing.
 
-brz-queue uses Zig's built-in test framework (`test` blocks and `std.testing`), Zig's
+ringloom-queue uses Zig's built-in test framework (`test` blocks and `std.testing`), Zig's
 built-in fuzz testing, and the language's runtime safety checks. The goal is to verify
 correctness, memory safety, and performance of the single-writer / multiple-reader
 architecture with zero allocations on the hot path.
 
-Key testing concerns specific to brz-queue:
+Key testing concerns specific to ringloom-queue:
 
 - **Fixed struct layouts** — `SharedMetadata` (512 bytes) and `QueueFileHeader` (64 bytes)
   must have exact sizes and field offsets for mmap-and-cast to work across processes.
@@ -22,7 +22,7 @@ Key testing concerns specific to brz-queue:
   pollable maintenance helpers must be reliable, bounded, and low-jitter.
 - **Codec round-trips** — user-supplied codecs must serialize and deserialize without
   loss or allocation.
-- **File format invariants** — `.brz` files and `metadata.brz` must conform to the spec.
+- **File format invariants** — `.ringloom` files and `metadata.ringloom` must conform to the spec.
 
 ---
 
@@ -36,11 +36,11 @@ is discovered and run by `zig build test`. Assertions come from `std.testing`:
 ```zig
 const std = @import("std");
 const testing = std.testing;
-const brz = @import("brz_queue.zig");
+const ringloom = @import("ringloom_queue.zig");
 
 test "queue init and deinit" {
-    var queue = try brz.Queue(TestMsg).open(.{
-        .dir = "/tmp/brz-test-queue",
+    var queue = try ringloom.Queue(TestMsg).open(.{
+        .dir = "/tmp/ringloom-test-queue",
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
@@ -110,7 +110,7 @@ if any allocation is leaked. Every test that allocates must use `testing.allocat
 
 ```zig
 test "queue cleanup frees all memory" {
-    var queue = try brz.Queue(TestMsg).open(.{
+    var queue = try ringloom.Queue(TestMsg).open(.{
         .dir = tmp.path,
         .create = true,
         .allocator = testing.allocator, // Leak detection enabled
@@ -371,7 +371,7 @@ test "codec handles max-size message" {
 
 ```zig
 test "cycle calculation: FAST_DAILY epoch=0" {
-    const scheme = brz.RollScheme.FAST_DAILY;
+    const scheme = ringloom.RollScheme.FAST_DAILY;
     // 2021-11-18 00:00:00 UTC = epoch day 18949
     const ts_ms: u64 = 1637193600000;
     const cycle = scheme.toCycle(ts_ms);
@@ -379,35 +379,35 @@ test "cycle calculation: FAST_DAILY epoch=0" {
 }
 
 test "cycle calculation: next day increments cycle by 1" {
-    const scheme = brz.RollScheme.FAST_DAILY;
+    const scheme = ringloom.RollScheme.FAST_DAILY;
     const day1: u64 = 1637193600000; // 2021-11-18
     const day2: u64 = 1637280000000; // 2021-11-19
     try testing.expectEqual(scheme.toCycle(day1) + 1, scheme.toCycle(day2));
 }
 
-test "filename generation with .brz extension" {
-    const scheme = brz.RollScheme.FAST_DAILY;
+test "filename generation with .ringloom extension" {
+    const scheme = ringloom.RollScheme.FAST_DAILY;
     var buf: [64]u8 = undefined;
     const name = scheme.cycleToFilename(18949, &buf);
-    try testing.expectEqualStrings("20211118F.brz", name);
+    try testing.expectEqualStrings("20211118F.ringloom", name);
 }
 
-test "TEST_SECONDLY filename with .brz extension" {
-    const scheme = brz.RollScheme.TEST_SECONDLY;
+test "TEST_SECONDLY filename with .ringloom extension" {
+    const scheme = ringloom.RollScheme.TEST_SECONDLY;
     var buf: [64]u8 = undefined;
     const name = scheme.cycleToFilename(0, &buf);
-    // Cycle 0 = epoch second → "19700101-000000T.brz"
-    try testing.expectEqualStrings("19700101-000000T.brz", name);
+    // Cycle 0 = epoch second → "19700101-000000T.ringloom"
+    try testing.expectEqualStrings("19700101-000000T.ringloom", name);
 }
 
 test "date format conversion for all roll schemes" {
-    // Verify every roll scheme produces a non-empty filename ending in .brz
-    inline for (std.meta.fields(brz.RollScheme)) |field| {
-        const scheme = @field(brz.RollScheme, field.name);
+    // Verify every roll scheme produces a non-empty filename ending in .ringloom
+    inline for (std.meta.fields(ringloom.RollScheme)) |field| {
+        const scheme = @field(ringloom.RollScheme, field.name);
         var buf: [64]u8 = undefined;
         const name = scheme.cycleToFilename(0, &buf);
-        try testing.expect(name.len > 4); // at least "X.brz"
-        try testing.expect(std.mem.endsWith(u8, name, ".brz"));
+        try testing.expect(name.len > 4); // at least "X.ringloom"
+        try testing.expect(std.mem.endsWith(u8, name, ".ringloom"));
     }
 }
 ```
@@ -443,17 +443,17 @@ test "total entry size is always 4-byte aligned" {
 
 ```zig
 test "create new queue, write, close, reopen, read" {
-    const tmp = try test_util.makeTempDir("brz.lifecycle.");
+    const tmp = try test_util.makeTempDir("ringloom.lifecycle.");
     defer test_util.removeTempDir(tmp);
 
     // 1. Create queue
     {
-        var queue = try brz.Queue([]const u8).open(.{
+        var queue = try ringloom.Queue([]const u8).open(.{
             .dir = tmp.path,
             .roll_scheme = .FAST_DAILY,
             .create = true,
             .allocator = testing.allocator,
-        }, brz.RawBytesCodec);
+        }, ringloom.RawBytesCodec);
         defer queue.deinit();
 
         // 2. Append several messages
@@ -467,12 +467,12 @@ test "create new queue, write, close, reopen, read" {
     // Queue is now closed (deinit ran)
 
     // 3. Reopen queue
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = false,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     // 4. Create tailer, read all messages, verify content
@@ -489,21 +489,21 @@ test "create new queue, write, close, reopen, read" {
 ### 3.2 Metadata File
 
 ```zig
-test "metadata.brz is valid 512-byte struct" {
-    const tmp = try test_util.makeTempDir("brz.meta.");
+test "metadata.ringloom is valid 512-byte struct" {
+    const tmp = try test_util.makeTempDir("ringloom.meta.");
     defer test_util.removeTempDir(tmp);
 
-    // Create queue — this creates metadata.brz
-    var queue = try brz.Queue([]const u8).open(.{
+    // Create queue — this creates metadata.ringloom
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     // Verify metadata file exists and is exactly 512 bytes
-    const meta_path = try std.fs.path.join(testing.allocator, &.{ tmp.path, "metadata.brz" });
+    const meta_path = try std.fs.path.join(testing.allocator, &.{ tmp.path, "metadata.ringloom" });
     defer testing.allocator.free(meta_path);
 
     const file = try std.fs.openFileAbsolute(meta_path, .{});
@@ -528,15 +528,15 @@ test "metadata.brz is valid 512-byte struct" {
 
 ```zig
 test "queue file has correct header and index region" {
-    const tmp = try test_util.makeTempDir("brz.filestructure.");
+    const tmp = try test_util.makeTempDir("ringloom.filestructure.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .TEST4_SECONDLY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     // Append a message to force file creation
@@ -544,13 +544,13 @@ test "queue file has correct header and index region" {
     defer appender.deinit();
     try appender.append("hello");
 
-    // Find the .brz data file
-    const brz_file = try test_util.findFirstBrzFile(tmp.path);
-    defer brz_file.close();
+    // Find the .ringloom data file
+    const ringloom_file = try test_util.findFirstRingloomFile(tmp.path);
+    defer ringloom_file.close();
 
     // Verify QueueFileHeader at offset 0
     var hdr_buf: [64]u8 = undefined;
-    _ = try brz_file.preadAll(&hdr_buf, 0);
+    _ = try ringloom_file.preadAll(&hdr_buf, 0);
 
     const magic = std.mem.readInt(u32, hdr_buf[0..4], .little);
     try testing.expectEqual(@as(u32, 0x43515A42), magic); // "BZQC"
@@ -563,7 +563,7 @@ test "queue file has correct header and index region" {
     const file_data_offset = std.mem.readInt(u64, hdr_buf[24..32], .little);
     // data_offset field or computed — verify first data header is at expected location
     var data_header_buf: [4]u8 = undefined;
-    _ = try brz_file.preadAll(&data_header_buf, expected_data_offset);
+    _ = try ringloom_file.preadAll(&data_header_buf, expected_data_offset);
     const data_header = std.mem.readInt(u32, &data_header_buf, .little);
     // Should be a DATA header with size = len("hello") = 5
     try testing.expectEqual(@as(u32, 5), data_header & 0x3FFFFFFF);
@@ -575,16 +575,16 @@ test "queue file has correct header and index region" {
 
 ```zig
 test "cycle roll creates new file and writes EOF" {
-    const tmp = try test_util.makeTempDir("brz.roll.");
+    const tmp = try test_util.makeTempDir("ringloom.roll.");
     defer test_util.removeTempDir(tmp);
 
     // Use TEST_SECONDLY for fast rolling (1-second cycles)
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .TEST_SECONDLY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -592,7 +592,7 @@ test "cycle roll creates new file and writes EOF" {
 
     // Write first message in cycle N
     try appender.append("msg-in-cycle-1");
-    const first_file = try test_util.findLatestBrzFile(tmp.path);
+    const first_file = try test_util.findLatestRingloomFile(tmp.path);
 
     // Sleep past the roll boundary
     std.time.sleep(1_100 * std.time.ns_per_ms);
@@ -600,8 +600,8 @@ test "cycle roll creates new file and writes EOF" {
     // Write message in cycle N+1
     try appender.append("msg-in-cycle-2");
 
-    // Count .brz files — should be at least 2
-    const file_count = try test_util.countBrzFiles(tmp.path);
+    // Count .ringloom files — should be at least 2
+    const file_count = try test_util.countRingloomFiles(tmp.path);
     try testing.expect(file_count >= 2);
 
     // Verify EOF marker in the old file
@@ -623,15 +623,15 @@ test "cycle roll creates new file and writes EOF" {
 
 ```zig
 test "pre-roll creates next cycle file before roll boundary" {
-    const tmp = try test_util.makeTempDir("brz.preroll.");
+    const tmp = try test_util.makeTempDir("ringloom.preroll.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .TEST_SECONDLY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -653,7 +653,7 @@ test "pre-roll creates next cycle file before roll boundary" {
     // (This is a soft check; just verify it doesn't error)
     _ = elapsed;
 
-    try testing.expect(try test_util.countBrzFiles(tmp.path) >= 2);
+    try testing.expect(try test_util.countRingloomFiles(tmp.path) >= 2);
 }
 ```
 
@@ -665,7 +665,7 @@ test "pre-roll creates next cycle file before roll boundary" {
 
 ```zig
 test "multi-process: writer and reader" {
-    const tmp = try test_util.makeTempDir("brz.mp.");
+    const tmp = try test_util.makeTempDir("ringloom.mp.");
     defer test_util.removeTempDir(tmp);
 
     // Fork a child process
@@ -673,12 +673,12 @@ test "multi-process: writer and reader" {
 
     if (pid == 0) {
         // Child: write messages
-        var queue = try brz.Queue([]const u8).open(.{
+        var queue = try ringloom.Queue([]const u8).open(.{
             .dir = tmp.path,
             .roll_scheme = .FAST_DAILY,
             .create = true,
             .allocator = std.heap.page_allocator,
-        }, brz.RawBytesCodec);
+        }, ringloom.RawBytesCodec);
         defer queue.deinit();
 
         var appender = try queue.appender();
@@ -695,12 +695,12 @@ test "multi-process: writer and reader" {
         // Parent: wait briefly then read
         std.time.sleep(50 * std.time.ns_per_ms);
 
-        var queue = try brz.Queue([]const u8).open(.{
+        var queue = try ringloom.Queue([]const u8).open(.{
             .dir = tmp.path,
             .roll_scheme = .FAST_DAILY,
             .create = false,
             .allocator = testing.allocator,
-        }, brz.RawBytesCodec);
+        }, ringloom.RawBytesCodec);
         defer queue.deinit();
 
         var tailer = try queue.tailer(.start);
@@ -729,19 +729,19 @@ test "multi-process: writer and reader" {
 
 ```zig
 test "multiple reader threads on same queue" {
-    const tmp = try test_util.makeTempDir("brz.mtread.");
+    const tmp = try test_util.makeTempDir("ringloom.mtread.");
     defer test_util.removeTempDir(tmp);
 
     const num_messages: u32 = 1000;
     const num_readers: u32 = 4;
 
     // Create and populate queue
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -760,7 +760,7 @@ test "multiple reader threads on same queue" {
 
     for (0..num_readers) |t| {
         threads[t] = try std.Thread.spawn(.{}, struct {
-            fn reader(q: *brz.Queue([]const u8), count: *u32) void {
+            fn reader(q: *ringloom.Queue([]const u8), count: *u32) void {
                 var tailer = q.tailer(.start) catch return;
                 defer tailer.deinit();
 
@@ -784,7 +784,7 @@ test "multiple reader threads on same queue" {
 
 ```zig
 test "multi-process appender lease allows only one active appender" {
-    const tmp = try test_util.makeTempDir("brz.lease.");
+    const tmp = try test_util.makeTempDir("ringloom.lease.");
     defer test_util.removeTempDir(tmp);
 
     const contenders = 4;
@@ -792,12 +792,12 @@ test "multi-process appender lease allows only one active appender" {
 
     // Create queue first
     {
-        var queue = try brz.Queue([]const u8).open(.{
+        var queue = try ringloom.Queue([]const u8).open(.{
             .dir = tmp.path,
             .roll_scheme = .FAST_DAILY,
             .create = true,
             .allocator = testing.allocator,
-        }, brz.RawBytesCodec);
+        }, ringloom.RawBytesCodec);
         queue.deinit();
     }
 
@@ -805,11 +805,11 @@ test "multi-process appender lease allows only one active appender" {
     for (0..contenders) |w| {
         const pid = try std.posix.fork();
         if (pid == 0) {
-            var queue = try brz.Queue([]const u8).open(.{
+            var queue = try ringloom.Queue([]const u8).open(.{
                 .dir = tmp.path,
                 .create = false,
                 .allocator = std.heap.page_allocator,
-            }, brz.RawBytesCodec);
+            }, ringloom.RawBytesCodec);
             defer queue.deinit();
 
             if (queue.appender()) |appender| {
@@ -845,15 +845,15 @@ test "multi-process appender lease allows only one active appender" {
 
 ```zig
 test "tailer poll returns null then message without blocking" {
-    const tmp = try test_util.makeTempDir("brz.poll.");
+    const tmp = try test_util.makeTempDir("ringloom.poll.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var tailer = try queue.tailer(.start);
@@ -870,7 +870,7 @@ test "tailer poll returns null then message without blocking" {
 }
 
 test "tailer read prefetch never passes published write position" {
-    const tmp = try test_util.makeTempDir("brz.read-prefetch.");
+    const tmp = try test_util.makeTempDir("ringloom.read-prefetch.");
     defer test_util.removeTempDir(tmp);
 
     var queue = try openTestQueue(.{
@@ -904,16 +904,16 @@ test "maintenance poll is bounded and reports more work" {
 }
 
 test "C ABI open does not spawn helper threads" {
-    var opts = brz_c_default_options();
+    var opts = ringloom_c_default_options();
     opts.spawn_helper_threads = false;
     opts.enable_prefetcher = true;
     opts.enable_cleaner = true;
 
-    var q: ?*brz_queue_t = null;
-    try testing.expectEqual(BRZ_OK, brz_queue_open(&opts, &q));
-    defer brz_queue_close(q.?);
+    var q: ?*ringloom_queue_t = null;
+    try testing.expectEqual(RINGLOOM_OK, ringloom_queue_open(&opts, &q));
+    defer ringloom_queue_close(q.?);
 
-    try testing.expectEqual(@as(u32, 0), brz_debug_thread_count(q.?));
+    try testing.expectEqual(@as(u32, 0), ringloom_debug_thread_count(q.?));
 }
 ```
 
@@ -925,15 +925,15 @@ test "C ABI open does not spawn helper threads" {
 
 ```zig
 test "benchmark: append latency p50/p99/p999" {
-    const tmp = try test_util.makeTempDir("brz.bench.latency.");
+    const tmp = try test_util.makeTempDir("ringloom.bench.latency.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -969,15 +969,15 @@ test "benchmark: append latency p50/p99/p999" {
 
 ```zig
 test "benchmark: sustained throughput" {
-    const tmp = try test_util.makeTempDir("brz.bench.throughput.");
+    const tmp = try test_util.makeTempDir("ringloom.bench.throughput.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -1010,16 +1010,16 @@ test "benchmark: sustained throughput" {
 
 ```zig
 test "benchmark: tailer poll latency with read prefetch" {
-    const tmp = try test_util.makeTempDir("brz.bench.poll-prefetch.");
+    const tmp = try test_util.makeTempDir("ringloom.bench.poll-prefetch.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .FAST_DAILY,
         .create = true,
         .read_prefetch_runway_bytes = 8 * 1024 * 1024,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     try prefillQueue(&queue, 10_000);
@@ -1115,8 +1115,8 @@ test "property: codec round-trip for random messages" {
         random.bytes(payload[0..len]);
 
         var buf: [4096]u8 = undefined;
-        const written = brz.RawBytesCodec.write(&buf, payload[0..len]);
-        const parsed = brz.RawBytesCodec.parse(written);
+        const written = ringloom.RawBytesCodec.write(&buf, payload[0..len]);
+        const parsed = ringloom.RawBytesCodec.parse(written);
 
         try testing.expectEqualSlices(u8, payload[0..len], parsed);
     }
@@ -1127,15 +1127,15 @@ test "property: codec round-trip for random messages" {
 
 ```zig
 test "property: index offsets are monotonically increasing" {
-    const tmp = try test_util.makeTempDir("brz.prop.index.");
+    const tmp = try test_util.makeTempDir("ringloom.prop.index.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .roll_scheme = .TEST4_SECONDLY, // small index for fast test
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -1197,7 +1197,7 @@ a `fuzz` input:
 test "fuzz codec parse does not crash" {
     // Feed random bytes to the codec parser — must not crash, panic, or UB
     const input = std.testing.fuzzInput(.{});
-    _ = brz.RawBytesCodec.parse(input) catch {};
+    _ = ringloom.RawBytesCodec.parse(input) catch {};
 }
 
 test "fuzz message header parser does not crash" {
@@ -1215,13 +1215,13 @@ test "fuzz message header parser does not crash" {
 
 ```zig
 test "fuzz queue file parser with random bytes" {
-    // Write random bytes as a .brz file and try to open/read
+    // Write random bytes as a .ringloom file and try to open/read
     const input = std.testing.fuzzInput(.{});
-    const tmp = try test_util.makeTempDir("brz.fuzz.");
+    const tmp = try test_util.makeTempDir("ringloom.fuzz.");
     defer test_util.removeTempDir(tmp);
 
-    // Write random content as a .brz file
-    const fuzz_path = try std.fs.path.join(testing.allocator, &.{ tmp.path, "19700101F.brz" });
+    // Write random content as a .ringloom file
+    const fuzz_path = try std.fs.path.join(testing.allocator, &.{ tmp.path, "19700101F.ringloom" });
     defer testing.allocator.free(fuzz_path);
 
     {
@@ -1230,15 +1230,15 @@ test "fuzz queue file parser with random bytes" {
         _ = try file.writeAll(input);
     }
 
-    // Also create a valid metadata.brz so queue.open doesn't fail on that
+    // Also create a valid metadata.ringloom so queue.open doesn't fail on that
     try test_util.writeValidMetadata(tmp.path);
 
     // Attempt to open and read — must not crash
-    var queue = brz.Queue([]const u8).open(.{
+    var queue = ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .create = false,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec) catch return;
+    }, ringloom.RawBytesCodec) catch return;
     defer queue.deinit();
 
     var tailer = queue.tailer(.start) catch return;
@@ -1258,7 +1258,7 @@ test "fuzz queue file parser with random bytes" {
 |--------|-------|------|
 | Codec parse | Random bytes | No crash, no UB |
 | Message header parser | Random 4-byte values | No crash, correct classification |
-| Queue file reader | Random `.brz` file | No crash, graceful error |
+| Queue file reader | Random `.ringloom` file | No crash, graceful error |
 | Index binary search | Random u64 array | No out-of-bounds, correct result |
 | Metadata parser | Random 512 bytes | No crash, detects invalid magic |
 
@@ -1268,11 +1268,11 @@ Seed the fuzzer with known-good files from integration tests:
 
 ```sh
 # Build seed corpus from passing integration tests
-mkdir -p fuzz/corpus/brz_file
-cp /tmp/brz-test-*/20*.brz fuzz/corpus/brz_file/
+mkdir -p fuzz/corpus/ringloom_file
+cp /tmp/ringloom-test-*/20*.ringloom fuzz/corpus/ringloom_file/
 
 mkdir -p fuzz/corpus/metadata
-cp /tmp/brz-test-*/metadata.brz fuzz/corpus/metadata/
+cp /tmp/ringloom-test-*/metadata.ringloom fuzz/corpus/metadata/
 ```
 
 ---
@@ -1297,14 +1297,14 @@ The hot path (append and poll) must not allocate. Verify by wrapping the allocat
 
 ```zig
 test "zero allocations on append hot path" {
-    const tmp = try test_util.makeTempDir("brz.noalloc.");
+    const tmp = try test_util.makeTempDir("ringloom.noalloc.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -1331,14 +1331,14 @@ test "zero allocations on append hot path" {
 }
 
 test "zero allocations on poll hot path" {
-    const tmp = try test_util.makeTempDir("brz.noalloc.poll.");
+    const tmp = try test_util.makeTempDir("ringloom.noalloc.poll.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
     defer queue.deinit();
 
     var appender = try queue.appender();
@@ -1368,14 +1368,14 @@ test "zero allocations on poll hot path" {
 
 ```zig
 test "mmap: unmap before close, null after unmap" {
-    const tmp = try test_util.makeTempDir("brz.mmap.");
+    const tmp = try test_util.makeTempDir("ringloom.mmap.");
     defer test_util.removeTempDir(tmp);
 
-    var queue = try brz.Queue([]const u8).open(.{
+    var queue = try ringloom.Queue([]const u8).open(.{
         .dir = tmp.path,
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
 
     // After deinit, all mappings should be released
     queue.deinit();
@@ -1391,11 +1391,11 @@ test "mmap: unmap before close, null after unmap" {
 ```zig
 test "queue deinit frees all memory" {
     // The testing allocator will fail this test if any allocation leaks
-    var queue = try brz.Queue([]const u8).open(.{
-        .dir = "/tmp/brz-leak-test",
+    var queue = try ringloom.Queue([]const u8).open(.{
+        .dir = "/tmp/ringloom-leak-test",
         .create = true,
         .allocator = testing.allocator,
-    }, brz.RawBytesCodec);
+    }, ringloom.RawBytesCodec);
 
     var appender = try queue.appender();
     try appender.append("test");
@@ -1437,11 +1437,11 @@ P3 = nice to have).
 | Scenario | Priority | Description |
 |---|---|---|
 | Write within single cycle | P1 | All entries have timestamps in the same roll period |
-| Write across cycle boundary | P1 | Timestamps span two roll periods, verify new `.brz` file created |
-| Read across cycle boundary | P1 | Tailer follows from one `.brz` file to the next |
+| Write across cycle boundary | P1 | Timestamps span two roll periods, verify new `.ringloom` file created |
+| Read across cycle boundary | P1 | Tailer follows from one `.ringloom` file to the next |
 | Multiple cycle gaps | P2 | Write to cycle N, skip N+1, write to N+2 — tailer handles missing files |
 | Resume tailer at specific cycle | P1 | Tailer starts at an index in a non-first cycle |
-| Cycle filename generation | P1 | Verify filenames for all roll schemes produce `.brz` extension |
+| Cycle filename generation | P1 | Verify filenames for all roll schemes produce `.ringloom` extension |
 | EOF written on roll | P1 | Verify `0xC0000000` header in old file when new cycle starts |
 | Pre-roll file creation | P1 | Verify next cycle's file is pre-created before the roll boundary |
 
@@ -1555,8 +1555,8 @@ pub fn build(b: *std.Build) void {
 
     // Main library
     const lib = b.addStaticLibrary(.{
-        .name = "brz_queue",
-        .root_source_file = b.path("src/brz_queue.zig"),
+        .name = "ringloom_queue",
+        .root_source_file = b.path("src/ringloom_queue.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1586,8 +1586,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        // Link the brz_queue module so tests can import it
-        t.root_module.addImport("brz_queue", &lib.root_module);
+        // Link the ringloom_queue module so tests can import it
+        t.root_module.addImport("ringloom_queue", &lib.root_module);
 
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
@@ -1601,7 +1601,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench.root_module.addImport("brz_queue", &lib.root_module);
+    bench.root_module.addImport("ringloom_queue", &lib.root_module);
 
     const bench_run = b.addRunArtifact(bench);
     bench_step.dependOn(&bench_run.step);
