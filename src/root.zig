@@ -1,18 +1,44 @@
-//! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
-const Io = std.Io;
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+pub const config = @import("ringloom/config.zig");
+pub const errors = @import("ringloom/errors.zig");
+pub const header = @import("ringloom/header.zig");
+pub const metadata = @import("ringloom/metadata.zig");
+pub const index = @import("ringloom/index.zig");
+pub const roll = @import("ringloom/roll.zig");
+pub const codec = @import("ringloom/codec.zig");
+pub const platform = @import("ringloom/platform.zig");
+pub const prefetcher = @import("ringloom/prefetcher.zig");
+pub const cleaner = @import("ringloom/cleaner.zig");
+pub const appender = @import("ringloom/appender.zig");
+pub const tailer = @import("ringloom/tailer.zig");
+pub const queue = @import("ringloom/queue.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+pub const Header = header.Header;
+pub const SharedMetadata = metadata.SharedMetadata;
+pub const QueueFileHeader = metadata.QueueFileHeader;
+pub const Index = index.Index;
+pub const IndexRegion = index.IndexRegion;
+pub const RollScheme = roll.RollScheme;
+pub const Queue = queue.Queue;
+pub const Tailer = tailer.Tailer;
+pub const TailerState = tailer.TailerState;
+pub const ParseBlockState = tailer.ParseBlockState;
+pub const RawCollected = tailer.RawCollected;
+pub const Collected = tailer.Collected;
+pub const Appender = appender.Appender;
+pub const Platform = platform.Platform;
+pub const StepResult = platform.StepResult;
+pub const Prefetcher = prefetcher.Prefetcher;
+pub const Cleaner = cleaner.Cleaner;
+pub const RingloomError = errors.RingloomError;
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+pub const Codec = codec.Codec;
+pub const Dispatcher = codec.Dispatcher;
+pub const DispatchAction = codec.DispatchAction;
+pub const DefaultRawCodec = codec.DefaultRawCodec;
+pub const RuntimeCodec = codec.RuntimeCodec;
+
+test {
+    std.testing.refAllDecls(@This());
 }

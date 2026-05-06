@@ -1410,21 +1410,21 @@ src/
 
 | Component | Zig module | Status |
 |-----------|------------|--------|
-| Header constants | `header.zig` | ☐ |
-| TailerState enum | `tailer.zig` | ☐ |
-| ParseBlockState enum | `tailer.zig` | ☐ |
-| Collected struct | `tailer.zig` | ☐ |
-| Codec interface | `codec.zig` | ☐ |
-| RollScheme + table (27 schemes) | `roll.zig` | ☐ |
-| Java→strftime conversion | `roll.zig` | ☐ |
-| 64-bit index helpers | `index.zig` | ☐ |
-| SharedMetadata (512-byte extern struct) | `metadata.zig` | ☐ |
-| QueueFileHeader (64-byte extern struct) | `metadata.zig` | ☐ |
-| IndexRegion (flat u64 array) | `index.zig` | ☐ |
-| Queue struct | `queue.zig` | ☐ |
-| Tailer struct | `tailer.zig` | ☐ |
-| Platform capabilities | `platform.zig` | ☐ |
-| Prefetcher state machine | `prefetcher.zig` | ☐ |
-| Cleaner state machine | `cleaner.zig` | ☐ |
-| Behaviour constants | `config.zig` | ☐ |
-| Error set | `errors.zig` | ☐ |
+| Header constants | `header.zig` | ☑ |
+| TailerState enum | `tailer.zig` | ☑ |
+| ParseBlockState enum | `tailer.zig` | ☑ |
+| Collected struct | `tailer.zig` | ☑ |
+| Codec interface | `codec.zig` | ☑ |
+| RollScheme + table (27 schemes) | `roll.zig` | ☑ |
+| Java→strftime conversion | `roll.zig` | ☑ |
+| 64-bit index helpers | `index.zig` | ☑ |
+| SharedMetadata (512-byte extern struct) | `metadata.zig` | ☑ |
+| QueueFileHeader (64-byte extern struct) | `metadata.zig` | ☑ |
+| IndexRegion (flat u64 array) | `index.zig` | ☑ |
+| Queue struct | `queue.zig` | ☑ |
+| Tailer struct | `tailer.zig` | ☑ |
+| Platform capabilities | `platform.zig` | ☑ |
+| Prefetcher state machine | `prefetcher.zig` | ☑ |
+| Cleaner state machine | `cleaner.zig` | ☑ |
+| Behaviour constants | `config.zig` | ☑ |
+| Error set | `errors.zig` | ☑ |
