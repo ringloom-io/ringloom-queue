@@ -2,12 +2,14 @@ const std = @import("std");
 
 const Header = @import("header.zig").Header;
 
+/// Errors raised by codec helpers before bytes enter or leave the mmap buffer.
 pub const CodecError = error{
     BufferTooSmall,
     MessageTooLarge,
     ParseFailed,
 };
 
+/// Compile-time codec contract for translating messages to and from payload bytes.
 pub fn Codec(comptime MessageType: type) type {
     return struct {
         pub const Message = MessageType;
@@ -16,16 +18,19 @@ pub fn Codec(comptime MessageType: type) type {
         serialized_size: *const fn (msg: MessageType) usize,
         write: *const fn (buf: []u8, msg: MessageType, size: usize) void,
 
+        /// Returns the serialized payload size after enforcing the 30-bit header limit.
         pub fn payloadSize(self: @This(), msg: MessageType) CodecError!usize {
             const size = self.serialized_size(msg);
             if (size > Header.SIZE_MASK) return error.MessageTooLarge;
             return size;
         }
 
+        /// Returns the full entry size, including the 4-byte header and padding.
         pub fn entrySize(self: @This(), msg: MessageType) CodecError!usize {
             return Header.entrySize(try self.payloadSize(msg));
         }
 
+        /// Writes a message into the provided payload buffer and returns the used slice.
         pub fn writePayload(self: @This(), buf: []u8, msg: MessageType) CodecError![]u8 {
             const size = try self.payloadSize(msg);
             if (buf.len < size) return error.BufferTooSmall;
@@ -33,12 +38,14 @@ pub fn Codec(comptime MessageType: type) type {
             return buf[0..size];
         }
 
+        /// Parses a payload slice or reports `ParseFailed` when the codec rejects it.
         pub fn parsePayload(self: @This(), buf: []const u8) CodecError!MessageType {
             return self.parse(buf) orelse error.ParseFailed;
         }
     };
 }
 
+/// Zero-copy codec for opaque byte slices.
 pub const RawCodec = Codec([]const u8){
     .parse = struct {
         fn f(buf: []const u8) ?[]const u8 {
@@ -59,6 +66,7 @@ pub const RawCodec = Codec([]const u8){
     }.f,
 };
 
+/// Zero-copy codec for UTF-8 text payloads.
 pub const TextCodec = Codec([]const u8){
     .parse = struct {
         fn f(buf: []const u8) ?[]const u8 {
@@ -70,8 +78,10 @@ pub const TextCodec = Codec([]const u8){
     .write = RawCodec.write,
 };
 
+/// Default codec used by untyped APIs.
 pub const DefaultRawCodec = RawCodec;
 
+/// Builds a fixed-layout codec for value types that can be copied as bytes.
 pub fn StructCodec(comptime T: type) Codec(T) {
     return .{
         .parse = struct {
@@ -96,11 +106,13 @@ pub fn StructCodec(comptime T: type) Codec(T) {
     };
 }
 
+/// Callback result used by dispatching tailer loops.
 pub const DispatchAction = enum {
     @"continue",
     stop,
 };
 
+/// Type-safe callback wrapper that parses a payload before dispatch.
 pub fn Dispatcher(comptime MessageType: type) type {
     return struct {
         pub const DispatchFn = *const fn (ctx: *anyopaque, index: u64, msg: MessageType) DispatchAction;
@@ -124,6 +136,7 @@ pub fn Dispatcher(comptime MessageType: type) type {
     };
 }
 
+/// Runtime vtable codec for FFI or dynamically selected message encodings.
 pub const RuntimeCodec = struct {
     parse_fn: *const fn (data: [*]const u8, len: usize) ?*anyopaque,
     free_fn: ?*const fn (obj: *anyopaque) void = null,

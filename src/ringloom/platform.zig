@@ -5,12 +5,14 @@ const RingloomError = @import("errors.zig").RingloomError;
 
 pub const fd_t = std.posix.fd_t;
 
+/// Bounded maintenance poll outcome for prefetcher and cleaner state machines.
 pub const StepResult = enum(u8) {
     idle,
     made_progress,
     more_work,
 };
 
+/// Runtime platform capability snapshot and OS-specific file advice helpers.
 pub const Platform = struct {
     supports_map_populate: bool,
     supports_madv_populate_write: bool,
@@ -19,6 +21,7 @@ pub const Platform = struct {
     supports_fadvise: bool,
     page_size: usize,
 
+    /// Detects capabilities that affect mmap, preallocation, and read-ahead strategy.
     pub fn detect() Platform {
         return .{
             .supports_map_populate = builtin.os.tag == .linux,
@@ -30,6 +33,7 @@ pub const Platform = struct {
         };
     }
 
+    /// Reserves disk blocks for a file range when the current platform supports it.
     pub fn preallocate(self: Platform, fd: fd_t, offset: u64, len: u64) RingloomError!void {
         if (!self.supports_preallocation) return error.PlatformCapabilityUnavailable;
         if (builtin.os.tag != .linux) return error.PlatformCapabilityUnavailable;
@@ -40,6 +44,7 @@ pub const Platform = struct {
         return checkedLinux(linux.fallocate(fd, 0, signed_offset, signed_len), .preallocate);
     }
 
+    /// Hints that a file range will soon be read by a tailer.
     pub fn adviseReadAhead(self: Platform, fd: fd_t, offset: u64, len: u64) RingloomError!void {
         if (!self.supports_fadvise) return error.PlatformCapabilityUnavailable;
         if (builtin.os.tag != .linux) return error.PlatformCapabilityUnavailable;
@@ -53,6 +58,7 @@ pub const Platform = struct {
         );
     }
 
+    /// Hints that a file range is cold and can be dropped from cache.
     pub fn adviseDontNeed(self: Platform, fd: fd_t, offset: u64, len: u64) RingloomError!void {
         if (!self.supports_fadvise) return error.PlatformCapabilityUnavailable;
         if (builtin.os.tag != .linux) return error.PlatformCapabilityUnavailable;
@@ -66,6 +72,7 @@ pub const Platform = struct {
         );
     }
 
+    /// Sets the visible file length after allocation or extension.
     pub fn truncate(self: Platform, fd: fd_t, size: u64) RingloomError!void {
         _ = self;
         const signed_size = try toSignedOffset(size, error.PreallocateFailed);

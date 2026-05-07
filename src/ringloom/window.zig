@@ -4,12 +4,14 @@ const config = @import("config.zig");
 const mmap_ops = @import("mmap_ops.zig");
 const RingloomError = @import("errors.zig").RingloomError;
 
+/// Block-aligned mapping window selected for a file tip.
 pub const WindowParams = struct {
     offset: u64,
     size: u64,
     tip_in_window: u64,
 };
 
+/// Computes the two-block window that keeps the previous block mapped.
 pub fn computeWindow(tip: u64, file_size: u64, blocksize: u64) WindowParams {
     if (blocksize == 0 or file_size == 0) {
         return .{ .offset = 0, .size = 0, .tip_in_window = 0 };
@@ -29,20 +31,24 @@ pub fn computeWindow(tip: u64, file_size: u64, blocksize: u64) WindowParams {
     };
 }
 
+/// Returns true when an existing mapping does not match the requested window.
 pub inline fn needsRemap(current_offset: u64, current_size: u64, new: WindowParams) bool {
     return new.size == 0 or new.offset != current_offset or new.size != current_size;
 }
 
+/// Returns true once the cursor crosses the halfway point of a mapped window.
 pub inline fn shouldPremap(tip_in_window: u64, window_size: u64) bool {
     return window_size != 0 and tip_in_window > (window_size >> 1);
 }
 
+/// Mutable current mmap window for a queue data file.
 pub const MmapWindow = struct {
     buf: ?[]align(config.page_alignment) u8 = null,
     offset: u64 = 0,
     size: u64 = 0,
     fd: std.posix.fd_t = -1,
 
+    /// Ensures the current window maps `params`, remapping when necessary.
     pub fn ensureMapped(
         self: *MmapWindow,
         params: WindowParams,
@@ -65,6 +71,7 @@ pub const MmapWindow = struct {
         self.size = params.size;
     }
 
+    /// Returns a pointer at an absolute file offset when it is inside the window.
     pub fn ptrAt(self: *const MmapWindow, abs_offset: u64) ?[*]u8 {
         const buf = self.buf orelse return null;
         if (abs_offset < self.offset) return null;
@@ -73,6 +80,7 @@ pub const MmapWindow = struct {
         return buf.ptr + @as(usize, @intCast(rel));
     }
 
+    /// Returns a mutable slice at an absolute file offset when fully mapped.
     pub fn sliceAt(self: *const MmapWindow, abs_offset: u64, len: usize) ?[]u8 {
         const buf = self.buf orelse return null;
         if (abs_offset < self.offset) return null;
@@ -84,6 +92,7 @@ pub const MmapWindow = struct {
         return buf[start..][0..len];
     }
 
+    /// Releases the current mapping, if any.
     pub fn unmap(self: *MmapWindow) void {
         if (self.buf) |old_buf| {
             mmap_ops.unmapFile(old_buf);
@@ -94,21 +103,25 @@ pub const MmapWindow = struct {
     }
 };
 
+/// Pair of current and prepared-next mappings for pointer-swap remaps.
 pub const PremappedWindow = struct {
     current: MmapWindow = .{},
     next: ?MmapWindow = null,
 
+    /// Releases both current and next mappings.
     pub fn deinit(self: *PremappedWindow) void {
         self.current.unmap();
         if (self.next) |*next| next.unmap();
         self.next = null;
     }
 
+    /// Replaces the prepared next mapping.
     pub fn setNext(self: *PremappedWindow, next: MmapWindow) void {
         if (self.next) |*old| old.unmap();
         self.next = next;
     }
 
+    /// Promotes a matching prepared window or maps the requested current window.
     pub fn ensureCurrentMapped(
         self: *PremappedWindow,
         params: WindowParams,

@@ -3,6 +3,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const QueueFileHeader = @import("metadata.zig").QueueFileHeader;
 
+/// Helpers for the 64-bit public index: upper 32 bits are cycle, lower 32 bits are seqnum.
 pub const Index = struct {
     pub const cycle_shift: u6 = 32;
     pub const seqnum_mask: u64 = 0x00000000ffffffff;
@@ -28,16 +29,19 @@ pub const Index = struct {
     }
 };
 
+/// Starting point selected from the inline index before a tailer scans forward.
 pub const SeekPoint = struct {
     offset: u64,
     seqnum: u32,
 };
 
+/// View of the flat inline index stored immediately after a queue file header.
 pub const IndexRegion = struct {
     entries: [*]align(8) u64,
     count: u32,
     spacing: u32,
 
+    /// Returns the index slot for a seqnum only when that seqnum is indexed.
     pub inline fn slotFor(self: IndexRegion, seqnum: u32) ?u32 {
         if (self.spacing == 0) return null;
         const slot = seqnum / self.spacing;
@@ -46,6 +50,7 @@ pub const IndexRegion = struct {
         return slot;
     }
 
+    /// Acquire-loads an indexed byte offset; zero means the slot is empty.
     pub inline fn lookup(self: IndexRegion, slot: u32) ?u64 {
         if (slot >= self.count) return null;
         const val = @atomicLoad(u64, &self.entries[slot], .acquire);
@@ -53,15 +58,18 @@ pub const IndexRegion = struct {
         return val;
     }
 
+    /// Release-stores an indexed byte offset if the slot is in range.
     pub inline fn store(self: IndexRegion, slot: u32, offset: u64) void {
         if (slot >= self.count) return;
         @atomicStore(u64, &self.entries[slot], offset, .release);
     }
 
+    /// Returns the first byte offset after the queue file header and index array.
     pub inline fn dataRegionOffset(self: IndexRegion) u64 {
         return @sizeOf(QueueFileHeader) + @as(u64, self.count) * @sizeOf(u64);
     }
 
+    /// Finds the nearest indexed offset at or before `target_seqnum`.
     pub fn seekOffset(self: IndexRegion, target_seqnum: u32, data_start: u64) SeekPoint {
         if (self.count == 0 or self.spacing == 0) return .{ .offset = data_start, .seqnum = 0 };
 
@@ -78,6 +86,7 @@ pub const IndexRegion = struct {
         return .{ .offset = data_start, .seqnum = 0 };
     }
 
+    /// Builds an index view from the base of a mapped queue file.
     pub fn fromMmap(mmap_base: [*]align(config.page_alignment) u8, header: *const QueueFileHeader) IndexRegion {
         const index_base = mmap_base + @sizeOf(QueueFileHeader);
         return .{

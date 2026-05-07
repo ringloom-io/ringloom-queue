@@ -13,6 +13,7 @@ const Queue = @import("queue.zig").Queue;
 const ReadPrefetchState = @import("prefetcher.zig").ReadPrefetchState;
 const StepResult = @import("platform.zig").StepResult;
 
+/// Result state from the most recent tailer poll.
 pub const TailerState = enum(u8) {
     awaiting_entry = 0,
     busy = 1,
@@ -23,6 +24,7 @@ pub const TailerState = enum(u8) {
     extend_needed = 6,
     collected = 7,
 
+    /// Returns a stable diagnostic label for this state.
     pub fn description(self: TailerState) []const u8 {
         return switch (self) {
             .awaiting_entry => "AWAITING_ENTRY",
@@ -37,6 +39,7 @@ pub const TailerState = enum(u8) {
     }
 };
 
+/// Internal block scanner states used by low-level parsing paths.
 pub const ParseBlockState = enum(u8) {
     awaiting_entry = 0,
     busy = 1,
@@ -46,6 +49,7 @@ pub const ParseBlockState = enum(u8) {
     collected = 7,
 };
 
+/// Synchronous collection result for typed messages.
 pub fn Collected(comptime T: type) type {
     return struct {
         msg: ?T = null,
@@ -54,18 +58,21 @@ pub fn Collected(comptime T: type) type {
     };
 }
 
+/// Synchronous collection result for borrowed raw byte payloads.
 pub const RawCollected = struct {
     msg: ?[]const u8 = null,
     size: usize = 0,
     index: u64 = 0,
 };
 
+/// Non-blocking raw poll result.
 pub const RawEntry = struct {
     index: u64,
     payload: []const u8,
     raw_size: usize,
 };
 
+/// Non-blocking typed poll result.
 pub fn Entry(comptime MessageType: type) type {
     return struct {
         index: u64,
@@ -74,6 +81,7 @@ pub fn Entry(comptime MessageType: type) type {
     };
 }
 
+/// Mapping protection used when opening a tailer cycle file.
 pub const MmapProtection = enum {
     read_only,
     read_write,
@@ -86,6 +94,7 @@ pub const MmapProtection = enum {
     }
 };
 
+/// Independent read cursor over queue cycle files.
 pub const Tailer = struct {
     dispatch_after: u64 = 0,
     state: TailerState = .not_yet_polled,
@@ -111,6 +120,7 @@ pub const Tailer = struct {
     read_prefetch: ReadPrefetchState = .{},
     queue: *Queue,
 
+    /// Initializes a tailer positioned at the requested public index.
     pub fn init(queue: *Queue, start_index: u64) Tailer {
         return .{
             .queue = queue,
@@ -119,6 +129,7 @@ pub const Tailer = struct {
         };
     }
 
+    /// Allocates, registers, and optionally seeks a new tailer.
     pub fn create(queue: *Queue, start_index: u64) !*Tailer {
         const tailer = try queue.allocator.create(Tailer);
         errdefer queue.allocator.destroy(tailer);
@@ -132,12 +143,14 @@ pub const Tailer = struct {
         return tailer;
     }
 
+    /// Unregisters this tailer and releases its mapping resources.
     pub fn deinit(self: *Tailer) void {
         self.queue.unregisterTailerPrefetch(self);
         self.closeCycleFile();
         self.queue.allocator.destroy(self);
     }
 
+    /// Non-blocking raw read from the current tailer position.
     pub fn pollRaw(self: *Tailer) !?RawEntry {
         var iterations: usize = 0;
         while (iterations < 1024) : (iterations += 1) {
@@ -199,6 +212,7 @@ pub const Tailer = struct {
         return null;
     }
 
+    /// Non-blocking typed read using a codec to parse the payload.
     pub fn pollWithCodec(
         self: *Tailer,
         comptime MessageType: type,
@@ -212,6 +226,7 @@ pub const Tailer = struct {
         };
     }
 
+    /// Blocking typed read loop that yields while waiting for data.
     pub fn collectWithCodec(
         self: *Tailer,
         comptime MessageType: type,
@@ -223,6 +238,7 @@ pub const Tailer = struct {
         }
     }
 
+    /// Drives read-side prefetch preparation for this tailer.
     pub fn prefetchPoll(self: *Tailer, max_work_units: u32) !StepResult {
         _ = max_work_units;
         const buf = self.qf_buf orelse return .idle;
@@ -233,6 +249,7 @@ pub const Tailer = struct {
         return .idle;
     }
 
+    /// Seeks to a public index using the inline index, then scans forward.
     pub fn seekTo(self: *Tailer, target_index: u64) !void {
         const target_cycle = Index.cycle(target_index);
         const target_seqnum = Index.seqnum(target_index);
@@ -252,6 +269,7 @@ pub const Tailer = struct {
         self.dispatch_after = if (target_index == 0) 0 else target_index - 1;
     }
 
+    /// Converts an absolute file offset to a mapped pointer when in range.
     pub fn offsetToPtr(self: *const Tailer, file_offset: u64) ?[*]u8 {
         const buf = self.qf_buf orelse return null;
         if (file_offset < self.qf_mmapoff) return null;

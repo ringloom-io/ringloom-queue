@@ -2,6 +2,7 @@ const std = @import("std");
 
 const config = @import("config.zig");
 
+/// Defines the cycle duration, filename format, and inline-index density.
 pub const RollScheme = struct {
     name: []const u8,
     format_str: []const u8,
@@ -9,11 +10,13 @@ pub const RollScheme = struct {
     index_count: u32,
     index_spacing: u32,
 
+    /// Returns the cycle duration in milliseconds.
     pub fn rollLengthMs(self: RollScheme) u64 {
         return @as(u64, self.roll_length_secs) * 1000;
     }
 };
 
+/// Built-in roll schemes supported by the queue format.
 pub const roll_schemes = [_]RollScheme{
     .{ .name = "FIVE_MINUTELY", .format_str = "yyyyMMdd-HHmm'V'", .roll_length_secs = 5 * 60, .index_count = 2048, .index_spacing = 256 },
     .{ .name = "TEN_MINUTELY", .format_str = "yyyyMMdd-HHmm'X'", .roll_length_secs = 10 * 60, .index_count = 2048, .index_spacing = 256 },
@@ -44,8 +47,10 @@ pub const roll_schemes = [_]RollScheme{
     .{ .name = "TEST8_DAILY", .format_str = "yyyyMMdd'T8'", .roll_length_secs = 86400, .index_count = 128, .index_spacing = 8 },
 };
 
+/// Default roll scheme used when creating a queue without an explicit scheme.
 pub const default_scheme = roll_schemes[8];
 
+/// Finds a roll scheme by its stable public name.
 pub fn findSchemeByName(name: []const u8) ?RollScheme {
     for (roll_schemes) |scheme| {
         if (std.mem.eql(u8, scheme.name, name)) return scheme;
@@ -53,6 +58,7 @@ pub fn findSchemeByName(name: []const u8) ?RollScheme {
     return null;
 }
 
+/// Finds a roll scheme by its Java-style filename format string.
 pub fn findSchemeByFormat(format_str: []const u8) ?RollScheme {
     for (roll_schemes) |scheme| {
         if (std.mem.eql(u8, scheme.format_str, format_str)) return scheme;
@@ -60,12 +66,14 @@ pub fn findSchemeByFormat(format_str: []const u8) ?RollScheme {
     return null;
 }
 
+/// Errors returned when converting roll filename formats.
 pub const ConversionError = error{
     UnrecognizedToken,
     UnterminatedQuote,
     BufferOverflow,
 };
 
+/// Converts the supported Java date tokens into this package's UTC formatter tokens.
 pub fn javaFormatToStrftime(
     java_fmt: []const u8,
     strftime_buf: []u8,
@@ -121,12 +129,14 @@ pub fn javaFormatToStrftime(
     return .{ .strftime = strftime_buf[0..si], .clean = clean_buf[0..ci] };
 }
 
+/// Computes the roll cycle for a UTC millisecond timestamp.
 pub fn cycleFromMs(ms: i64, epoch_ms: i64, roll_length_ms: u64) u64 {
     std.debug.assert(roll_length_ms != 0);
     if (ms <= epoch_ms) return 0;
     return @intCast(@divFloor(ms - epoch_ms, @as(i64, @intCast(roll_length_ms))));
 }
 
+/// Allocates the full path for a cycle file using a converted date format.
 pub fn getCycleFilename(
     allocator: std.mem.Allocator,
     dirname: []const u8,
@@ -144,6 +154,7 @@ pub fn getCycleFilename(
     return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ dirname, date, config.queue_file_extension });
 }
 
+/// Backwards-compatible alias for `getCycleFilename`.
 pub fn getCycleFn(
     allocator: std.mem.Allocator,
     dirname: []const u8,
@@ -154,6 +165,7 @@ pub fn getCycleFn(
     return getCycleFilename(allocator, dirname, cycle, roll_length_ms, strftime_pattern);
 }
 
+/// Formats a UTC timestamp using the small token set produced by `javaFormatToStrftime`.
 pub fn formatTimestamp(buf: []u8, seconds: i64, strftime_pattern: []const u8) ConversionError![]const u8 {
     const dt = dateTimeFromUnixSeconds(seconds);
     var out: usize = 0;

@@ -3,21 +3,25 @@ const std = @import("std");
 const Platform = @import("platform.zig").Platform;
 const RingloomError = @import("errors.zig").RingloomError;
 
+/// Rounds `value` up to the next multiple of `alignment`.
 pub inline fn alignUp(value: u64, alignment: u64) u64 {
     if (alignment == 0) return value;
     const rem = value % alignment;
     return if (rem == 0) value else value + (alignment - rem);
 }
 
+/// Returns true when the appender is within one block of the mapped file end.
 pub inline fn needsExtension(tip: u64, file_size: u64, blocksize: u64) bool {
     return blocksize != 0 and tip +| blocksize >= file_size;
 }
 
+/// Preallocates and truncates a file to the requested size.
 pub fn extendFile(platform: Platform, fd: std.posix.fd_t, new_size: u64) RingloomError!void {
     try platform.preallocate(fd, 0, new_size);
     try platform.truncate(fd, new_size);
 }
 
+/// Extends a file even when platform block preallocation is unavailable.
 pub fn extendFilePermissive(platform: Platform, fd: std.posix.fd_t, new_size: u64) RingloomError!void {
     platform.preallocate(fd, 0, new_size) catch |err| switch (err) {
         error.PlatformCapabilityUnavailable => {},
@@ -26,6 +30,7 @@ pub fn extendFilePermissive(platform: Platform, fd: std.posix.fd_t, new_size: u6
     try platform.truncate(fd, new_size);
 }
 
+/// Extends a file only when `required_size` exceeds `current_size`.
 pub fn ensureFileSize(
     platform: Platform,
     fd: std.posix.fd_t,
@@ -39,6 +44,7 @@ pub fn ensureFileSize(
     current_size.* = new_size;
 }
 
+/// Best-effort variant of `ensureFileSize` for platforms without preallocation.
 pub fn ensureFileSizePermissive(
     platform: Platform,
     fd: std.posix.fd_t,

@@ -10,6 +10,7 @@ const tailer_mod = @import("tailer.zig");
 const Version = @import("queue.zig").Version;
 const StepResult = @import("platform.zig").StepResult;
 
+/// Options for opening or creating a typed queue.
 pub const QueueConfig = struct {
     dir: []const u8,
     version: Version = .v1,
@@ -27,6 +28,7 @@ pub const QueueConfig = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
+/// Snapshot of queue and appender counters useful for observability.
 pub const Diagnostics = struct {
     appends: u64 = 0,
     rolls: u64 = 0,
@@ -40,11 +42,13 @@ pub const Diagnostics = struct {
     cleaner_enabled: bool = false,
 };
 
+/// Blocking collect strategy used by the convenience tailer loop.
 pub const BackoffPolicy = enum {
     spin,
     yield,
 };
 
+/// Type-safe public queue API monomorphized for `MessageType`.
 pub fn Queue(comptime MessageType: type) type {
     return struct {
         const Self = @This();
@@ -52,6 +56,7 @@ pub fn Queue(comptime MessageType: type) type {
         inner: *CoreQueue,
         codec: codec_mod.Codec(MessageType),
 
+        /// Opens an existing queue or creates it when `config.create` is set.
         pub fn open(config: QueueConfig, comptime codec: codec_mod.Codec(MessageType)) !Self {
             _ = config.version;
             _ = config.lock_appender_windows;
@@ -79,19 +84,23 @@ pub fn Queue(comptime MessageType: type) type {
             };
         }
 
+        /// Releases all queue resources owned by this handle.
         pub fn deinit(self: *Self) void {
             self.inner.deinit();
         }
 
+        /// Appends a message using the current wall-clock cycle.
         pub fn append(self: *Self, msg: MessageType) !u64 {
             return self.appendWithTimestamp(msg, try nowMs(self.inner.io));
         }
 
+        /// Appends a message using an explicit UTC millisecond timestamp.
         pub fn appendWithTimestamp(self: *Self, msg: MessageType, ts_ms: u64) !u64 {
             const app = try self.inner.openAppender();
             return app.appendWithCodec(MessageType, self.codec, msg, ts_ms);
         }
 
+        /// Opens an independent tailer starting at the requested public index.
         pub fn tailer(self: *Self, start_index: u64) !Tailer(MessageType) {
             const actual_start = if (start_index == 0 and self.inner.lowest_cycle != 0)
                 Index.compose(@intCast(self.inner.lowest_cycle), 0)
@@ -103,6 +112,7 @@ pub fn Queue(comptime MessageType: type) type {
             };
         }
 
+        /// Requests cleaner retention to advance to `cycle`.
         pub fn truncateBefore(self: *Self, cycle: u32) !void {
             if (self.inner.cleaner) |cleaner| {
                 cleaner.retention_floor_cycle = cycle;
@@ -111,6 +121,7 @@ pub fn Queue(comptime MessageType: type) type {
             return error.CleanerFailed;
         }
 
+        /// Returns a best-effort diagnostics snapshot without touching the hot path.
         pub fn diagnostics(self: *const Self) Diagnostics {
             var result: Diagnostics = .{
                 .highest_cycle = self.inner.highest_cycle,
@@ -129,14 +140,17 @@ pub fn Queue(comptime MessageType: type) type {
             return result;
         }
 
+        /// Drives queue-level prefetcher and cleaner work within a bounded budget.
         pub fn maintenancePoll(self: *Self, max_work_units: u32) !StepResult {
             return self.inner.maintenancePoll(max_work_units);
         }
 
+        /// Returns the detected on-disk format version.
         pub fn getVersion(self: *const Self) Version {
             return self.inner.getVersion();
         }
 
+        /// Returns the roll scheme loaded from metadata or supplied at creation.
         pub fn getRollScheme(self: *const Self) RollScheme {
             return .{
                 .name = self.inner.roll_name orelse "",
@@ -149,6 +163,7 @@ pub fn Queue(comptime MessageType: type) type {
     };
 }
 
+/// Typed tailer cursor over a queue.
 pub fn Tailer(comptime MessageType: type) type {
     return struct {
         const Self = @This();
@@ -158,10 +173,12 @@ pub fn Tailer(comptime MessageType: type) type {
         inner: *tailer_mod.Tailer,
         codec: codec_mod.Codec(MessageType),
 
+        /// Non-blocking read; returns null when no complete message is available.
         pub fn poll(self: *Self) !?Entry {
             return self.inner.pollWithCodec(MessageType, self.codec);
         }
 
+        /// Blocking convenience loop around `poll` using caller-selected backoff.
         pub fn collect(self: *Self, backoff: BackoffPolicy) !Entry {
             while (true) {
                 if (try self.poll()) |entry| return entry;
@@ -172,28 +189,34 @@ pub fn Tailer(comptime MessageType: type) type {
             }
         }
 
+        /// Drives read-side prefetch work for this tailer.
         pub fn prefetchPoll(self: *Self, max_work_units: u32) !StepResult {
             return self.inner.prefetchPoll(max_work_units);
         }
 
+        /// Repositions the tailer so the next read starts at or after `index`.
         pub fn seekTo(self: *Self, index: u64) !void {
             try self.inner.seekTo(index);
         }
 
+        /// Returns the state produced by the last polling operation.
         pub fn getState(self: *const Self) tailer_mod.TailerState {
             return self.inner.state;
         }
 
+        /// Returns the next public index this tailer will attempt to read.
         pub fn getIndex(self: *const Self) u64 {
             return self.inner.qf_index;
         }
 
+        /// Closes files and mappings owned by this tailer.
         pub fn deinit(self: *Self) void {
             self.inner.deinit();
         }
     };
 }
 
+/// Writes a compact hexadecimal and ASCII dump for debugging payload bytes.
 pub fn hexDump(writer: anytype, label: []const u8, data: []const u8) !void {
     try writer.print("-- {s} ({d} bytes) --\n", .{ label, data.len });
     var offset: usize = 0;

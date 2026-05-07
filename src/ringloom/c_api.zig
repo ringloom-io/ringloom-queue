@@ -6,10 +6,14 @@ const CoreQueue = @import("queue.zig").Queue;
 const roll = @import("roll.zig");
 const Tailer = @import("tailer.zig").Tailer;
 
+/// C ABI version for struct-size and behavior compatibility checks.
 pub const abi_version: u32 = 1;
 
+/// Opaque C queue handle.
 pub const ringloom_queue_t = opaque {};
+/// Opaque C appender handle.
 pub const ringloom_appender_t = opaque {};
+/// Opaque C tailer handle.
 pub const ringloom_tailer_t = opaque {};
 
 const QueueHandle = struct {
@@ -24,6 +28,7 @@ const TailerHandle = struct {
     tailer: *Tailer,
 };
 
+/// Stable C error codes; these are not Zig error-set ordinals.
 pub const ringloom_error_t = enum(c_int) {
     ok = 0,
     ok_not_ready = 1,
@@ -39,12 +44,14 @@ pub const ringloom_error_t = enum(c_int) {
     internal_error = -255,
 };
 
+/// C representation of bounded maintenance poll progress.
 pub const ringloom_step_result_t = enum(c_int) {
     idle = 0,
     progress = 1,
     more_work = 2,
 };
 
+/// Options passed to `ringloom_queue_open`.
 pub const ringloom_queue_options = extern struct {
     size: u32 = @sizeOf(ringloom_queue_options),
     dir: ?[*]const u8 = null,
@@ -57,6 +64,7 @@ pub const ringloom_queue_options = extern struct {
     spawn_helper_threads: bool = false,
 };
 
+/// Borrowed payload view returned by `ringloom_tailer_poll`.
 pub const ringloom_message_view = extern struct {
     size: u32 = @sizeOf(ringloom_message_view),
     index: u64 = 0,
@@ -64,10 +72,12 @@ pub const ringloom_message_view = extern struct {
     data_len: usize = 0,
 };
 
+/// Returns the C ABI version supported by this build.
 pub export fn ringloom_abi_version() u32 {
     return abi_version;
 }
 
+/// Returns a static, null-terminated string for a C error code.
 pub export fn ringloom_strerror(err: c_int) [*:0]const u8 {
     return switch (err) {
         0 => "ok",
@@ -85,6 +95,7 @@ pub export fn ringloom_strerror(err: c_int) [*:0]const u8 {
     };
 }
 
+/// Opens or creates a queue and stores an opaque handle in `out`.
 pub export fn ringloom_queue_open(opts: ?*const ringloom_queue_options, out: ?*?*ringloom_queue_t) c_int {
     const options = opts orelse return code(.invalid_argument);
     const out_ptr = out orelse return code(.invalid_argument);
@@ -129,6 +140,7 @@ pub export fn ringloom_queue_open(opts: ?*const ringloom_queue_options, out: ?*?
     return code(.ok);
 }
 
+/// Closes a queue handle and all resources it owns.
 pub export fn ringloom_queue_close(q: ?*ringloom_queue_t) void {
     const handle = queueHandle(q) orelse return;
     const allocator = handle.queue.allocator;
@@ -136,6 +148,7 @@ pub export fn ringloom_queue_close(q: ?*ringloom_queue_t) void {
     allocator.destroy(handle);
 }
 
+/// Opens a C appender handle; returns `appender_already_open` for duplicates.
 pub export fn ringloom_appender_open(q: ?*ringloom_queue_t, out: ?*?*ringloom_appender_t) c_int {
     const queue_handle = queueHandle(q) orelse return code(.invalid_argument);
     const out_ptr = out orelse return code(.invalid_argument);
@@ -152,6 +165,7 @@ pub export fn ringloom_appender_open(q: ?*ringloom_queue_t, out: ?*?*ringloom_ap
     return code(.ok);
 }
 
+/// Appends raw bytes and optionally returns the assigned public index.
 pub export fn ringloom_appender_append(
     a: ?*ringloom_appender_t,
     data: ?*const anyopaque,
@@ -166,6 +180,7 @@ pub export fn ringloom_appender_append(
     return code(.ok);
 }
 
+/// Closes a C appender handle.
 pub export fn ringloom_appender_close(a: ?*ringloom_appender_t) void {
     const handle = appenderHandle(a) orelse return;
     const allocator = handle.appender.queue.allocator;
@@ -173,6 +188,7 @@ pub export fn ringloom_appender_close(a: ?*ringloom_appender_t) void {
     allocator.destroy(handle);
 }
 
+/// Opens a C tailer handle at `start_index`.
 pub export fn ringloom_tailer_open(q: ?*ringloom_queue_t, start_index: u64, out: ?*?*ringloom_tailer_t) c_int {
     const queue_handle = queueHandle(q) orelse return code(.invalid_argument);
     const out_ptr = out orelse return code(.invalid_argument);
@@ -192,6 +208,7 @@ pub export fn ringloom_tailer_open(q: ?*ringloom_queue_t, start_index: u64, out:
     return code(.ok);
 }
 
+/// Non-blocking poll; returned data is borrowed until the next tailer call or close.
 pub export fn ringloom_tailer_poll(t: ?*ringloom_tailer_t, out: ?*ringloom_message_view) c_int {
     const handle = tailerHandle(t) orelse return code(.invalid_argument);
     const out_ptr = out orelse return code(.invalid_argument);
@@ -209,6 +226,7 @@ pub export fn ringloom_tailer_poll(t: ?*ringloom_tailer_t, out: ?*ringloom_messa
     return code(.ok_not_ready);
 }
 
+/// Drives bounded read-side prefetch work for a tailer.
 pub export fn ringloom_tailer_prefetch_poll(
     t: ?*ringloom_tailer_t,
     max_work_units: u32,
@@ -220,6 +238,7 @@ pub export fn ringloom_tailer_prefetch_poll(
     return code(.ok);
 }
 
+/// Closes a C tailer handle.
 pub export fn ringloom_tailer_close(t: ?*ringloom_tailer_t) void {
     const handle = tailerHandle(t) orelse return;
     const allocator = handle.tailer.queue.allocator;
@@ -227,6 +246,7 @@ pub export fn ringloom_tailer_close(t: ?*ringloom_tailer_t) void {
     allocator.destroy(handle);
 }
 
+/// Drives bounded queue maintenance work.
 pub export fn ringloom_queue_maintenance_poll(
     q: ?*ringloom_queue_t,
     max_work_units: u32,
@@ -238,6 +258,7 @@ pub export fn ringloom_queue_maintenance_poll(
     return code(.ok);
 }
 
+/// Alias for queue-level maintenance polling.
 pub export fn ringloom_queue_prefetch_poll(
     q: ?*ringloom_queue_t,
     max_work_units: u32,
@@ -246,6 +267,7 @@ pub export fn ringloom_queue_prefetch_poll(
     return ringloom_queue_maintenance_poll(q, max_work_units, out);
 }
 
+/// Alias for queue-level maintenance polling.
 pub export fn ringloom_queue_cleaner_poll(
     q: ?*ringloom_queue_t,
     max_work_units: u32,

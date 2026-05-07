@@ -10,12 +10,14 @@ const QueueFileHeader = metadata_mod.QueueFileHeader;
 const mmap_ops = @import("mmap_ops.zig");
 const Queue = @import("queue.zig").Queue;
 
+/// Prepared mmap window that can be swapped into the appender.
 pub const MappedWindow = struct {
     buf: []align(config.page_alignment) u8,
     mmap_offset: u64,
     mmap_size: u64,
 };
 
+/// Counters that describe appender activity and fallback paths.
 pub const AppenderDiagnostics = struct {
     appends: u64 = 0,
     rolls: u64 = 0,
@@ -24,11 +26,13 @@ pub const AppenderDiagnostics = struct {
     preroll_misses: u64 = 0,
 };
 
+/// Result of a raw append, including the borrowed mmap payload slice.
 pub const AppendResult = struct {
     index: u64,
     payload: []const u8,
 };
 
+/// Single-writer append handle for a queue.
 pub const Appender = struct {
     queue: *Queue,
     cycle: u64 = 0,
@@ -43,6 +47,7 @@ pub const Appender = struct {
     owner_token: u64 = 0,
     diagnostics: AppenderDiagnostics = .{},
 
+    /// Initializes appender state before the lifecycle lease is acquired.
     pub fn init(queue: *Queue) Appender {
         return .{
             .queue = queue,
@@ -50,6 +55,11 @@ pub const Appender = struct {
         };
     }
 
+    /// Opens or reuses the appender for this queue handle.
+    ///
+    /// Cross-process exclusivity is enforced by the mapped appender lease; the
+    /// Zig handle is reused so `Queue.append` can stay allocation-free after
+    /// the first append.
     pub fn open(queue: *Queue) !*Appender {
         if (queue.appender) |existing| return existing;
 
@@ -65,6 +75,7 @@ pub const Appender = struct {
         return appender;
     }
 
+    /// Releases the lifecycle lease and destroys this appender handle.
     pub fn close(self: *Appender) void {
         const queue = self.queue;
         self.deinit();
@@ -72,6 +83,7 @@ pub const Appender = struct {
         queue.allocator.destroy(self);
     }
 
+    /// Releases mappings, file descriptors, and the lifecycle lease.
     pub fn deinit(self: *Appender) void {
         if (self.ready_window) |window| {
             mmap_ops.unmapFile(window.buf);
@@ -91,14 +103,17 @@ pub const Appender = struct {
         }
     }
 
+    /// Appends a raw payload using the current wall-clock cycle.
     pub fn append(self: *Appender, payload: []const u8) !u64 {
         return self.appendWithTimestamp(payload, try self.nowMs());
     }
 
+    /// Appends a raw payload using an explicit UTC millisecond timestamp.
     pub fn appendWithTimestamp(self: *Appender, payload: []const u8, now_ms: u64) !u64 {
         return (try self.appendRaw(payload, now_ms)).index;
     }
 
+    /// Appends bytes directly to mmap and returns the assigned index and payload view.
     pub fn appendRaw(self: *Appender, payload: []const u8, now_ms: u64) !AppendResult {
         if (payload.len == 0) return error.EmptyPayload;
         if (payload.len > Header.SIZE_MASK) return error.MessageTooLarge;
@@ -146,6 +161,7 @@ pub const Appender = struct {
         };
     }
 
+    /// Serializes and appends a typed message through the provided codec.
     pub fn appendWithCodec(
         self: *Appender,
         comptime MessageType: type,
@@ -411,6 +427,7 @@ pub const Appender = struct {
     }
 };
 
+/// Returns the first data byte after the file header and inline index.
 pub fn dataStartOffset(queue: *const Queue) u64 {
     return @sizeOf(QueueFileHeader) + @as(u64, queue.index_count) * @sizeOf(u64);
 }

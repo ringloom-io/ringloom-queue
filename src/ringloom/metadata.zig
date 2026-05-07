@@ -4,6 +4,7 @@ pub const metadata_magic: u32 = 0x4d515a42;
 pub const queue_file_magic: u32 = 0x43515a42;
 pub const format_version: u16 = 1;
 
+/// Fixed 512-byte metadata file shared by appenders and tailers.
 pub const SharedMetadata = extern struct {
     magic: u32 = metadata_magic,
     version: u16 = format_version,
@@ -20,6 +21,7 @@ pub const SharedMetadata = extern struct {
     appender_lock: u64 align(8),
     _reserved: [440]u8 = [_]u8{0} ** 440,
 
+    /// Creates a zeroed metadata record with the immutable roll configuration set.
     pub fn init(roll_length_secs: u32, index_spacing: u32, index_count: u32, epoch_ms: u64) SharedMetadata {
         return .{
             .roll_length_secs = roll_length_secs,
@@ -35,6 +37,7 @@ pub const SharedMetadata = extern struct {
     }
 };
 
+/// Fixed 64-byte header at the start of every cycle data file.
 pub const QueueFileHeader = extern struct {
     magic: u32 = queue_file_magic,
     version: u16 = format_version,
@@ -47,6 +50,7 @@ pub const QueueFileHeader = extern struct {
     created_cycle: u32,
     _reserved: [28]u8 = [_]u8{0} ** 28,
 
+    /// Creates a queue-file header that mirrors the shared roll configuration.
     pub fn init(
         roll_length_secs: u32,
         index_spacing: u32,

@@ -6,6 +6,7 @@ const SharedMetadata = @import("metadata.zig").SharedMetadata;
 
 const posix = std.posix;
 
+/// Memory protection requested for a shared file mapping.
 pub const Protection = enum {
     read_only,
     read_write,
@@ -18,6 +19,7 @@ pub const Protection = enum {
     }
 };
 
+/// Optional mmap flags used by platform-specific prefetch paths.
 pub const MapFlags = struct {
     type: posix.system.MAP_TYPE = .SHARED,
     populate: bool = false,
@@ -34,6 +36,7 @@ pub const MapFlags = struct {
         return flags;
     }
 
+    /// Returns the same mapping request with the Linux huge-page flag disabled.
     pub fn withoutHugePages(self: MapFlags) MapFlags {
         var flags = self;
         flags.huge_tlb = false;
@@ -41,15 +44,18 @@ pub const MapFlags = struct {
     }
 };
 
+/// Mapping of `metadata.ringloom` plus its fixed-layout metadata pointer.
 pub const MetadataMap = struct {
     buf: []align(config.page_alignment) u8,
     metadata: *SharedMetadata,
 
+    /// Releases the metadata mapping.
     pub fn unmap(self: MetadataMap) void {
         unmapFile(self.buf);
     }
 };
 
+/// Maps a shared file range with the requested protection and flags.
 pub fn mapFile(
     fd: posix.fd_t,
     offset: u64,
@@ -70,6 +76,7 @@ pub fn mapFile(
     ) catch error.MmapFailed;
 }
 
+/// Maps a range and retries without huge pages when that optional mapping fails.
 pub fn mapFileWithFallback(
     fd: posix.fd_t,
     offset: u64,
@@ -85,10 +92,12 @@ pub fn mapFileWithFallback(
     };
 }
 
+/// Unmaps a previously mapped file range.
 pub fn unmapFile(buf: []align(config.page_alignment) const u8) void {
     posix.munmap(buf);
 }
 
+/// Replaces one mapping with another mapping of the same file descriptor.
 pub fn remapFile(
     old_buf: []align(config.page_alignment) u8,
     fd: posix.fd_t,
@@ -102,18 +111,22 @@ pub fn remapFile(
     return new_buf;
 }
 
+/// Hints that the mapping will be read sequentially.
 pub fn adviseSequential(buf: []align(config.page_alignment) u8) RingloomError!void {
     posix.madvise(buf.ptr, buf.len, posix.MADV.SEQUENTIAL) catch return error.MadviseFailed;
 }
 
+/// Hints that the mapping will be needed soon.
 pub fn adviseWillNeed(buf: []align(config.page_alignment) u8) RingloomError!void {
     posix.madvise(buf.ptr, buf.len, posix.MADV.WILLNEED) catch return error.MadviseFailed;
 }
 
+/// Hints that the mapping can be evicted from cache.
 pub fn adviseDontNeed(buf: []align(config.page_alignment) u8) RingloomError!void {
     posix.madvise(buf.ptr, buf.len, posix.MADV.DONTNEED) catch return error.MadviseFailed;
 }
 
+/// Write-touches future zero-filled pages so the appender avoids first-write faults.
 pub fn touchWritablePages(buf: []align(config.page_alignment) u8, page_size: usize) void {
     var off: usize = 0;
     while (off < buf.len) : (off += page_size) {
@@ -122,6 +135,7 @@ pub fn touchWritablePages(buf: []align(config.page_alignment) u8, page_size: usi
     }
 }
 
+/// Read-touches published pages so tailers avoid first-read faults.
 pub fn touchReadablePages(buf: []align(config.page_alignment) const u8, page_size: usize) void {
     var off: usize = 0;
     while (off < buf.len) : (off += page_size) {
@@ -130,6 +144,7 @@ pub fn touchReadablePages(buf: []align(config.page_alignment) const u8, page_siz
     }
 }
 
+/// Maps `metadata.ringloom` and casts it to the fixed metadata struct.
 pub fn mapSharedMetadata(fd: posix.fd_t, prot: Protection) RingloomError!MetadataMap {
     const buf = try mapFile(fd, 0, @sizeOf(SharedMetadata), prot, .{});
     return .{

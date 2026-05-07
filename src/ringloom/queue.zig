@@ -17,11 +17,13 @@ const StepResult = @import("platform.zig").StepResult;
 const Tailer = @import("tailer.zig").Tailer;
 const mmap_ops = @import("mmap_ops.zig");
 
+/// Supported on-disk format versions.
 pub const Version = enum(u8) {
     unknown = 0,
     v1 = 1,
 };
 
+/// Detects the queue format version by reading the metadata magic.
 pub fn detectVersion(dirname: []const u8) !Version {
     const io = defaultIo();
     const cwd = std.Io.Dir.cwd();
@@ -43,6 +45,7 @@ pub fn detectVersion(dirname: []const u8) !Version {
     return .v1;
 }
 
+/// Core untyped queue lifecycle and shared metadata owner.
 pub const Queue = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -97,6 +100,7 @@ pub const Queue = struct {
     pub const qf_disk_sz: u64 = config.default_qf_disk_size;
     pub const metadata_file_sz: u64 = @sizeOf(SharedMetadata);
 
+    /// Allocates queue state for a directory path.
     pub fn init(allocator: std.mem.Allocator, dirname: []const u8) !*Queue {
         const queue = try allocator.create(Queue);
         queue.* = .{
@@ -108,6 +112,7 @@ pub const Queue = struct {
         return queue;
     }
 
+    /// Sets the roll scheme used when creating or validating metadata.
     pub fn setRollScheme(self: *Queue, scheme: RollScheme) !void {
         if (self.roll_name) |n| self.allocator.free(n);
         if (self.roll_format) |f| self.allocator.free(f);
@@ -126,61 +131,75 @@ pub const Queue = struct {
         self.roll_strftime = try self.allocator.dupe(u8, result.strftime);
     }
 
+    /// Sets the roll scheme by its stable name.
     pub fn setRollSchemeName(self: *Queue, name: []const u8) !void {
         const scheme = roll.findSchemeByName(name) orelse return error.UnknownRollScheme;
         try self.setRollScheme(scheme);
     }
 
+    /// Allows or disallows creating a missing queue directory and metadata file.
     pub fn setCreate(self: *Queue, permitted: bool) void {
         self.create = permitted;
     }
 
+    /// Sets the block size used for mapping and extension decisions.
     pub fn setBlocksize(self: *Queue, blocksize: u32) void {
         self.blocksize = blocksize;
     }
 
+    /// Sets how close to a cycle boundary pre-roll creation should start.
     pub fn setPrerollMs(self: *Queue, ms: u64) void {
         self.preroll_ms = ms;
     }
 
+    /// Enables best-effort Linux huge-page mappings for queue files.
     pub fn setUseHugePages(self: *Queue, enabled: bool) void {
         self.use_huge_pages = enabled;
     }
 
+    /// Configures write-side prefetching.
     pub fn setPrefetcher(self: *Queue, enabled: bool, runway_bytes: u64) void {
         self.enable_prefetcher = enabled;
         self.prefetch_runway_bytes = runway_bytes;
     }
 
+    /// Configures read-side prefetch runway length.
     pub fn setReadPrefetcher(self: *Queue, runway_bytes: u64) void {
         self.read_prefetch_runway_bytes = runway_bytes;
     }
 
+    /// Records whether native helper threads are allowed for maintenance work.
     pub fn setHelperThreads(self: *Queue, enabled: bool) void {
         self.spawn_helper_threads = enabled;
     }
 
+    /// Configures cleaner availability and retention policy.
     pub fn setCleaner(self: *Queue, enabled: bool, retention_cycles: ?u32) void {
         self.enable_cleaner = enabled;
         self.retention_cycles = retention_cycles;
     }
 
+    /// Doubles the configured block size.
     pub fn doubleBlocksize(self: *Queue) void {
         self.blocksize <<= 1;
     }
 
+    /// Converts a UTC millisecond timestamp to a queue cycle number.
     pub fn cycleFromMs(self: *const Queue, ms: i64) u64 {
         return rollCycleFromMs(ms, self.roll_epoch, self.roll_length_ms);
     }
 
+    /// Returns the detected or created metadata version.
     pub fn getVersion(self: *const Queue) Version {
         return self.version;
     }
 
+    /// Registers a tailer so queue teardown can release it.
     pub fn registerTailer(self: *Queue, tailer: *Tailer) !void {
         try self.tailers.append(self.allocator, tailer);
     }
 
+    /// Removes a tailer registration when the caller closes it.
     pub fn unregisterTailerPrefetch(self: *Queue, tailer: *Tailer) void {
         for (self.tailers.items, 0..) |registered, i| {
             if (registered == tailer) {
@@ -190,14 +209,17 @@ pub const Queue = struct {
         }
     }
 
+    /// Opens or reuses this handle's single appender.
     pub fn openAppender(self: *Queue) !*Appender {
         return Appender.open(self);
     }
 
+    /// Opens an independent tailer at a public index.
     pub fn openTailer(self: *Queue, start_index: u64) !*Tailer {
         return Tailer.create(self, start_index);
     }
 
+    /// Opens existing metadata or creates a new queue when configured.
     pub fn open(self: *Queue) !void {
         if (self.metadata != null) return error.OpenFailed;
 
@@ -327,6 +349,7 @@ pub const Queue = struct {
         try self.validateConfig();
     }
 
+    /// Refreshes the sorted list of cycle files in the queue directory.
     pub fn refreshQueueFiles(self: *Queue) !void {
         for (self.queuefile_paths.items) |path| {
             self.allocator.free(path);
@@ -353,6 +376,7 @@ pub const Queue = struct {
         }.lessThan);
     }
 
+    /// Creates and initializes a queue data file for `cycle`.
     pub fn queuefileInit(self: *Queue, path: []const u8, cycle: u64) !std.posix.fd_t {
         if (cycle > std.math.maxInt(u32)) return error.InvalidRollConfig;
         try self.validateConfig();
@@ -392,6 +416,7 @@ pub const Queue = struct {
         return file.handle;
     }
 
+    /// Allocates the path for a queue data file cycle.
     pub fn cyclePath(self: *Queue, cycle: u64) ![]u8 {
         if (self.roll_strftime == null) return error.RollFormatMissing;
         if (self.roll_length_secs == 0) return error.InvalidRollConfig;
@@ -420,6 +445,7 @@ pub const Queue = struct {
         });
     }
 
+    /// Pre-creates and maps the next cycle file when near a roll boundary.
     pub fn maybePreroll(self: *Queue, current_time_ms: u64) !void {
         if (self.preroll_ms == 0 or self.preroll_cycle != null) return;
         try self.validateConfig();
@@ -461,6 +487,7 @@ pub const Queue = struct {
         self.preroll_cycle = next_cycle;
     }
 
+    /// Acquires the on-disk single-appender lifecycle lease.
     pub fn acquireAppenderLease(self: *Queue, owner_token: u64) !void {
         if (owner_token == 0) return error.AppenderAlreadyOpen;
         const meta = self.metadata orelse return error.MetadataFieldsMissing;
@@ -475,6 +502,7 @@ pub const Queue = struct {
         if (prev != null) return error.AppenderAlreadyOpen;
     }
 
+    /// Releases the on-disk appender lifecycle lease.
     pub fn releaseAppenderLease(self: *Queue, owner_token: u64) !void {
         if (owner_token == 0) return error.AppenderLeaseLost;
         const meta = self.metadata orelse return error.MetadataFieldsMissing;
@@ -489,6 +517,7 @@ pub const Queue = struct {
         if (prev != null) return error.AppenderLeaseLost;
     }
 
+    /// Drives bounded prefetcher and cleaner work.
     pub fn maintenancePoll(self: *Queue, max_work_units: usize) !StepResult {
         var result: StepResult = .idle;
         if (self.prefetcher) |prefetcher| {
@@ -500,6 +529,7 @@ pub const Queue = struct {
         return result;
     }
 
+    /// Releases all queue-owned memory, mappings, descriptors, and helper state.
     pub fn deinit(self: *Queue) void {
         while (self.tailers.pop()) |tailer| {
             tailer.deinit();
