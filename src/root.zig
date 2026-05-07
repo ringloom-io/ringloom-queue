@@ -19,6 +19,7 @@ pub const tailer = @import("ringloom/tailer.zig");
 pub const queue = @import("ringloom/queue.zig");
 pub const api = @import("ringloom/api.zig");
 pub const c_api = @import("ringloom/c_api.zig");
+const validation_tests = @import("ringloom/validation_tests.zig");
 
 pub const Header = header.Header;
 pub const SharedMetadata = metadata.SharedMetadata;
@@ -103,5 +104,6 @@ pub const ringloom_error_t = c_api.ringloom_error_t;
 pub const ringloom_step_result_t = c_api.ringloom_step_result_t;
 
 test {
+    _ = validation_tests;
     std.testing.refAllDecls(@This());
 }

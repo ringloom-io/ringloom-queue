@@ -142,6 +142,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/ringloom/bench_tests.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "ringloom_queue", .module = mod },
+        },
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "ringloom_queue_bench",
+        .root_module = bench_mod,
+    });
+    const run_bench_tests = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run opt-in benchmarks");
+    bench_step.dependOn(&run_bench_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
