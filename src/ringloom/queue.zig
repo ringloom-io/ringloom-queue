@@ -182,8 +182,20 @@ pub const Queue = struct {
     }
 
     pub fn unregisterTailerPrefetch(self: *Queue, tailer: *Tailer) void {
-        _ = self;
-        _ = tailer;
+        for (self.tailers.items, 0..) |registered, i| {
+            if (registered == tailer) {
+                _ = self.tailers.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    pub fn openAppender(self: *Queue) !*Appender {
+        return Appender.open(self);
+    }
+
+    pub fn openTailer(self: *Queue, start_index: u64) !*Tailer {
+        return Tailer.create(self, start_index);
     }
 
     pub fn open(self: *Queue) !void {

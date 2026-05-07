@@ -40,6 +40,7 @@ pub const RingloomError = error{
     MetadataReopenFailed,
 
     MessageTooLarge,
+    EmptyPayload,
     WriteConflict,
 
     IndexSlotOutOfBounds,

@@ -17,6 +17,8 @@ pub const cleaner = @import("ringloom/cleaner.zig");
 pub const appender = @import("ringloom/appender.zig");
 pub const tailer = @import("ringloom/tailer.zig");
 pub const queue = @import("ringloom/queue.zig");
+pub const api = @import("ringloom/api.zig");
+pub const c_api = @import("ringloom/c_api.zig");
 
 pub const Header = header.Header;
 pub const SharedMetadata = metadata.SharedMetadata;
@@ -25,7 +27,12 @@ pub const Index = index.Index;
 pub const IndexRegion = index.IndexRegion;
 pub const RollScheme = roll.RollScheme;
 pub const Version = queue.Version;
-pub const Queue = queue.Queue;
+pub const CoreQueue = queue.Queue;
+pub const Queue = api.Queue;
+pub const QueueConfig = api.QueueConfig;
+pub const Diagnostics = api.Diagnostics;
+pub const BackoffPolicy = api.BackoffPolicy;
+pub const PublicTailer = api.Tailer;
 pub const Tailer = tailer.Tailer;
 pub const TailerState = tailer.TailerState;
 pub const ParseBlockState = tailer.ParseBlockState;
@@ -85,6 +92,15 @@ pub const TextCodec = codec.TextCodec;
 pub const DefaultRawCodec = codec.DefaultRawCodec;
 pub const StructCodec = codec.StructCodec;
 pub const RuntimeCodec = codec.RuntimeCodec;
+pub const hexDump = api.hexDump;
+
+pub const ringloom_queue_t = c_api.ringloom_queue_t;
+pub const ringloom_appender_t = c_api.ringloom_appender_t;
+pub const ringloom_tailer_t = c_api.ringloom_tailer_t;
+pub const ringloom_queue_options = c_api.ringloom_queue_options;
+pub const ringloom_message_view = c_api.ringloom_message_view;
+pub const ringloom_error_t = c_api.ringloom_error_t;
+pub const ringloom_step_result_t = c_api.ringloom_step_result_t;
 
 test {
     std.testing.refAllDecls(@This());
