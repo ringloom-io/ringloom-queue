@@ -402,7 +402,8 @@ pub const Appender = struct {
         if (cycle > highest) @atomicStore(u64, &meta.highest_cycle, cycle, .release);
 
         const lowest = @atomicLoad(u64, &meta.lowest_cycle, .acquire);
-        if (lowest == 0 and cycle != 0 and self.queue.queuefile_paths.items.len == 0) {
+        const modcount = @atomicLoad(u64, &meta.modcount, .acquire);
+        if (lowest == 0 and cycle != 0 and modcount == 0) {
             @atomicStore(u64, &meta.lowest_cycle, cycle, .release);
         }
 

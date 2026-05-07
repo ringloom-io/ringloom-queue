@@ -26,6 +26,23 @@ Key testing concerns specific to ringloom-queue:
 
 ---
 
+> **API drift note (kept up-to-date with the implementation):**
+> The original spec snippets below reference a few names that were renamed or
+> never landed in the public API. When porting a snippet, translate as follows:
+>
+> | Spec name                          | Actual API in `src/`                                  |
+> |------------------------------------|-------------------------------------------------------|
+> | `ringloom.RawBytesCodec`           | `ringloom.RawCodec`                                   |
+> | `.roll_scheme = .FAST_DAILY`       | `.roll_scheme = ringloom.roll.findSchemeByName("FAST_DAILY").?` |
+> | `var appender = try queue.appender();` then `appender.append(payload)` | `_ = try queue.append(payload);` (the queue caches a single appender internally) |
+> | `queue.tailer(.start)`             | `queue.tailer(0)` (start_index is a `u64`)            |
+> | `RollScheme.FAST_DAILY` (enum decl)| `ringloom.roll.findSchemeByName("FAST_DAILY").?`      |
+>
+> The benchmark binary in §6 below uses the actual API; older test snippets are
+> kept for design intent but may need the substitutions above to compile.
+
+---
+
 ## 1. Zig's Built-in Test Framework
 
 ### 1.1 Test Blocks and `std.testing`
@@ -921,158 +938,109 @@ test "C ABI open does not spawn helper threads" {
 
 ## 6. Performance Tests
 
-### 6.1 Latency Benchmark
+The benchmark suite is shipped as a separate executable (built only by the
+`bench` step) rather than as `zig test` cases, because we want full control over
+warmup, measurement loops, output formatting, and CLI configuration. Build and
+invoke it with:
 
-```zig
-test "benchmark: append latency p50/p99/p999" {
-    const tmp = try test_util.makeTempDir("ringloom.bench.latency.");
-    defer test_util.removeTempDir(tmp);
-
-    var queue = try ringloom.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .roll_scheme = .FAST_DAILY,
-        .create = true,
-        .allocator = testing.allocator,
-    }, ringloom.RawBytesCodec);
-    defer queue.deinit();
-
-    var appender = try queue.appender();
-    defer appender.deinit();
-
-    const iterations = 1_000_000;
-    var latencies: [iterations]u64 = undefined;
-    const payload = "benchmark-payload-64-bytes-exactly-for-consistent-measurement!";
-
-    var i: usize = 0;
-    while (i < iterations) : (i += 1) {
-        const start = asm volatile ("rdtsc" : [r] "={eax}" (-> u32));
-        try appender.append(payload);
-        const end = asm volatile ("rdtsc" : [r] "={eax}" (-> u32));
-        latencies[i] = end -% start;
-    }
-
-    std.sort.sort(u64, &latencies, {}, std.sort.asc(u64));
-
-    const p50 = latencies[iterations / 2];
-    const p99 = latencies[iterations * 99 / 100];
-    const p999 = latencies[iterations * 999 / 1000];
-
-    std.debug.print("\nAppend latency (cycles): p50={d} p99={d} p99.9={d}\n", .{ p50, p99, p999 });
-
-    // Soft assertion — alert if p99 is unreasonably high
-    // (threshold depends on hardware; 10μs ≈ 30,000 cycles at 3 GHz)
-    try testing.expect(p99 < 100_000); // ~33μs at 3 GHz — generous bound
-}
+```bash
+zig build bench -- [--warmup=N] [--count=N] [--size=N] [--no-tailer] [--keep-dir]
 ```
 
-### 6.2 Throughput Benchmark
+The harness lives in `src/ringloom/bench_tests.zig` and reports both **append**
+and **tailer poll** numbers in a single table:
+
+- Throughput (msgs/s, MiB/s) measured against monotonic wall-clock time around
+  the inner loop.
+- Latency percentiles `min / mean / p50 / p95 / p99 / p99.9 / max` in
+  nanoseconds, computed from per-message `std.Io.Clock.awake` samples.
+- A clock-overhead estimate (median delta of two back-to-back `Clock.awake`
+  reads) so reviewers can subtract sampling cost from latency figures.
+
+### 6.1 Configuration & Defaults
+
+| Flag           | Default       | Description                                             |
+|----------------|---------------|---------------------------------------------------------|
+| `--warmup=N`   | `10_000`      | Untimed appends executed before each measured loop.     |
+| `--count=N`    | `1_000_000`   | Number of measured messages for both append and tailer. |
+| `--size=N`     | `64`          | Payload size in bytes (runtime allocated).              |
+| `--no-tailer`  | off           | Skip the tailer poll benchmark.                         |
+| `--keep-dir`   | off           | Keep the temporary queue directory for inspection.      |
+| `-h`, `--help` |               | Print usage and exit.                                   |
+
+Notable harness invariants:
+
+- The queue uses the `FAST_DAILY` roll scheme with `preroll_ms = 0`.
+- When `(warmup + count) * entrySize(size)` exceeds one queue file, the harness
+  automatically advances the append timestamp by one roll interval after each
+  per-cycle capacity is filled, so large runs span multiple cycle files instead
+  of failing.
+- The harness still rejects configurations where a **single message** would not
+  fit in one queue file, or where the run would exceed the 32-bit cycle-index
+  space.
+- The tailer benchmark seeks directly to the first measured append index, so
+  warmup messages are not scanned, timed, or included in tailer throughput.
+
+### 6.2 Latency & Throughput Benchmark
+
+The append loop is the canonical microbenchmark. Per measured message:
 
 ```zig
-test "benchmark: sustained throughput" {
-    const tmp = try test_util.makeTempDir("ringloom.bench.throughput.");
-    defer test_util.removeTempDir(tmp);
-
-    var queue = try ringloom.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .roll_scheme = .FAST_DAILY,
-        .create = true,
-        .allocator = testing.allocator,
-    }, ringloom.RawBytesCodec);
-    defer queue.deinit();
-
-    var appender = try queue.appender();
-    defer appender.deinit();
-
-    const payload = "throughput-benchmark-payload-64B!-padded-to-alignment-boundary.";
-    const duration_ns: i128 = 10 * std.time.ns_per_s;
-    const start = std.time.nanoTimestamp();
-    var count: u64 = 0;
-
-    while (std.time.nanoTimestamp() - start < duration_ns) {
-        try appender.append(payload);
-        count += 1;
-    }
-
-    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
-    const msgs_per_sec = count * std.time.ns_per_s / elapsed_ns;
-    std.debug.print("\nSustained throughput: {d} msgs/sec ({d} messages in {d}ms)\n", .{
-        msgs_per_sec,
-        count,
-        elapsed_ns / std.time.ns_per_ms,
-    });
-
-    // Should sustain at least 1M msgs/sec for 64-byte payloads
-    try testing.expect(msgs_per_sec > 1_000_000);
-}
+const t0 = std.Io.Clock.awake.now(io);
+_ = try queue.appendWithTimestamp(payload, fixed_ts);
+const t1 = std.Io.Clock.awake.now(io);
+latencies[i] = t0.durationTo(t1).toNanoseconds();
 ```
 
-### 6.3 Tailer Poll and Read-Prefetch Latency
+`appendWithTimestamp` is preferred over `append` so we don't fold the
+wall-clock read into the measured cost. For large runs, the timestamp is held
+constant within a cycle and then advanced by `roll_length_ms` once that cycle's
+message capacity is reached. After the loop completes, the harness sorts the
+latency array (nearest-rank percentiles) and prints the table.
 
-```zig
-test "benchmark: tailer poll latency with read prefetch" {
-    const tmp = try test_util.makeTempDir("ringloom.bench.poll-prefetch.");
-    defer test_util.removeTempDir(tmp);
+### 6.3 Tailer Poll Latency
 
-    var queue = try ringloom.Queue([]const u8).open(.{
-        .dir = tmp.path,
-        .roll_scheme = .FAST_DAILY,
-        .create = true,
-        .read_prefetch_runway_bytes = 8 * 1024 * 1024,
-        .allocator = testing.allocator,
-    }, ringloom.RawBytesCodec);
-    defer queue.deinit();
+A single tailer is opened against the same queue at the first measured append
+index returned by the append loop. The harness then times one `poll()` per
+measured message. Because the queue is fully written before this loop, every
+poll returns an entry; if a `null` is observed (e.g. because of a transient
+mapping update) the harness spins and retries without recording a sample.
 
-    try prefillQueue(&queue, 10_000);
+### 6.4 Reading the Output
 
-    var tailer = try queue.tailer(.start);
-    defer tailer.deinit();
+A typical result looks like:
 
-    const iterations = 10_000;
-    var poll_latencies: [iterations]u64 = undefined;
-
-    for (&poll_latencies) |*lat| {
-        _ = try tailer.prefetchPoll(256);
-        const before = std.time.nanoTimestamp();
-        _ = try tailer.poll();
-        lat.* = @intCast(std.time.nanoTimestamp() - before);
-    }
-
-    std.sort.sort(u64, &poll_latencies, {}, std.sort.asc(u64));
-
-    const p50 = poll_latencies[iterations / 2];
-    const p99 = poll_latencies[iterations * 99 / 100];
-    std.debug.print("\ntailer poll latency: p50={d}ns p99={d}ns\n", .{ p50, p99 });
-}
+```
++------------------------+--------------------------+--------------------------+
+| metric                 | append                   | tailer poll              |
++------------------------+--------------------------+--------------------------+
+| samples                |                  1000000 |                  1000000 |
+| throughput (msgs/s)    |                 10565203 |                 19304604 |
+| throughput (MiB/s)     |                   644.85 |                  1178.26 |
+| min (ns)               |                       30 |                       20 |
+| mean (ns)              |                       70 |                       28 |
+| p50 (ns)               |                       30 |                       30 |
+| p95 (ns)               |                       50 |                       30 |
+| p99 (ns)               |                     2184 |                       40 |
+| p99.9 (ns)             |                     2415 |                     1904 |
+| max (ns)               |                    10149 |                    11361 |
++------------------------+--------------------------+--------------------------+
 ```
 
-### 6.4 Prefetcher Page-Fault Regression
+Latency numbers describe **append-to-mmap** and **poll-from-mmap** costs; they
+do not include `msync`/`fsync` durability. Dedicated latency runs should pin the
+benchmark to an isolated CPU and sample
+`perf stat -e page-faults,minor-faults,major-faults,dTLB-load-misses` alongside.
 
-The low-jitter profile must prove that the appender does not take page faults in
-steady state when the prefetcher is enabled.
+### 6.5 Page-Fault Regression (future work)
 
-```zig
-test "benchmark: appender has no steady-state page faults with prefetcher" {
-    const before = try test_util.readTaskFaultCounters();
+The low-jitter profile must prove that the appender does not take page faults
+in steady state when the prefetcher is enabled. This is currently driven
+manually by running the bench under `perf stat`; an automated regression that
+reads `/proc/self/status` before/after the timed loop and asserts
+`major_faults` is unchanged is tracked separately.
 
-    // Open queue with enable_prefetcher=true, append enough data to cross
-    // several mmap windows, then read counters again.
-    try runAppendBenchmark(.{
-        .enable_prefetcher = true,
-        .prefetch_runway_bytes = 16 * 1024 * 1024,
-        .spawn_helper_threads = true,
-    });
-
-    const after = try test_util.readTaskFaultCounters();
-    try testing.expectEqual(before.major_faults, after.major_faults);
-    try testing.expect(after.minor_faults - before.minor_faults < 4);
-}
-```
-
-The small minor-fault allowance covers unrelated runtime/test harness activity.
-Dedicated latency runs should pin the benchmark to an isolated CPU and sample
-`perf stat -e page-faults,minor-faults,major-faults,dTLB-load-misses`.
-
-### 6.5 Cleaner Does Not Reclaim Hot Data
+### 6.6 Cleaner Does Not Reclaim Hot Data
 
 ```zig
 test "cleaner only reclaims data behind local tailers and retention floor" {
@@ -1593,17 +1561,22 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run.step);
     }
 
-    // Benchmark step (separate, opt-in)
-    const bench_step = b.step("bench", "Run benchmarks");
-
-    const bench = b.addTest(.{
-        .root_source_file = b.path("src/bench_test.zig"),
+    // Benchmark step (separate, opt-in executable, not a test).
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/ringloom/bench_tests.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "ringloom_queue", .module = mod },
+        },
     });
-    bench.root_module.addImport("ringloom_queue", &lib.root_module);
-
-    const bench_run = b.addRunArtifact(bench);
+    const bench_exe = b.addExecutable(.{
+        .name = "ringloom_queue_bench",
+        .root_module = bench_mod,
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run opt-in benchmarks");
     bench_step.dependOn(&bench_run.step);
 }
 ```

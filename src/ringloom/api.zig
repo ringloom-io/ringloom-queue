@@ -268,6 +268,41 @@ test "public raw queue appends and polls messages" {
     try std.testing.expectEqualStrings("hello", entry.message);
 }
 
+test "public tailer starts at cycle zero after appender rolls" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try tmpQueuePath(allocator, &tmp);
+    defer allocator.free(path);
+
+    var queue = try Queue([]const u8).open(.{
+        .dir = path,
+        .create = true,
+        .roll_scheme = roll.findSchemeByName("TEST4_SECONDLY").?,
+        .allocator = allocator,
+        .spawn_helper_threads = false,
+        .preroll_ms = 0,
+    }, codec_mod.RawCodec);
+    defer queue.deinit();
+
+    const idx0 = try queue.appendWithTimestamp("cycle-0", 0);
+    const idx1 = try queue.appendWithTimestamp("cycle-1", 1000);
+    try std.testing.expectEqual(Index.compose(0, 0), idx0);
+    try std.testing.expectEqual(Index.compose(1, 0), idx1);
+    try std.testing.expectEqual(@as(u64, 0), queue.inner.lowest_cycle);
+
+    var tailer = try queue.tailer(0);
+    defer tailer.deinit();
+
+    const first = (try tailer.poll()).?;
+    try std.testing.expectEqual(idx0, first.index);
+    try std.testing.expectEqualStrings("cycle-0", first.message);
+
+    const second = (try tailer.poll()).?;
+    try std.testing.expectEqual(idx1, second.index);
+    try std.testing.expectEqualStrings("cycle-1", second.message);
+}
+
 test "hexDump writes stable ASCII output" {
     var buf: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);

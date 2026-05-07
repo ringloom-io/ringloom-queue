@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const run_bench_tests = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench_tests.addArgs(args);
     const bench_step = b.step("bench", "Run opt-in benchmarks");
     bench_step.dependOn(&run_bench_tests.step);
 }
