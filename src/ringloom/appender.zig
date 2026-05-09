@@ -248,6 +248,9 @@ pub const Appender = struct {
             self.fd = null;
         }
 
+        self.queue.lockPreroll();
+        defer self.queue.unlockPreroll();
+
         if (self.queue.preroll_cycle != null and self.queue.preroll_cycle.? == target_cycle) {
             self.fd = self.queue.preroll_fd;
             self.buf = self.queue.preroll_mmap;
@@ -262,7 +265,7 @@ pub const Appender = struct {
             try self.openCycleFresh(target_cycle);
         }
 
-        self.cycle = target_cycle;
+        @atomicStore(u64, &self.cycle, target_cycle, .release);
         self.tip = dataStartOffset(self.queue);
         self.seqnum = 0;
         self.diagnostics.rolls += 1;
@@ -271,7 +274,7 @@ pub const Appender = struct {
 
     fn openCycle(self: *Appender, cycle: u64) !void {
         try self.openCycleFresh(cycle);
-        self.cycle = cycle;
+        @atomicStore(u64, &self.cycle, cycle, .release);
         self.publishCycle(cycle);
         self.publishTip();
     }

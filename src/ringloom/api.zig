@@ -115,7 +115,7 @@ pub fn Queue(comptime MessageType: type) type {
         /// Requests cleaner retention to advance to `cycle`.
         pub fn truncateBefore(self: *Self, cycle: u32) !void {
             if (self.inner.cleaner) |cleaner| {
-                cleaner.retention_floor_cycle = cycle;
+                cleaner.deleteCyclesBefore(cycle);
                 return;
             }
             return error.CleanerFailed;

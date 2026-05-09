@@ -5,7 +5,7 @@
 //! are all configurable via CLI args.
 //!
 //! Usage (via the build system):
-//!     zig build bench -- [--warmup=N] [--count=N] [--size=N] [--no-tailer] [--keep-dir] [--help]
+//!     zig build bench -- [--warmup=N] [--count=N] [--size=N] [--no-tailer] [--keep-dir] [--no-maintenance-threads] [--retention-cycles=N] [--help]
 
 const std = @import("std");
 const ringloom = @import("ringloom_queue");
@@ -16,6 +16,8 @@ const BenchOptions = struct {
     size: usize = 64,
     skip_tailer: bool = false,
     keep_dir: bool = false,
+    maintenance_threads: bool = true,
+    retention_cycles: ?u32 = null,
 };
 
 const BenchmarkPlan = struct {
@@ -37,6 +39,8 @@ const LatencyStats = struct {
     p99_ns: u64,
     p999_ns: u64,
 };
+
+const no_preroll_cycle = std.math.maxInt(u64);
 
 const RunResult = struct {
     label: []const u8,
@@ -87,11 +91,17 @@ pub fn main(init: std.process.Init) !void {
         .create = true,
         .roll_scheme = plan.scheme,
         .allocator = allocator,
-        .spawn_helper_threads = true,
+        .spawn_helper_threads = false,
         .enable_prefetcher = true,
+        .enable_cleaner = true,
+        .retention_cycles = opts.retention_cycles,
         .preroll_ms = 0,
     }, ringloom.RawCodec);
     defer queue.deinit();
+
+    var maintenance = BenchMaintenance.init(&queue);
+    if (opts.maintenance_threads) try maintenance.start();
+    defer maintenance.stopAndJoin();
 
     const payload = try allocator.alloc(u8, opts.size);
     defer allocator.free(payload);
@@ -106,7 +116,8 @@ pub fn main(init: std.process.Init) !void {
 
     try printPreamble(io, opts, plan, clock_overhead_ns);
 
-    const append_result = try runAppendBench(&queue, payload, latencies, opts, plan, io);
+    const append_result = try runAppendBench(&queue, &maintenance, payload, latencies, opts, plan, io);
+    maintenance.stopAndJoin();
 
     const maybe_tailer = if (!opts.skip_tailer)
         try runTailerBench(&queue, append_result.first_index, opts, latencies, io)
@@ -116,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
     try printResultsTable(io, opts, append_result, maybe_tailer);
 
     try printDiagnostics(io, queue.diagnostics());
+    try printMaintenanceDiagnostics(io, maintenance);
 }
 
 // -----------------------------------------------------------------------------
@@ -133,12 +145,17 @@ fn parseArgs(init: std.process.Init) !BenchOptions {
             opts.skip_tailer = true;
         } else if (std.mem.eql(u8, arg, "--keep-dir")) {
             opts.keep_dir = true;
+        } else if (std.mem.eql(u8, arg, "--no-maintenance-threads")) {
+            opts.maintenance_threads = false;
         } else if (parseUsizeFlag(arg, "--warmup=")) |v| {
             opts.warmup = v;
         } else if (parseUsizeFlag(arg, "--count=")) |v| {
             opts.count = v;
         } else if (parseUsizeFlag(arg, "--size=")) |v| {
             opts.size = v;
+        } else if (parseUsizeFlag(arg, "--retention-cycles=")) |v| {
+            if (v > std.math.maxInt(u32)) return error.InvalidArgument;
+            opts.retention_cycles = @intCast(v);
         } else {
             std.log.err("unknown argument: {s}", .{arg});
             return error.InvalidArgument;
@@ -164,6 +181,10 @@ fn printHelp(io: std.Io) !void {
         \\  --size=N        Payload size in bytes (default: 64)
         \\  --no-tailer     Skip the tailer poll benchmark
         \\  --keep-dir      Do not delete the temporary queue directory on exit
+        \\  --no-maintenance-threads
+        \\                  Disable benchmark-owned prefetcher/cleaner threads
+        \\  --retention-cycles=N
+        \\                  Enable cleaner retention during the append benchmark
         \\  -h, --help      Show this message
         \\
     ;
@@ -238,6 +259,7 @@ fn timestampForOrdinal(plan: BenchmarkPlan, ordinal: u64) u64 {
 
 fn runAppendBench(
     queue: *ringloom.Queue([]const u8),
+    maintenance: *BenchMaintenance,
     payload: []const u8,
     latencies: []u64,
     opts: BenchOptions,
@@ -249,7 +271,9 @@ fn runAppendBench(
     // benchmark advances the append timestamp by one roll interval after the
     // per-cycle capacity is reached so the run spans multiple queue files.
     var i: usize = 0;
+    maintenance.publishPrerollTarget(plan, 0);
     while (i < opts.warmup) : (i += 1) {
+        maintenance.publishPrerollTarget(plan, i);
         _ = try queue.appendWithTimestamp(payload, timestampForOrdinal(plan, i));
     }
 
@@ -258,6 +282,7 @@ fn runAppendBench(
     i = 0;
     while (i < opts.count) : (i += 1) {
         const ordinal = @as(u64, opts.warmup) + i;
+        maintenance.publishPrerollTarget(plan, ordinal);
         const t0 = std.Io.Clock.awake.now(io);
         const idx = try queue.appendWithTimestamp(payload, timestampForOrdinal(plan, ordinal));
         const t1 = std.Io.Clock.awake.now(io);
@@ -358,6 +383,78 @@ fn measureClockOverhead(io: std.Io) u64 {
     return samples[samples.len / 2];
 }
 
+const BenchMaintenance = struct {
+    queue: *ringloom.Queue([]const u8),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    next_preroll_cycle: std.atomic.Value(u64) = std.atomic.Value(u64).init(no_preroll_cycle),
+    prefetch_thread: ?std.Thread = null,
+    cleaner_thread: ?std.Thread = null,
+    prefetch_progress: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cleaner_progress: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    errors: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn init(queue: *ringloom.Queue([]const u8)) BenchMaintenance {
+        return .{ .queue = queue };
+    }
+
+    fn start(self: *BenchMaintenance) !void {
+        self.stop.store(false, .release);
+        self.prefetch_thread = try std.Thread.spawn(.{}, prefetchLoop, .{self});
+        errdefer self.stopAndJoin();
+        self.cleaner_thread = try std.Thread.spawn(.{}, cleanerLoop, .{self});
+    }
+
+    fn stopAndJoin(self: *BenchMaintenance) void {
+        self.stop.store(true, .release);
+        if (self.prefetch_thread) |thread| {
+            thread.join();
+            self.prefetch_thread = null;
+        }
+        if (self.cleaner_thread) |thread| {
+            thread.join();
+            self.cleaner_thread = null;
+        }
+    }
+
+    fn publishPrerollTarget(self: *BenchMaintenance, plan: BenchmarkPlan, ordinal: usize) void {
+        const current_cycle = @divFloor(@as(u64, ordinal), plan.messages_per_cycle);
+        const next_cycle = current_cycle + 1;
+        const target = if (next_cycle < plan.cycles_needed) next_cycle else no_preroll_cycle;
+        self.next_preroll_cycle.store(target, .release);
+    }
+
+    fn prefetchLoop(self: *BenchMaintenance) void {
+        while (!self.stop.load(.acquire)) {
+            const cycle = self.next_preroll_cycle.load(.acquire);
+            if (cycle != no_preroll_cycle) {
+                if (self.queue.inner.prefetcher) |prefetcher| {
+                    const step = prefetcher.prepareCycle(cycle) catch {
+                        _ = self.errors.fetchAdd(1, .monotonic);
+                        self.stop.store(true, .release);
+                        return;
+                    };
+                    if (step != .idle) _ = self.prefetch_progress.fetchAdd(1, .monotonic);
+                }
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn cleanerLoop(self: *BenchMaintenance) void {
+        while (!self.stop.load(.acquire)) {
+            if (self.queue.inner.cleaner) |cleaner| {
+                const step = cleaner.poll(16) catch {
+                    _ = self.errors.fetchAdd(1, .monotonic);
+                    self.stop.store(true, .release);
+                    return;
+                };
+                if (step != .idle) _ = self.cleaner_progress.fetchAdd(1, .monotonic);
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
 // -----------------------------------------------------------------------------
 // Output
 // -----------------------------------------------------------------------------
@@ -386,24 +483,30 @@ fn printPreamble(io: std.Io, opts: BenchOptions, plan: BenchmarkPlan, clock_over
         \\  measured count  : {d}
         \\  payload size    : {d} bytes
         \\  tailer bench    : {s}
+        \\  maint threads   : {s}
         \\  roll scheme     : {s}
         \\  entry size      : {d} bytes
         \\  msgs / cycle    : {d}
         \\  cycles needed   : {d}
         \\  clock overhead  : ~{d} ns / pair (median)
         \\
-        \\
     , .{
         opts.warmup,
         opts.count,
         opts.size,
         if (opts.skip_tailer) "skipped" else "enabled",
+        if (opts.maintenance_threads) "enabled" else "disabled",
         plan.scheme.name,
         plan.entry_size,
         plan.messages_per_cycle,
         plan.cycles_needed,
         clock_overhead_ns,
     });
+    if (opts.retention_cycles) |retention| {
+        try out.print("  retention       : keep {d} cycles\n\n", .{retention});
+    } else {
+        try out.print("  retention       : disabled\n\n", .{});
+    }
     try out.flush();
 }
 
@@ -531,6 +634,25 @@ fn printDiagnostics(io: std.Io, d: ringloom.Diagnostics) !void {
         d.preroll_misses,
         d.prefetcher_enabled,
         d.cleaner_enabled,
+    });
+    try out.flush();
+}
+
+fn printMaintenanceDiagnostics(io: std.Io, maintenance: BenchMaintenance) !void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.File.Writer = .init(.stdout(), io, &buf);
+    const out = &w.interface;
+    try out.print(
+        \\
+        \\benchmark maintenance threads:
+        \\  prefetch progress polls   : {d}
+        \\  cleaner progress polls    : {d}
+        \\  helper errors             : {d}
+        \\
+    , .{
+        maintenance.prefetch_progress.load(.acquire),
+        maintenance.cleaner_progress.load(.acquire),
+        maintenance.errors.load(.acquire),
     });
     try out.flush();
 }

@@ -62,6 +62,8 @@ pub const ringloom_queue_options = extern struct {
     enable_prefetcher: bool = true,
     enable_cleaner: bool = true,
     spawn_helper_threads: bool = false,
+    retention_cycles: u32 = 0,
+    retention_cycles_set: bool = false,
 };
 
 /// Borrowed payload view returned by `ringloom_tailer_poll`.
@@ -124,7 +126,12 @@ pub export fn ringloom_queue_open(opts: ?*const ringloom_queue_options, out: ?*?
         };
     }
     queue.setPrefetcher(options.enable_prefetcher, queue.prefetch_runway_bytes);
-    queue.setCleaner(options.enable_cleaner, queue.retention_cycles);
+    const retention_cycles: ?u32 = if (options.size >= @offsetOf(ringloom_queue_options, "retention_cycles_set") + @sizeOf(bool) and
+        options.retention_cycles_set)
+        options.retention_cycles
+    else
+        null;
+    queue.setCleaner(options.enable_cleaner, retention_cycles);
     queue.setHelperThreads(options.spawn_helper_threads);
     queue.open() catch |err| {
         queue.deinit();

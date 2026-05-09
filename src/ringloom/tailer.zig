@@ -240,11 +240,17 @@ pub const Tailer = struct {
 
     /// Drives read-side prefetch preparation for this tailer.
     pub fn prefetchPoll(self: *Tailer, max_work_units: u32) !StepResult {
-        _ = max_work_units;
         const buf = self.qf_buf orelse return .idle;
+        self.updateReadPrefetch();
         if (self.queue.prefetcher) |prefetcher| {
-            try prefetcher.prepareReadableWindow(buf, self.queue.platform.page_size);
-            return .made_progress;
+            return try prefetcher.prepareReadableRange(
+                self.qf_fd,
+                buf,
+                self.qf_mmapoff,
+                self.qf_file_size,
+                &self.read_prefetch,
+                max_work_units,
+            );
         }
         return .idle;
     }
@@ -320,7 +326,7 @@ pub const Tailer = struct {
         self.qf_filename = path;
         self.qf_fd = file.handle;
         self.qf_file_size = stat.size;
-        self.qf_cycle_open = cycle;
+        @atomicStore(u64, &self.qf_cycle_open, cycle, .release);
         self.qf_buf = buf;
         self.qf_mmapoff = 0;
         self.qf_mmapsz = stat.size;
@@ -350,7 +356,7 @@ pub const Tailer = struct {
         self.qf_file_size = 0;
         self.qf_mmapoff = 0;
         self.qf_mmapsz = 0;
-        self.qf_cycle_open = std.math.maxInt(u64);
+        @atomicStore(u64, &self.qf_cycle_open, std.math.maxInt(u64), .release);
     }
 
     fn advanceToNextCycle(self: *Tailer) void {

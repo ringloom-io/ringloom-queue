@@ -176,7 +176,7 @@ test "validation: poll readiness and read prefetch stay within published limit" 
     _ = try queue.appendWithTimestamp("poll-test", 0);
     const entry = (try tailer.poll()).?;
     try std.testing.expectEqualStrings("poll-test", entry.message);
-    try std.testing.expectEqual(@import("platform.zig").StepResult.made_progress, try tailer.prefetchPoll(8));
+    try std.testing.expectEqual(@import("platform.zig").StepResult.idle, try tailer.prefetchPoll(8));
 
     const published = @atomicLoad(u64, &queue.inner.metadata.?.write_position, .acquire);
     try std.testing.expect(tailer.inner.read_prefetch.next_offset <= published);

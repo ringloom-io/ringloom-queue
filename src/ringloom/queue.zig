@@ -79,6 +79,7 @@ pub const Queue = struct {
     preroll_fd: ?std.posix.fd_t = null,
     preroll_mmap: ?[]align(config.page_alignment) u8 = null,
     preroll_cycle: ?u64 = null,
+    preroll_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     preroll_ms: u64 = config.default_preroll_ms,
 
     platform: Platform,
@@ -464,14 +465,30 @@ pub const Queue = struct {
         if (current_time_ms >= cycle_end_ms) return;
         if (cycle_end_ms - current_time_ms >= self.preroll_ms) return;
 
-        const path = try self.cyclePath(next_cycle);
+        _ = try self.preparePrerollCycle(next_cycle);
+    }
+
+    /// Prepares an explicit cycle file for later appender roll handoff.
+    pub fn preparePrerollCycle(self: *Queue, cycle: u64) !bool {
+        self.lockPreroll();
+        defer self.unlockPreroll();
+
+        if (self.preroll_cycle != null) return false;
+        if (self.appender) |appender| {
+            const current_cycle = @atomicLoad(u64, &appender.cycle, .acquire);
+            if (cycle <= current_cycle) return false;
+        }
+
+        const path = try self.cyclePath(cycle);
         defer self.allocator.free(path);
 
-        const fd = try self.queuefileInit(path, next_cycle);
+        const fd = self.queuefileInit(path, cycle) catch |err| switch (err) {
+            error.PathAlreadyExists => return false,
+            else => return err,
+        };
         errdefer closeFd(self.io, fd);
 
-        const target_map_sz = @min(@as(u64, self.blocksize) * 2, qf_disk_sz);
-        const map_sz_u64 = std.mem.alignForward(u64, target_map_sz, std.heap.pageSize());
+        const map_sz_u64 = std.mem.alignForward(u64, qf_disk_sz, std.heap.pageSize());
         if (map_sz_u64 > std.math.maxInt(usize)) return error.MmapFailed;
 
         const buf = try mmap_ops.mapFileWithFallback(fd, 0, @intCast(map_sz_u64), .read_write, .{
@@ -484,7 +501,8 @@ pub const Queue = struct {
 
         self.preroll_fd = fd;
         self.preroll_mmap = buf;
-        self.preroll_cycle = next_cycle;
+        self.preroll_cycle = cycle;
+        return true;
     }
 
     /// Acquires the on-disk single-appender lifecycle lease.
@@ -500,6 +518,18 @@ pub const Queue = struct {
             .monotonic,
         );
         if (prev != null) return error.AppenderAlreadyOpen;
+    }
+
+    /// Serializes pre-roll creation and appender handoff.
+    pub fn lockPreroll(self: *Queue) void {
+        while (self.preroll_lock.cmpxchgWeak(false, true, .acquire, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Releases the pre-roll creation/handoff lock.
+    pub fn unlockPreroll(self: *Queue) void {
+        self.preroll_lock.store(false, .release);
     }
 
     /// Releases the on-disk appender lifecycle lease.
@@ -521,10 +551,10 @@ pub const Queue = struct {
     pub fn maintenancePoll(self: *Queue, max_work_units: usize) !StepResult {
         var result: StepResult = .idle;
         if (self.prefetcher) |prefetcher| {
-            result = combineStepResults(result, prefetcher.poll(max_work_units));
+            result = combineStepResults(result, try prefetcher.poll(max_work_units));
         }
         if (self.cleaner) |cleaner| {
-            result = combineStepResults(result, cleaner.poll(max_work_units));
+            result = combineStepResults(result, try cleaner.poll(max_work_units));
         }
         return result;
     }
@@ -614,16 +644,15 @@ pub const Queue = struct {
         self.platform = Platform.detect();
         if (self.enable_prefetcher and self.prefetcher == null) {
             const prefetcher = try self.allocator.create(Prefetcher);
-            prefetcher.* = Prefetcher.init(self.allocator);
+            prefetcher.* = Prefetcher.initForQueue(self.allocator, self, .{
+                .write_runway_bytes = self.prefetch_runway_bytes,
+                .read_runway_bytes = self.read_prefetch_runway_bytes,
+            });
             self.prefetcher = prefetcher;
         }
         if (self.enable_cleaner and self.cleaner == null) {
             const cleaner = try self.allocator.create(Cleaner);
-            cleaner.* = Cleaner.init(self.allocator);
-            cleaner.retention_floor_cycle = if (self.retention_cycles) |retention|
-                self.lowest_cycle + retention
-            else
-                0;
+            cleaner.* = Cleaner.initForQueue(self.allocator, self, self.retention_cycles);
             self.cleaner = cleaner;
         }
     }
@@ -901,6 +930,67 @@ test "appender lease acquire and release use metadata CAS" {
     try queue.releaseAppenderLease(1234);
     try queue.acquireAppenderLease(5678);
     try queue.releaseAppenderLease(5678);
+}
+
+test "maintenance poll advances write prefetch state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try tmpQueuePath(allocator, &tmp);
+    defer allocator.free(path);
+
+    const queue = try Queue.init(allocator, path);
+    defer queue.deinit();
+    queue.setCreate(true);
+    try queue.setRollSchemeName("TEST4_SECONDLY");
+    queue.setPrerollMs(0);
+    try queue.open();
+
+    const app = try Appender.open(queue);
+    _ = try app.appendWithTimestamp("prefetch", 0);
+
+    const step = try queue.maintenancePoll(1);
+    try std.testing.expect(step == .made_progress or step == .more_work);
+    try std.testing.expect(queue.prefetcher.?.write.active);
+    try std.testing.expect(queue.prefetcher.?.write.next_offset > app.tip);
+}
+
+test "cleaner retention deletes old cycle files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try tmpQueuePath(allocator, &tmp);
+    defer allocator.free(path);
+
+    const queue = try Queue.init(allocator, path);
+    defer queue.deinit();
+    queue.setCreate(true);
+    try queue.setRollSchemeName("TEST4_SECONDLY");
+    queue.setCleaner(true, 1);
+    queue.setPrerollMs(0);
+    try queue.open();
+
+    const app = try Appender.open(queue);
+    _ = try app.appendWithTimestamp("cycle-0", 0);
+    _ = try app.appendWithTimestamp("cycle-1", 1000);
+    _ = try app.appendWithTimestamp("cycle-2", 2000);
+
+    const cycle0_path = try queue.cyclePath(0);
+    defer allocator.free(cycle0_path);
+    const cycle1_path = try queue.cyclePath(1);
+    defer allocator.free(cycle1_path);
+    const cycle2_path = try queue.cyclePath(2);
+    defer allocator.free(cycle2_path);
+
+    var polls: usize = 0;
+    while (polls < 4) : (polls += 1) {
+        if (try queue.maintenancePoll(8) == .idle) break;
+    }
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(queue.io, cycle0_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(queue.io, cycle1_path, .{}));
+    _ = try std.Io.Dir.cwd().statFile(queue.io, cycle2_path, .{});
+    try std.testing.expectEqual(@as(u64, 2), queue.lowest_cycle);
 }
 
 fn tmpQueuePath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
