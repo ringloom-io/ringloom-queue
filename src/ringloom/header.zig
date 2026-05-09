@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 
 /// Namespace for the 4-byte entry header that frames every on-disk message.

@@ -634,4 +634,4 @@ ringloom-queue supports **one active writer thread/process and multiple reader t
 
 ---
 
-*This specification defines the ringloom-queue v1 on-disk format. ringloom-queue is an independent implementation and is NOT compatible with Java Chronicle Queue or any other queue format.*
+*This specification defines the ringloom-queue v1 on-disk format.

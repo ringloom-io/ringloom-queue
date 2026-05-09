@@ -1281,5 +1281,3 @@ Cycle N                               Cycle N+1
 ```
 
 ---
-
-*This document describes the architecture of ringloom-queue, a clean-room memory-mapped IPC queue implemented in Zig 0.16. For protocol changes between versions, see `CHANGES.md`.*

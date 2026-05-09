@@ -191,14 +191,6 @@ pub fn touchWritablePages(buf: []align(page_size) u8, page_size: usize) void {
 }
 ```
 
-### Chronicle Queue comparison
-
-Chronicle Queue calls this idea **pre-touching**. Its public docs describe
-touching storage resources and possibly acquiring future cycle files before the
-appender needs them; it exposes manual `ExcerptAppender.pretouch()` and an
-automatic preloader. ringloom-queue should implement the same principle as a
-`Prefetcher` state machine with explicit handoff to the appender.
-
 ---
 
 ## 3. Tailer Read Prefetching

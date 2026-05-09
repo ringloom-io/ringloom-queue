@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 
 pub const metadata_magic: u32 = 0x4d515a42;

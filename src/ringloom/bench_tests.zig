@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Opt-in benchmark binary for ringloom-queue.
 //!
 //! Measures latency (p50/p95/p99/p99.9) and throughput for both the appender
