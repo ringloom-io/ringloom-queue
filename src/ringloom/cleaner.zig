@@ -1,7 +1,16 @@
 const std = @import("std");
 
+const config = @import("config.zig");
+const mmap_ops = @import("mmap_ops.zig");
 const StepResult = @import("platform.zig").StepResult;
 const Queue = @import("queue.zig").Queue;
+
+const max_deferred_resources = 64;
+
+const DeferredResource = struct {
+    buf: ?[]align(config.page_alignment) u8 = null,
+    fd: ?std.posix.fd_t = null,
+};
 
 /// Pollable cleaner shell for retention and cold-page reclamation work.
 pub const Cleaner = struct {
@@ -9,6 +18,10 @@ pub const Cleaner = struct {
     queue: ?*Queue = null,
     retention_cycles: ?u32 = null,
     retention_floor_cycle: u64 = 0,
+    deferred: [max_deferred_resources]DeferredResource = [_]DeferredResource{.{}} ** max_deferred_resources,
+    deferred_head: usize = 0,
+    deferred_count: usize = 0,
+    deferred_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Creates an idle cleaner.
     pub fn init(allocator: std.mem.Allocator) Cleaner {
@@ -26,7 +39,25 @@ pub const Cleaner = struct {
 
     /// Releases resources owned by the cleaner.
     pub fn deinit(self: *Cleaner) void {
-        _ = self;
+        self.reapAllDeferred();
+    }
+
+    /// Queues an old mapping/fd for cleaner-thread reclamation.
+    pub fn deferResource(
+        self: *Cleaner,
+        buf: ?[]align(config.page_alignment) u8,
+        fd: ?std.posix.fd_t,
+    ) bool {
+        if (buf == null and fd == null) return true;
+
+        self.lockDeferred();
+        defer self.unlockDeferred();
+
+        if (self.deferred_count == self.deferred.len) return false;
+        const tail = (self.deferred_head + self.deferred_count) % self.deferred.len;
+        self.deferred[tail] = .{ .buf = buf, .fd = fd };
+        self.deferred_count += 1;
+        return true;
     }
 
     /// Requests deletion of cycle files older than `cycle`.
@@ -38,7 +69,13 @@ pub const Cleaner = struct {
     pub fn poll(self: *Cleaner, max_work_units: usize) !StepResult {
         if (max_work_units == 0) return .idle;
         const queue = self.queue orelse return .idle;
-        return try self.applyRetention(queue, max_work_units);
+
+        var remaining = max_work_units;
+        var result = self.reapDeferred(queue, &remaining);
+        if (remaining > 0) {
+            result = combineStepResults(result, try self.applyRetention(queue, remaining));
+        }
+        return result;
     }
 
     fn applyRetention(self: *Cleaner, queue: *Queue, max_work_units: usize) !StepResult {
@@ -99,7 +136,59 @@ pub const Cleaner = struct {
         }
         return floor;
     }
+
+    fn reapDeferred(self: *Cleaner, queue: *Queue, remaining: *usize) StepResult {
+        var made_progress = false;
+        while (remaining.* > 0) {
+            const resource = self.popDeferred() orelse break;
+            releaseResource(queue, resource);
+            remaining.* -= 1;
+            made_progress = true;
+        }
+        if (!made_progress) return .idle;
+        return if (self.hasDeferred()) .more_work else .made_progress;
+    }
+
+    fn reapAllDeferred(self: *Cleaner) void {
+        const queue = self.queue orelse return;
+        while (self.popDeferred()) |resource| {
+            releaseResource(queue, resource);
+        }
+    }
+
+    fn popDeferred(self: *Cleaner) ?DeferredResource {
+        self.lockDeferred();
+        defer self.unlockDeferred();
+
+        if (self.deferred_count == 0) return null;
+        const resource = self.deferred[self.deferred_head];
+        self.deferred[self.deferred_head] = .{};
+        self.deferred_head = (self.deferred_head + 1) % self.deferred.len;
+        self.deferred_count -= 1;
+        return resource;
+    }
+
+    fn hasDeferred(self: *Cleaner) bool {
+        self.lockDeferred();
+        defer self.unlockDeferred();
+        return self.deferred_count != 0;
+    }
+
+    fn lockDeferred(self: *Cleaner) void {
+        while (self.deferred_lock.cmpxchgWeak(false, true, .acquire, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockDeferred(self: *Cleaner) void {
+        self.deferred_lock.store(false, .release);
+    }
 };
+
+fn releaseResource(queue: *Queue, resource: DeferredResource) void {
+    if (resource.buf) |buf| mmap_ops.unmapFile(buf);
+    if (resource.fd) |fd| closeFd(queue.io, fd);
+}
 
 fn canDeleteCycle(queue: *Queue, cycle: u64) bool {
     const highest = if (queue.metadata) |meta|
@@ -140,4 +229,18 @@ fn removeQueueFilePath(queue: *Queue, path: []const u8) void {
             return;
         }
     }
+}
+
+fn combineStepResults(a: StepResult, b: StepResult) StepResult {
+    if (a == .more_work or b == .more_work) return .more_work;
+    if (a == .made_progress or b == .made_progress) return .made_progress;
+    return .idle;
+}
+
+fn closeFd(io: std.Io, fd: std.posix.fd_t) void {
+    const file: std.Io.File = .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+    file.close(io);
 }

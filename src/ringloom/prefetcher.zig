@@ -9,6 +9,7 @@ const Queue = @import("queue.zig").Queue;
 /// Tracks the next published range a tailer can safely prefetch.
 pub const ReadPrefetchState = struct {
     cycle: u64 = 0,
+    cursor_offset: u64 = 0,
     next_offset: u64 = 0,
     published_limit: u64 = 0,
     active: bool = false,
@@ -17,6 +18,7 @@ pub const ReadPrefetchState = struct {
     pub fn reset(self: *ReadPrefetchState, cycle: u64, offset: u64) void {
         self.* = .{
             .cycle = cycle,
+            .cursor_offset = offset,
             .next_offset = offset,
             .published_limit = offset,
             .active = true,
@@ -150,7 +152,7 @@ pub const Prefetcher = struct {
         const published_limit = @min(state.published_limit, @min(map_end, file_size));
         if (published_limit <= state.next_offset) return .idle;
 
-        const runway_limit = state.next_offset +| self.read_runway_bytes;
+        const runway_limit = state.cursor_offset +| self.read_runway_bytes;
         const work_limit = state.next_offset +| workBudgetBytes(max_work_units, page_size);
         const target_limit = @min(published_limit, @min(runway_limit, work_limit));
         if (target_limit <= state.next_offset) return .idle;

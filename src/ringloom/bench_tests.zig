@@ -5,7 +5,7 @@
 //! are all configurable via CLI args.
 //!
 //! Usage (via the build system):
-//!     zig build bench -- [--warmup=N] [--count=N] [--size=N] [--no-tailer] [--keep-dir] [--no-maintenance-threads] [--retention-cycles=N] [--help]
+//!     zig build bench -- [--warmup=N] [--count=N] [--size=N] [--no-tailer] [--keep-dir] [--no-maintenance-threads] [--no-tailer-prefetch] [--retention-cycles=N] [--help]
 
 const std = @import("std");
 const ringloom = @import("ringloom_queue");
@@ -17,6 +17,7 @@ const BenchOptions = struct {
     skip_tailer: bool = false,
     keep_dir: bool = false,
     maintenance_threads: bool = true,
+    tailer_prefetch: bool = true,
     retention_cycles: ?u32 = null,
 };
 
@@ -38,9 +39,12 @@ const LatencyStats = struct {
     p95_ns: u64,
     p99_ns: u64,
     p999_ns: u64,
+    p9999_ns: u64,
 };
 
 const no_preroll_cycle = std.math.maxInt(u64);
+const tailer_prefetch_poll_units: u32 = 64;
+const tailer_prefetch_initial_wait_yields: usize = 4096;
 
 const RunResult = struct {
     label: []const u8,
@@ -48,6 +52,11 @@ const RunResult = struct {
     payload_size: usize,
     stats: LatencyStats,
     first_index: u64 = 0,
+    prefetch_enabled: bool = false,
+    prefetch_progress: u64 = 0,
+    prefetch_idle: u64 = 0,
+    prefetch_cleaner_progress: u64 = 0,
+    prefetch_errors: u32 = 0,
 
     fn throughputMsgsPerSec(self: RunResult) f64 {
         if (self.elapsed_ns == 0) return 0;
@@ -128,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
 
     try printDiagnostics(io, queue.diagnostics());
     try printMaintenanceDiagnostics(io, maintenance);
+    try printTailerPrefetchDiagnostics(io, maybe_tailer);
 }
 
 // -----------------------------------------------------------------------------
@@ -147,6 +157,8 @@ fn parseArgs(init: std.process.Init) !BenchOptions {
             opts.keep_dir = true;
         } else if (std.mem.eql(u8, arg, "--no-maintenance-threads")) {
             opts.maintenance_threads = false;
+        } else if (std.mem.eql(u8, arg, "--no-tailer-prefetch")) {
+            opts.tailer_prefetch = false;
         } else if (parseUsizeFlag(arg, "--warmup=")) |v| {
             opts.warmup = v;
         } else if (parseUsizeFlag(arg, "--count=")) |v| {
@@ -183,6 +195,8 @@ fn printHelp(io: std.Io) !void {
         \\  --keep-dir      Do not delete the temporary queue directory on exit
         \\  --no-maintenance-threads
         \\                  Disable benchmark-owned prefetcher/cleaner threads
+        \\  --no-tailer-prefetch
+        \\                  Disable tailer read prefetch during tailer benchmark
         \\  --retention-cycles=N
         \\                  Enable cleaner retention during the append benchmark
         \\  -h, --help      Show this message
@@ -310,6 +324,13 @@ fn runTailerBench(
     var tailer = try queue.tailer(first_measured_index);
     defer tailer.deinit();
 
+    var tailer_prefetch = TailerPrefetch.init(&tailer);
+    defer tailer_prefetch.stopAndJoin();
+    if (opts.tailer_prefetch) {
+        try tailer_prefetch.start();
+        tailer_prefetch.waitForInitialProgress();
+    }
+
     const wall_start = std.Io.Clock.awake.now(io);
     var i: usize = 0;
     while (i < opts.count) {
@@ -326,11 +347,18 @@ fn runTailerBench(
     }
     const wall_elapsed = durationNs(wall_start, std.Io.Clock.awake.now(io));
 
+    tailer_prefetch.stopAndJoin();
+
     return .{
         .label = "tailer poll",
         .elapsed_ns = wall_elapsed,
         .payload_size = opts.size,
         .stats = computeStats(latencies),
+        .prefetch_enabled = opts.tailer_prefetch,
+        .prefetch_progress = tailer_prefetch.progress.load(.acquire),
+        .prefetch_idle = tailer_prefetch.idle.load(.acquire),
+        .prefetch_cleaner_progress = tailer_prefetch.cleaner_progress.load(.acquire),
+        .prefetch_errors = tailer_prefetch.errors.load(.acquire),
     };
 }
 
@@ -359,6 +387,7 @@ fn computeStats(latencies: []u64) LatencyStats {
         .p95_ns = percentile(latencies, 0.95),
         .p99_ns = percentile(latencies, 0.99),
         .p999_ns = percentile(latencies, 0.999),
+        .p9999_ns = percentile(latencies, 0.9999),
     };
 }
 
@@ -455,6 +484,78 @@ const BenchMaintenance = struct {
     }
 };
 
+const TailerPrefetch = struct {
+    tailer: *ringloom.PublicTailer([]const u8),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    progress: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    idle: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cleaner_progress: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    errors: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn init(tailer: *ringloom.PublicTailer([]const u8)) TailerPrefetch {
+        return .{ .tailer = tailer };
+    }
+
+    fn start(self: *TailerPrefetch) !void {
+        self.stop.store(false, .release);
+        self.thread = try std.Thread.spawn(.{}, loop, .{self});
+    }
+
+    fn stopAndJoin(self: *TailerPrefetch) void {
+        self.stop.store(true, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    fn waitForInitialProgress(self: *TailerPrefetch) void {
+        var yields: usize = 0;
+        while (yields < tailer_prefetch_initial_wait_yields) : (yields += 1) {
+            if (self.progress.load(.acquire) != 0 or self.errors.load(.acquire) != 0) return;
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn loop(self: *TailerPrefetch) void {
+        while (!self.stop.load(.acquire)) {
+            const step = self.tailer.prefetchPoll(tailer_prefetch_poll_units) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                self.stop.store(true, .release);
+                return;
+            };
+            switch (step) {
+                .idle => {
+                    _ = self.idle.fetchAdd(1, .monotonic);
+                    self.pollCleaner();
+                    std.Thread.yield() catch {};
+                },
+                .made_progress => {
+                    _ = self.progress.fetchAdd(1, .monotonic);
+                    self.pollCleaner();
+                    std.Thread.yield() catch {};
+                },
+                .more_work => {
+                    _ = self.progress.fetchAdd(1, .monotonic);
+                    self.pollCleaner();
+                },
+            }
+        }
+    }
+
+    fn pollCleaner(self: *TailerPrefetch) void {
+        if (self.tailer.inner.queue.cleaner) |cleaner| {
+            const step = cleaner.poll(4) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                self.stop.store(true, .release);
+                return;
+            };
+            if (step != .idle) _ = self.cleaner_progress.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
 // -----------------------------------------------------------------------------
 // Output
 // -----------------------------------------------------------------------------
@@ -469,6 +570,7 @@ const RowKind = enum {
     ns_p95,
     ns_p99,
     ns_p999,
+    ns_p9999,
     ns_max,
 };
 
@@ -483,6 +585,7 @@ fn printPreamble(io: std.Io, opts: BenchOptions, plan: BenchmarkPlan, clock_over
         \\  measured count  : {d}
         \\  payload size    : {d} bytes
         \\  tailer bench    : {s}
+        \\  tailer prefetch : {s}
         \\  maint threads   : {s}
         \\  roll scheme     : {s}
         \\  entry size      : {d} bytes
@@ -495,6 +598,7 @@ fn printPreamble(io: std.Io, opts: BenchOptions, plan: BenchmarkPlan, clock_over
         opts.count,
         opts.size,
         if (opts.skip_tailer) "skipped" else "enabled",
+        if (opts.tailer_prefetch and !opts.skip_tailer) "threaded" else "disabled",
         if (opts.maintenance_threads) "enabled" else "disabled",
         plan.scheme.name,
         plan.entry_size,
@@ -507,6 +611,30 @@ fn printPreamble(io: std.Io, opts: BenchOptions, plan: BenchmarkPlan, clock_over
     } else {
         try out.print("  retention       : disabled\n\n", .{});
     }
+    try out.flush();
+}
+
+fn printTailerPrefetchDiagnostics(io: std.Io, maybe_tailer: ?RunResult) !void {
+    const tailer = maybe_tailer orelse return;
+    if (!tailer.prefetch_enabled) return;
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.File.Writer = .init(.stdout(), io, &buf);
+    const out = &w.interface;
+    try out.print(
+        \\
+        \\tailer prefetch helper:
+        \\  progress polls           : {d}
+        \\  idle polls               : {d}
+        \\  cleaner progress polls   : {d}
+        \\  helper errors            : {d}
+        \\
+    , .{
+        tailer.prefetch_progress,
+        tailer.prefetch_idle,
+        tailer.prefetch_cleaner_progress,
+        tailer.prefetch_errors,
+    });
     try out.flush();
 }
 
@@ -532,6 +660,7 @@ fn printResultsTable(
         .{ .name = "p95 (ns)", .kind = .ns_p95 },
         .{ .name = "p99 (ns)", .kind = .ns_p99 },
         .{ .name = "p99.9 (ns)", .kind = .ns_p999 },
+        .{ .name = "p99.99 (ns)", .kind = .ns_p9999 },
         .{ .name = "max (ns)", .kind = .ns_max },
     };
 
@@ -607,6 +736,7 @@ fn formatCell(
         .ns_p95 => try out.print("{d:>24}", .{r.stats.p95_ns}),
         .ns_p99 => try out.print("{d:>24}", .{r.stats.p99_ns}),
         .ns_p999 => try out.print("{d:>24}", .{r.stats.p999_ns}),
+        .ns_p9999 => try out.print("{d:>24}", .{r.stats.p9999_ns}),
         .ns_max => try out.print("{d:>24}", .{r.stats.max_ns}),
     }
 }

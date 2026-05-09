@@ -89,14 +89,11 @@ pub const Appender = struct {
             mmap_ops.unmapFile(window.buf);
             self.ready_window = null;
         }
-        if (self.buf) |buf| {
-            mmap_ops.unmapFile(buf);
-            self.buf = null;
-        }
-        if (self.fd) |fd| {
-            closeFd(self.queue.io, fd);
-            self.fd = null;
-        }
+        const old_buf = self.buf;
+        const old_fd = self.fd;
+        self.buf = null;
+        self.fd = null;
+        self.deferOldResources(old_buf, old_fd);
         if (self.owner_token != 0) {
             self.queue.releaseAppenderLease(self.owner_token) catch {};
             self.owner_token = 0;
@@ -428,6 +425,19 @@ pub const Appender = struct {
         const start: usize = @intCast(rel);
         if (start > buf.len or len > buf.len - start) return error.MmapFailed;
         return buf[start..][0..len];
+    }
+
+    fn deferOldResources(
+        self: *Appender,
+        buf: ?[]align(config.page_alignment) u8,
+        fd: ?std.posix.fd_t,
+    ) void {
+        if (buf == null and fd == null) return;
+        if (self.queue.cleaner) |cleaner| {
+            if (cleaner.deferResource(buf, fd)) return;
+        }
+        if (buf) |old_buf| mmap_ops.unmapFile(old_buf);
+        if (fd) |old_fd| closeFd(self.queue.io, old_fd);
     }
 };
 

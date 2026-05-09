@@ -94,6 +94,13 @@ pub const MmapProtection = enum {
     }
 };
 
+const CycleMapping = struct {
+    filename: []const u8,
+    fd: std.posix.fd_t,
+    file_size: u64,
+    buf: []align(config.page_alignment) u8,
+};
+
 /// Independent read cursor over queue cycle files.
 pub const Tailer = struct {
     dispatch_after: u64 = 0,
@@ -116,8 +123,17 @@ pub const Tailer = struct {
     qf_mmapoff: u64 = 0,
     qf_mmapsz: u64 = 0,
 
+    ready_cycle: u64 = std.math.maxInt(u64),
+    ready_filename: ?[]const u8 = null,
+    ready_fd: ?std.posix.fd_t = null,
+    ready_file_size: u64 = 0,
+    ready_buf: ?[]align(config.page_alignment) u8 = null,
+
     last_modcount: u64 = 0,
     read_prefetch: ReadPrefetchState = .{},
+    prefetch_cursor_cycle: u64 = std.math.maxInt(u64),
+    prefetch_cursor_offset: u64 = 0,
+    prefetch_mapping_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     queue: *Queue,
 
     /// Initializes a tailer positioned at the requested public index.
@@ -200,7 +216,7 @@ pub const Tailer = struct {
             self.qf_tip += entry_size;
             self.qf_index += 1;
             self.state = .collected;
-            self.updateReadPrefetch();
+            self.publishReadPrefetchCursor();
             return .{
                 .index = index,
                 .payload = payload,
@@ -240,19 +256,34 @@ pub const Tailer = struct {
 
     /// Drives read-side prefetch preparation for this tailer.
     pub fn prefetchPoll(self: *Tailer, max_work_units: u32) !StepResult {
-        const buf = self.qf_buf orelse return .idle;
-        self.updateReadPrefetch();
-        if (self.queue.prefetcher) |prefetcher| {
-            return try prefetcher.prepareReadableRange(
-                self.qf_fd,
-                buf,
-                self.qf_mmapoff,
-                self.qf_file_size,
-                &self.read_prefetch,
-                max_work_units,
-            );
+        if (max_work_units == 0) return .idle;
+
+        var result: StepResult = .idle;
+        read_prefetch: {
+            self.lockPrefetchMapping();
+            defer self.unlockPrefetchMapping();
+
+            const buf = self.qf_buf orelse break :read_prefetch;
+            const meta = self.queue.metadata orelse break :read_prefetch;
+            const open_cycle = @atomicLoad(u64, &self.qf_cycle_open, .acquire);
+            const cursor_cycle = @atomicLoad(u64, &self.prefetch_cursor_cycle, .acquire);
+            if (open_cycle == std.math.maxInt(u64) or cursor_cycle != open_cycle) break :read_prefetch;
+
+            const cursor_offset = @atomicLoad(u64, &self.prefetch_cursor_offset, .acquire);
+            self.refreshReadPrefetchLocked(meta, open_cycle, cursor_offset);
+
+            if (self.queue.prefetcher) |prefetcher| {
+                result = try prefetcher.prepareReadableRange(
+                    self.qf_fd,
+                    buf,
+                    self.qf_mmapoff,
+                    self.qf_file_size,
+                    &self.read_prefetch,
+                    max_work_units,
+                );
+            }
         }
-        return .idle;
+        return combineStepResults(result, try self.prepareNextCycle());
     }
 
     /// Seeks to a public index using the inline index, then scans forward.
@@ -273,6 +304,7 @@ pub const Tailer = struct {
             if (!skipped) break;
         }
         self.dispatch_after = if (target_index == 0) 0 else target_index - 1;
+        self.publishReadPrefetchCursor();
     }
 
     /// Converts an absolute file offset to a mapped pointer when in range.
@@ -305,31 +337,16 @@ pub const Tailer = struct {
     }
 
     fn openCycleFile(self: *Tailer, cycle: u64) !void {
-        const path = try self.queue.cyclePath(cycle);
-        errdefer self.queue.allocator.free(path);
+        const mapping = try self.openCycleMapping(cycle);
 
-        const file = try std.Io.Dir.cwd().openFile(self.queue.io, path, .{
-            .mode = if (self.mmap_protection == .read_only) .read_only else .read_write,
-            .allow_directory = false,
-        });
-        errdefer file.close(self.queue.io);
-
-        const stat = try file.stat(self.queue.io);
-        if (stat.size < dataStartOffset(self.queue) + Header.HEADER_SIZE) return error.InvalidQueueFileHeader;
-        if (stat.size > std.math.maxInt(usize)) return error.MmapFailed;
-
-        const buf = try mmap_ops.mapFileWithFallback(file.handle, 0, @intCast(stat.size), self.mmap_protection.toProtection(), .{});
-        errdefer mmap_ops.unmapFile(buf);
-        try validateQueueFileHeader(buf, self.queue, cycle);
-        mmap_ops.adviseSequential(buf) catch {};
-
-        self.qf_filename = path;
-        self.qf_fd = file.handle;
-        self.qf_file_size = stat.size;
+        self.lockPrefetchMapping();
+        self.qf_filename = mapping.filename;
+        self.qf_fd = mapping.fd;
+        self.qf_file_size = mapping.file_size;
         @atomicStore(u64, &self.qf_cycle_open, cycle, .release);
-        self.qf_buf = buf;
+        self.qf_buf = mapping.buf;
         self.qf_mmapoff = 0;
-        self.qf_mmapsz = stat.size;
+        self.qf_mmapsz = mapping.file_size;
 
         if (Index.cycle(self.qf_index) == cycle and Index.seqnum(self.qf_index) != 0) {
             if (self.qf_tip == 0) self.qf_tip = dataStartOffset(self.queue);
@@ -337,18 +354,23 @@ pub const Tailer = struct {
             self.qf_tip = dataStartOffset(self.queue);
             self.qf_index = Index.compose(@intCast(cycle), 0);
         }
-        self.read_prefetch.reset(cycle, self.qf_tip);
+        self.read_prefetch = .{};
+        self.unlockPrefetchMapping();
+        self.publishReadPrefetchCursor();
     }
 
     fn closeCycleFile(self: *Tailer) void {
-        if (self.qf_buf) |buf| {
-            mmap_ops.unmapFile(buf);
-            self.qf_buf = null;
-        }
-        if (self.qf_fd) |fd| {
-            closeFd(self.queue.io, fd);
-            self.qf_fd = null;
-        }
+        self.lockPrefetchMapping();
+        defer self.unlockPrefetchMapping();
+        self.closeActiveCycleLocked(false);
+        self.closeReadyCycleLocked(false);
+    }
+
+    fn closeActiveCycleLocked(self: *Tailer, defer_cleanup: bool) void {
+        @atomicStore(u64, &self.prefetch_cursor_cycle, std.math.maxInt(u64), .release);
+        self.releaseResource(self.qf_buf, self.qf_fd, defer_cleanup);
+        self.qf_buf = null;
+        self.qf_fd = null;
         if (self.qf_filename) |filename| {
             self.queue.allocator.free(filename);
             self.qf_filename = null;
@@ -356,14 +378,19 @@ pub const Tailer = struct {
         self.qf_file_size = 0;
         self.qf_mmapoff = 0;
         self.qf_mmapsz = 0;
+        self.read_prefetch = .{};
         @atomicStore(u64, &self.qf_cycle_open, std.math.maxInt(u64), .release);
     }
 
     fn advanceToNextCycle(self: *Tailer) void {
         const next_cycle = @as(u64, Index.cycle(self.qf_index)) + 1;
-        self.closeCycleFile();
-        self.qf_tip = 0;
-        self.qf_index = Index.compose(@intCast(next_cycle), 0);
+        if (!self.tryUseReadyCycle(next_cycle)) {
+            self.lockPrefetchMapping();
+            self.closeActiveCycleLocked(true);
+            self.unlockPrefetchMapping();
+            self.qf_tip = 0;
+            self.qf_index = Index.compose(@intCast(next_cycle), 0);
+        }
         self.state = .awaiting_queue_file;
     }
 
@@ -383,14 +410,144 @@ pub const Tailer = struct {
         return buf[start..][0..len];
     }
 
-    fn updateReadPrefetch(self: *Tailer) void {
-        const meta = self.queue.metadata orelse return;
+    fn publishReadPrefetchCursor(self: *Tailer) void {
+        const open_cycle = @atomicLoad(u64, &self.qf_cycle_open, .acquire);
+        @atomicStore(u64, &self.prefetch_cursor_offset, self.qf_tip, .release);
+        @atomicStore(u64, &self.prefetch_cursor_cycle, open_cycle, .release);
+    }
+
+    fn refreshReadPrefetchLocked(
+        self: *Tailer,
+        meta: *metadata_mod.SharedMetadata,
+        open_cycle: u64,
+        cursor_offset: u64,
+    ) void {
         self.last_modcount = @atomicLoad(u64, &meta.modcount, .acquire);
-        if (!self.read_prefetch.active or self.read_prefetch.cycle != self.qf_cycle_open) {
-            self.read_prefetch.reset(self.qf_cycle_open, self.qf_tip);
+        if (!self.read_prefetch.active or self.read_prefetch.cycle != open_cycle) {
+            self.read_prefetch.reset(open_cycle, cursor_offset);
         }
-        self.read_prefetch.next_offset = self.qf_tip;
-        self.read_prefetch.published_limit = @atomicLoad(u64, &meta.write_position, .acquire);
+        self.read_prefetch.cursor_offset = cursor_offset;
+        if (self.read_prefetch.next_offset < cursor_offset) self.read_prefetch.next_offset = cursor_offset;
+        const highest_cycle = @atomicLoad(u64, &meta.highest_cycle, .acquire);
+        self.read_prefetch.published_limit = if (open_cycle < highest_cycle)
+            self.qf_file_size
+        else
+            @atomicLoad(u64, &meta.write_position, .acquire);
+    }
+
+    fn prepareNextCycle(self: *Tailer) !StepResult {
+        const meta = self.queue.metadata orelse return .idle;
+        const open_cycle = @atomicLoad(u64, &self.qf_cycle_open, .acquire);
+        if (open_cycle == std.math.maxInt(u64)) return .idle;
+        const highest_cycle = @atomicLoad(u64, &meta.highest_cycle, .acquire);
+        if (open_cycle >= highest_cycle) return .idle;
+        const next_cycle = open_cycle + 1;
+
+        self.lockPrefetchMapping();
+        defer self.unlockPrefetchMapping();
+        if (@atomicLoad(u64, &self.qf_cycle_open, .acquire) != open_cycle) return .idle;
+        if (self.ready_cycle == next_cycle) return .idle;
+        self.closeReadyCycleLocked(false);
+
+        const mapping = try self.openCycleMapping(next_cycle);
+        self.ready_cycle = next_cycle;
+        self.ready_filename = mapping.filename;
+        self.ready_fd = mapping.fd;
+        self.ready_file_size = mapping.file_size;
+        self.ready_buf = mapping.buf;
+        return .made_progress;
+    }
+
+    fn tryUseReadyCycle(self: *Tailer, cycle: u64) bool {
+        self.lockPrefetchMapping();
+        defer self.unlockPrefetchMapping();
+        if (self.ready_cycle != cycle) return false;
+
+        self.closeActiveCycleLocked(true);
+        self.qf_filename = self.ready_filename;
+        self.qf_fd = self.ready_fd;
+        self.qf_file_size = self.ready_file_size;
+        @atomicStore(u64, &self.qf_cycle_open, cycle, .release);
+        self.qf_buf = self.ready_buf;
+        self.qf_mmapoff = 0;
+        self.qf_mmapsz = self.ready_file_size;
+
+        self.ready_cycle = std.math.maxInt(u64);
+        self.ready_filename = null;
+        self.ready_fd = null;
+        self.ready_file_size = 0;
+        self.ready_buf = null;
+
+        self.qf_tip = dataStartOffset(self.queue);
+        self.qf_index = Index.compose(@intCast(cycle), 0);
+        self.read_prefetch = .{};
+        self.publishReadPrefetchCursor();
+        return true;
+    }
+
+    fn closeReadyCycleLocked(self: *Tailer, defer_cleanup: bool) void {
+        self.releaseResource(self.ready_buf, self.ready_fd, defer_cleanup);
+        if (self.ready_filename) |filename| {
+            self.queue.allocator.free(filename);
+        }
+        self.ready_cycle = std.math.maxInt(u64);
+        self.ready_filename = null;
+        self.ready_fd = null;
+        self.ready_file_size = 0;
+        self.ready_buf = null;
+    }
+
+    fn releaseResource(
+        self: *Tailer,
+        buf: ?[]align(config.page_alignment) u8,
+        fd: ?std.posix.fd_t,
+        defer_cleanup: bool,
+    ) void {
+        if (buf == null and fd == null) return;
+        if (defer_cleanup) {
+            if (self.queue.cleaner) |cleaner| {
+                if (cleaner.deferResource(buf, fd)) return;
+            }
+        }
+        if (buf) |old_buf| mmap_ops.unmapFile(old_buf);
+        if (fd) |old_fd| closeFd(self.queue.io, old_fd);
+    }
+
+    fn openCycleMapping(self: *Tailer, cycle: u64) !CycleMapping {
+        const path = try self.queue.cyclePath(cycle);
+        errdefer self.queue.allocator.free(path);
+
+        const file = try std.Io.Dir.cwd().openFile(self.queue.io, path, .{
+            .mode = if (self.mmap_protection == .read_only) .read_only else .read_write,
+            .allow_directory = false,
+        });
+        errdefer file.close(self.queue.io);
+
+        const stat = try file.stat(self.queue.io);
+        if (stat.size < dataStartOffset(self.queue) + Header.HEADER_SIZE) return error.InvalidQueueFileHeader;
+        if (stat.size > std.math.maxInt(usize)) return error.MmapFailed;
+
+        const buf = try mmap_ops.mapFileWithFallback(file.handle, 0, @intCast(stat.size), self.mmap_protection.toProtection(), .{});
+        errdefer mmap_ops.unmapFile(buf);
+        try validateQueueFileHeader(buf, self.queue, cycle);
+        mmap_ops.adviseSequential(buf) catch {};
+
+        return .{
+            .filename = path,
+            .fd = file.handle,
+            .file_size = stat.size,
+            .buf = buf,
+        };
+    }
+
+    fn lockPrefetchMapping(self: *Tailer) void {
+        while (self.prefetch_mapping_lock.cmpxchgWeak(false, true, .acquire, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockPrefetchMapping(self: *Tailer) void {
+        self.prefetch_mapping_lock.store(false, .release);
     }
 };
 
@@ -417,6 +574,12 @@ fn closeFd(io: std.Io, fd: std.posix.fd_t) void {
         .flags = .{ .nonblocking = false },
     };
     file.close(io);
+}
+
+fn combineStepResults(a: StepResult, b: StepResult) StepResult {
+    if (a == .more_work or b == .more_work) return .more_work;
+    if (a == .made_progress or b == .made_progress) return .made_progress;
+    return .idle;
 }
 
 test "tailer states expose protocol descriptions" {
