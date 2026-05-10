@@ -1,5 +1,10 @@
+import com.vanniktech.maven.publish.JavaLibrary
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.SourcesJar
+
 plugins {
     java
+    id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
 fun normalizeOsName(osName: String): String = when {
@@ -14,15 +19,17 @@ fun normalizeArchName(archName: String): String = when (archName.lowercase()) {
     else -> throw GradleException("Unsupported architecture for embedded ringloom-queue native library: $archName")
 }
 
-group = providers.gradleProperty("ringloomQueue.mavenGroup").orElse("io.ringloom").get()
-version = providers.gradleProperty("ringloomQueue.version").orElse("0.0.0-SNAPSHOT").get()
+val publicationGroup = providers.gradleProperty("ringloomQueue.mavenGroup").orElse("io.ringloom")
+val publicationArtifactId = providers.gradleProperty("ringloomQueue.mavenArtifactId").orElse("ringloom-queue-java-bindings")
+val publicationVersion = providers.gradleProperty("ringloomQueue.version").orElse("0.0.0-SNAPSHOT")
+
+group = publicationGroup.get()
+version = publicationVersion.get()
 
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(25))
     }
-    withSourcesJar()
-    withJavadocJar()
 }
 
 dependencies {
@@ -87,5 +94,43 @@ tasks.withType<Test>().configureEach {
     }
     System.getProperty("ringloom.queue.nativeLibPath")?.takeIf { it.isNotBlank() }?.let {
         systemProperty("ringloom.queue.nativeLibPath", it)
+    }
+}
+
+mavenPublishing {
+    coordinates(publicationGroup.get(), publicationArtifactId.get(), publicationVersion.get())
+    configure(
+        JavaLibrary(
+            javadocJar = JavadocJar.Javadoc(),
+            sourcesJar = SourcesJar.Sources(),
+        )
+    )
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+
+    pom {
+        name.set("ringloom-queue Java Bindings")
+        description.set("Java FFM bindings for the ringloom-queue memory-mapped append-only queue with an embedded native Linux x86_64 library.")
+        inceptionYear.set("2026")
+        url.set("https://github.com/ringloom-io/ringloom-queue")
+        licenses {
+            license {
+                name.set("Apache License, Version 2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("repo")
+            }
+        }
+        developers {
+            developer {
+                id.set("ringloom-io")
+                name.set("RingLoom Devs")
+                url.set("https://github.com/ringloom-io")
+            }
+        }
+        scm {
+            url.set("https://github.com/ringloom-io/ringloom-queue")
+            connection.set("scm:git:https://github.com/ringloom-io/ringloom-queue.git")
+            developerConnection.set("scm:git:ssh://git@github.com:ringloom-io/ringloom-queue.git")
+        }
     }
 }
