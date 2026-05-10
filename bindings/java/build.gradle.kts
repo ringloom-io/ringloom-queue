@@ -1,6 +1,7 @@
 import com.vanniktech.maven.publish.JavaLibrary
 import com.vanniktech.maven.publish.JavadocJar
 import com.vanniktech.maven.publish.SourcesJar
+import org.gradle.jvm.tasks.Jar
 
 plugins {
     java
@@ -84,6 +85,12 @@ val stageEmbeddedNativeLibrary = tasks.register<Copy>("stageEmbeddedNativeLibrar
 
 tasks.named<ProcessResources>("processResources") {
     dependsOn(stageEmbeddedNativeLibrary)
+}
+
+tasks.withType<Jar>().configureEach {
+    if (name == "sourcesJar") {
+        dependsOn(stageEmbeddedNativeLibrary)
+    }
 }
 
 tasks.withType<Test>().configureEach {
