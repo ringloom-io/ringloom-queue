@@ -44,6 +44,7 @@ These documents are ordered by dependency — each task builds on concepts from 
 | 08 | [Tailer (Reader) Implementation](08-zig-task-tailer.md) | **Task 6:** Implement tailer creation/polling, the read state machine, read-side prefetch/pretouch, binary search over the flat inline index for O(log n) seeking, per-tailer mmap window management, and multi-reader safety. | Tasks 1–4 |
 | 09 | [Public API](09-zig-task-public-api.md) | **Task 7:** Design the public Zig API using comptime generics, expose queue/appender/tailer creation, the codec interface, lifecycle management, diagnostics, and a C ABI shim with pollable maintenance helpers. | Tasks 1–6 |
 | 10 | [Testing and Validation Strategy](10-zig-task-testing.md) | **Task 8:** Implement unit tests for all modules, byte-level format tests against the file format spec, single-writer/multi-reader concurrency tests, latency/page-fault benchmarks, C ABI tests, and fuzz testing for the codec interface and message header parsing. | Tasks 1–7 |
+| 11 | [Java Bindings Specification](11-java-bindings.md) | **Binding:** Java 25 FFM API, Gradle packaging, embedded ReleaseSmall native shared library, and Java ownership/lifetime contracts. | Task 7 |
 
 ---
 
@@ -51,23 +52,23 @@ These documents are ordered by dependency — each task builds on concepts from 
 
 ```text
 Task 1: Core Types ─────────┬──────────────────────────────────────┐
-                             │                                      │
-Task 2: Codec Interface ─────┤                                      │
-                             │                                      │
-Task 3: Memory/Atomics ──────┤                                      │
-                             │                                      │
-                             ▼                                      │
-                   Task 4: Queue Lifecycle                          │
-                             │                                      │
-                    ┌────────┴────────┐                             │
-                    ▼                 ▼                              │
-          Task 5: Appender    Task 6: Tailer                        │
-            (CAS backoff,      (polling, read prefetch,             │
-             inline index)      binary search)                      │
-                    │                 │                              │
-                    └────────┬────────┘                             │
-                             ▼                                      │
-                   Task 7: Public API ◄─────────────────────────────┘
+                            │                                      │
+Task 2: Codec Interface ────┤                                      │
+                            │                                      │
+Task 3: Memory/Atomics ─────┤                                      │
+                            │                                      │
+                            ▼                                      │
+                   Task 4: Queue Lifecycle                         │
+                            │                                      │
+                    ┌───────┴────────┐                             │
+                    ▼                ▼                             │
+          Task 5: Appender    Task 6: Tailer                       │
+            (CAS backoff,      (polling, read prefetch,            │
+             inline index)      binary search)                     │
+                    │                 │                            │
+                    └────────┬────────┘                            │
+                             ▼                                     │
+                   Task 7: Public API ◄────────────────────────────┘
                              │
                              ▼
                    Task 8: Testing

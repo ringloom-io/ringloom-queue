@@ -12,6 +12,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const c_abi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ringloom/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const c_abi_shared_lib = b.addLibrary(.{
+        .name = "ringloom_queue",
+        .linkage = .dynamic,
+        .root_module = c_abi_mod,
+    });
+    b.installArtifact(c_abi_shared_lib);
+
+    const c_abi_step = b.step("c-abi", "Build the ringloom-queue C ABI shared library");
+    c_abi_step.dependOn(&b.addInstallArtifact(c_abi_shared_lib, .{}).step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
