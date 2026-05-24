@@ -114,11 +114,21 @@ pub const Appender = struct {
 
     /// Appends bytes directly to mmap and returns the assigned index and payload view.
     pub fn appendRaw(self: *Appender, payload: []const u8, now_ms: u64) !AppendResult {
-        if (payload.len == 0) return error.EmptyPayload;
-        if (payload.len > Header.SIZE_MASK) return error.MessageTooLarge;
+        return self.appendPartsRaw(&.{payload}, now_ms);
+    }
 
-        const payload_len_u30: u30 = @intCast(payload.len);
-        const entry_size = Header.entrySize(payload.len);
+    /// Appends multiple byte slices directly into one mmap queue entry.
+    pub fn appendPartsRaw(self: *Appender, parts: []const []const u8, now_ms: u64) !AppendResult {
+        var payload_size: usize = 0;
+        for (parts) |part| {
+            payload_size = std.math.add(usize, payload_size, part.len) catch return error.MessageTooLarge;
+        }
+
+        if (payload_size == 0) return error.EmptyPayload;
+        if (payload_size > Header.SIZE_MASK) return error.MessageTooLarge;
+
+        const payload_len_u30: u30 = @intCast(payload_size);
+        const entry_size = Header.entrySize(payload_size);
         if (entry_size > std.math.maxInt(u32)) return error.MessageTooLarge;
 
         const current_cycle = try self.cycleFromTimestamp(now_ms);
@@ -132,12 +142,17 @@ pub const Appender = struct {
         const header_ptr = try self.headerPtr(self.tip);
         try self.claimSlot(header_ptr);
 
-        const payload_buf = try self.sliceAt(self.tip + Header.HEADER_SIZE, payload.len);
-        @memcpy(payload_buf, payload);
+        const payload_buf = try self.sliceAt(self.tip + Header.HEADER_SIZE, payload_size);
+        var offset: usize = 0;
+        for (parts) |part| {
+            if (part.len == 0) continue;
+            @memcpy(payload_buf[offset..][0..part.len], part);
+            offset += part.len;
+        }
 
-        const pad = Header.paddingFor(payload.len);
+        const pad = Header.paddingFor(payload_size);
         if (pad != 0) {
-            const padding = try self.sliceAt(self.tip + Header.HEADER_SIZE + payload.len, pad);
+            const padding = try self.sliceAt(self.tip + Header.HEADER_SIZE + payload_size, pad);
             @memset(padding, 0);
         }
 

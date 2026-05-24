@@ -102,6 +102,12 @@ pub fn Queue(comptime MessageType: type) type {
             return app.appendWithCodec(MessageType, self.codec, msg, ts_ms);
         }
 
+        /// Appends multiple byte slices as one raw queue entry using an explicit UTC millisecond timestamp.
+        pub fn appendPartsWithTimestamp(self: *Self, parts: []const []const u8, ts_ms: u64) !appender_mod.AppendResult {
+            const app = try self.inner.openAppender();
+            return app.appendPartsRaw(parts, ts_ms);
+        }
+
         /// Opens an independent tailer starting at the requested public index.
         pub fn tailer(self: *Self, start_index: u64) !Tailer(MessageType) {
             const actual_start = if (start_index == 0 and self.inner.lowest_cycle != 0)
