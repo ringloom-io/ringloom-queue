@@ -149,9 +149,8 @@ pub const Appender = struct {
         self.diagnostics.appends += 1;
         self.publishTip();
 
-        self.queue.maybePreroll(now_ms) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        self.queue.maybePreroll(now_ms) catch {
+            self.diagnostics.preroll_misses += 1;
         };
 
         return .{
@@ -201,9 +200,8 @@ pub const Appender = struct {
         self.diagnostics.appends += 1;
         self.publishTip();
 
-        self.queue.maybePreroll(now_ms) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        self.queue.maybePreroll(now_ms) catch {
+            self.diagnostics.preroll_misses += 1;
         };
 
         return entry_index;

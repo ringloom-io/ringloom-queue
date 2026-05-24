@@ -7,6 +7,7 @@ const RingloomError = @import("errors.zig").RingloomError;
 const SharedMetadata = @import("metadata.zig").SharedMetadata;
 
 const posix = std.posix;
+const linux = std.os.linux;
 
 /// Memory protection requested for a shared file mapping.
 pub const Protection = enum {
@@ -23,7 +24,7 @@ pub const Protection = enum {
 
 /// Optional mmap flags used by platform-specific prefetch paths.
 pub const MapFlags = struct {
-    type: posix.system.MAP_TYPE = .SHARED,
+    type: linux.MAP_TYPE = .SHARED,
     populate: bool = false,
     huge_tlb: bool = false,
 
