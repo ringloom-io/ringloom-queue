@@ -127,12 +127,28 @@ pub const Appender = struct {
         if (payload_size == 0) return error.EmptyPayload;
         if (payload_size > Header.SIZE_MASK) return error.MessageTooLarge;
 
-        const payload_len_u30: u30 = @intCast(payload_size);
         const entry_size = Header.entrySize(payload_size);
         if (entry_size > std.math.maxInt(u32)) return error.MessageTooLarge;
 
         const current_cycle = try self.cycleFromTimestamp(now_ms);
         try self.ensureCycle(current_cycle);
+
+        const result = try self.writeBodyParts(parts, payload_size);
+
+        self.queue.maybePreroll(now_ms) catch {
+            self.diagnostics.preroll_misses += 1;
+        };
+
+        return result;
+    }
+
+    /// Writes one entry (claim/copy/pad/publish/index/advance) at the current
+    /// `tip`/`seqnum`. Shared by `appendPartsRaw` and `writePartsAtIndex` so the
+    /// two paths produce byte-for-byte identical on-disk output. The caller is
+    /// responsible for having aligned `self.cycle` beforehand.
+    fn writeBodyParts(self: *Appender, parts: []const []const u8, payload_size: usize) !AppendResult {
+        const payload_len_u30: u30 = @intCast(payload_size);
+        const entry_size = Header.entrySize(payload_size);
 
         const required_end = self.tip +| entry_size;
         if (required_end > Queue.qf_disk_sz) return error.MessageTooLarge;
@@ -164,14 +180,74 @@ pub const Appender = struct {
         self.diagnostics.appends += 1;
         self.publishTip();
 
-        self.queue.maybePreroll(now_ms) catch {
-            self.diagnostics.preroll_misses += 1;
-        };
-
         return .{
             .index = entry_index,
             .payload = payload_buf,
         };
+    }
+
+    /// The index this appender will accept next for a contiguous write:
+    /// `Index.compose(self.cycle, self.seqnum)`.
+    pub fn expectedNextIndex(self: *const Appender) u64 {
+        return Index.compose(@intCast(self.cycle), @intCast(self.seqnum));
+    }
+
+    /// Applies a replicated excerpt at an externally chosen `index`, reproducing
+    /// the exact on-disk bytes a normal append of the same payload would produce.
+    /// The cycle is taken from `index` (never the wall clock).
+    pub fn writeAtIndex(self: *Appender, index: u64, payload: []const u8) !void {
+        return self.writePartsAtIndex(index, &.{payload});
+    }
+
+    /// Multi-part form of `writeAtIndex`.
+    pub fn writePartsAtIndex(self: *Appender, index: u64, parts: []const []const u8) !void {
+        const target_cycle = Index.cycle(index);
+        const target_seq = Index.seqnum(index);
+
+        var payload_size: usize = 0;
+        for (parts) |part| {
+            payload_size = std.math.add(usize, payload_size, part.len) catch return error.MessageTooLarge;
+        }
+        if (payload_size == 0) return error.EmptyPayload;
+        if (payload_size > Header.SIZE_MASK) return error.MessageTooLarge;
+        const entry_size = Header.entrySize(payload_size);
+        if (entry_size > std.math.maxInt(u32)) return error.MessageTooLarge;
+
+        try self.ensureCycle(target_cycle);
+
+        if (target_seq != self.seqnum) {
+            if (target_seq < self.seqnum) return error.DuplicateIndex;
+            return error.IndexGap;
+        }
+
+        _ = try self.writeBodyParts(parts, payload_size);
+    }
+
+    /// Writes the EOF marker at the current tip when there is room. Idempotent;
+    /// shared by `rollCycle` and the replication CycleSynchronizer so the roll
+    /// path and synchronizer cannot drift.
+    pub fn sealTip(self: *Appender) !void {
+        if (self.buf != null and self.tip + Header.HEADER_SIZE <= self.file_size) {
+            const eof_ptr = try self.headerPtr(self.tip);
+            @atomicStore(u32, eof_ptr, Header.EOF, .release);
+        }
+    }
+
+    /// Opens `cycle` for writing (creating it if absent), rolling forward from
+    /// the current cycle as needed. Used by the CycleSynchronizer.
+    pub fn openCycleForWrite(self: *Appender, cycle: u64) !void {
+        try self.ensureCycle(cycle);
+    }
+
+    /// Seals `cycle`'s tip with EOF if the appender is on it; otherwise opens it
+    /// (creating if absent) and seals. No-op if the appender is already past it.
+    pub fn sealCurrentCycleIfAt(self: *Appender, cycle: u64) !void {
+        if (self.fd != null and self.cycle == cycle) {
+            try self.sealTip();
+            return;
+        }
+        self.openCycleForWrite(cycle) catch return;
+        try self.sealTip();
     }
 
     /// Serializes and appends a typed message through the provided codec.
@@ -246,10 +322,7 @@ pub const Appender = struct {
     }
 
     fn rollCycle(self: *Appender, target_cycle: u64) !void {
-        if (self.buf != null and self.tip + Header.HEADER_SIZE <= self.file_size) {
-            const eof_ptr = try self.headerPtr(self.tip);
-            @atomicStore(u32, eof_ptr, Header.EOF, .release);
-        }
+        try self.sealTip();
 
         if (self.buf) |buf| {
             mmap_ops.unmapFile(buf);

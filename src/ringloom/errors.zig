@@ -48,6 +48,9 @@ pub const RingloomError = error{
     IndexSlotOutOfBounds,
     IndexRegionCorrupted,
 
+    DuplicateIndex,
+    IndexGap,
+
     PlatformCapabilityUnavailable,
     PrefetchFailed,
     CleanerFailed,

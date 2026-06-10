@@ -21,6 +21,7 @@ pub const tailer = @import("ringloom/tailer.zig");
 pub const queue = @import("ringloom/queue.zig");
 pub const api = @import("ringloom/api.zig");
 pub const c_api = @import("ringloom/c_api.zig");
+pub const repl = @import("ringloom/repl/mod.zig");
 const validation_tests = @import("ringloom/validation_tests.zig");
 
 pub const Header = header.Header;
@@ -104,6 +105,15 @@ pub const ringloom_queue_options = c_api.ringloom_queue_options;
 pub const ringloom_message_view = c_api.ringloom_message_view;
 pub const ringloom_error_t = c_api.ringloom_error_t;
 pub const ringloom_step_result_t = c_api.ringloom_step_result_t;
+
+pub const ringloom_repl_source_t = c_api.ringloom_repl_source_t;
+pub const ringloom_repl_sink_t = c_api.ringloom_repl_sink_t;
+pub const ringloom_outbound_channel = c_api.ringloom_outbound_channel;
+pub const ringloom_inbound_channel = c_api.ringloom_inbound_channel;
+pub const ringloom_repl_source_options = c_api.ringloom_repl_source_options;
+pub const ringloom_repl_sink_options = c_api.ringloom_repl_sink_options;
+pub const ringloom_repl_source_metrics_t = c_api.ringloom_repl_source_metrics_t;
+pub const ringloom_repl_sink_metrics_t = c_api.ringloom_repl_sink_metrics_t;
 
 test {
     _ = validation_tests;
