@@ -607,6 +607,59 @@ test "scenario 11: backpressure never drops or duplicates frames" {
     try assertTailerParity(allocator, ctx.master, ctx.follower);
 }
 
+test "scenario 12: source session anchored on empty queue re-anchors when data arrives at a later cycle" {
+    // Reproduces the topics-registration bug: a source/sink handshake completes
+    // while the master is empty (firstAvailableIndex == 0, so the session tailer
+    // anchors at cycle 0). Data appended afterwards lands at a higher,
+    // timestamp-derived cycle whose cycle-0 file is never created. The source
+    // must re-anchor its session tailer forward to the queue's real lowest cycle
+    // or it ships nothing (frames_sent stays 0 forever).
+    const allocator = std.testing.allocator;
+    var ctx = try ScenarioCtx.init(allocator, "TEST4_SECONDLY");
+    defer ctx.deinit();
+
+    // Source + sink created against an EMPTY master with long liveness timeouts
+    // so the test exercises the re-anchor path rather than racing the sink's
+    // heartbeat watchdog while the queue is still empty.
+    var src = ctx.newSource();
+    defer src.deinit();
+    var snk = try Sink.init(allocator, ctx.follower, ctx.pair.sinkOutbound(), ctx.pair.sinkInbound(), .{
+        .heartbeat_timeout_ns = std.time.ns_per_min,
+        .hello_timeout_ns = std.time.ns_per_min,
+    });
+    defer snk.deinit();
+
+    // Complete the handshake against the empty queue. This anchors the single
+    // source session at firstAvailableIndex == 0 (cycle 0).
+    var hs: usize = 0;
+    while (hs < 10000) : (hs += 1) {
+        _ = try src.step(256);
+        _ = try snk.step(256);
+        if (src.sessions.items.len == 1 and snk.state == .live) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), src.sessions.items.len);
+    try std.testing.expectEqual(@as(u64, 0), src.metrics.frames_sent);
+
+    // Append data at a high cycle (timestamp 5000ms -> cycle 5 for
+    // TEST4_SECONDLY). Cycle 0 will never get a file.
+    const app = try Appender.open(ctx.master);
+    var last: u64 = 0;
+    var n: usize = 0;
+    while (n < 100) : (n += 1) {
+        var buf: [32]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "late-{d}", .{n});
+        last = try app.appendWithTimestamp(s, 5000);
+    }
+
+    // Drive replication to completion. Without re-anchoring, the session tailer
+    // is stuck at cycle 0 and the source never ships any frames.
+    try driveUntilApplied(&src, &snk, @intCast(last), 500000);
+
+    try std.testing.expect(src.metrics.frames_sent >= 100);
+    try std.testing.expectEqual(@as(i64, @intCast(last)), snk.last_applied_index);
+    try assertTailerParity(allocator, ctx.master, ctx.follower);
+}
+
 test {
     _ = protocol;
     std.testing.refAllDecls(@This());

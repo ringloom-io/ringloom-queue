@@ -282,9 +282,19 @@ pub fn ReplicationSink(comptime Outbound: type, comptime Inbound: type) type {
         fn applyOne(self: *Self, index: u64, payload: []const u8) void {
             if (self.last_applied_index >= 0 and index <= @as(u64, @intCast(self.last_applied_index))) return;
             if (index != self.expected_next) {
-                self.metrics.gaps_detected += 1;
-                self.requestReset(.gap_detected);
-                return;
+                // A fresh replica that has applied nothing may receive its first
+                // excerpt at a cycle the empty-queue HELLO_ACK could not predict
+                // (the source's queue was empty at handshake and data later
+                // arrived at a date-derived cycle). With nothing applied there is
+                // no divergence risk, so anchor to the source's real start instead
+                // of resetting — but only at a cycle boundary, never mid-cycle.
+                if (self.last_applied_index < 0 and Index.seqnum(index) == 0) {
+                    self.expected_next = index;
+                } else {
+                    self.metrics.gaps_detected += 1;
+                    self.requestReset(.gap_detected);
+                    return;
+                }
             }
             self.appender.writeAtIndex(index, payload) catch |err| {
                 switch (err) {

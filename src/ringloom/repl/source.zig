@@ -173,12 +173,35 @@ pub fn ReplicationSource(comptime Outbound: type, comptime Inbound: type) type {
                 produced = true;
             }
 
+            // Re-anchor a session whose tailer is stuck below the queue's
+            // current lowest cycle. This happens when the session was created
+            // against an empty queue (firstAvailableIndex == 0, cycle 0) and
+            // data later arrives at a higher, date-derived cycle: the tailer
+            // blocks on a cycle file that is never created. Seek it forward to
+            // the queue's real first available cycle so live data is picked up.
+            //
+            // prev_cycle is left untouched: the session has sent no excerpts
+            // yet, so emitting a CYCLE_ROLL would force the sink to materialize
+            // every intermediate empty cycle (potentially tens of thousands of
+            // files for date-derived cycles). A sink that has applied nothing
+            // re-bases its expected_next to the first real excerpt (sink.applyOne).
+            if (!produced and s.tailer.state == .awaiting_queue_file) {
+                const tailer_cycle = Index.cycle(s.tailer.qf_index);
+                const lowest_cycle: u32 = @intCast(self.queue.lowest_cycle);
+                if (lowest_cycle > tailer_cycle) {
+                    s.tailer.seekTo(Index.compose(lowest_cycle, 0)) catch |err| {
+                        std.log.scoped(.repl_src).warn("re-anchor seekTo cycle {d} failed: {}", .{ lowest_cycle, err });
+                    };
+                }
+            }
+
             if (!produced and s.mode != .live and s.state == .syncing) {
                 s.mode = .live;
                 s.state = .live;
             }
             return produced;
         }
+
 
         fn offerCycleRoll(self: *Self, s: *Session, from_cycle: u32, to_cycle: u32) !bool {
             const next_expected = Index.compose(to_cycle, 0);
