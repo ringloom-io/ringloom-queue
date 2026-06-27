@@ -175,6 +175,21 @@ pub const Tailer = struct {
             const cycle = Index.cycle(self.qf_index);
             self.ensureCycleFile(cycle) catch |err| switch (err) {
                 error.FileNotFound => {
+                    // The cycle file does not exist. If the queue was empty when
+                    // this tailer was created (anchored at cycle 0) and data has
+                    // since arrived at a higher, date-derived cycle, re-seek
+                    // forward to the queue's real lowest cycle instead of
+                    // blocking forever on a cycle file that will never appear.
+                    // The live lowest_cycle is read atomically from the shared
+                    // metadata mmap so this also works across processes (e.g. a
+                    // subscriber tailing a replica filled by the broker).
+                    if (self.queue.metadata) |meta| {
+                        const live_lowest = @atomicLoad(u64, &meta.lowest_cycle, .acquire);
+                        if (live_lowest > cycle) {
+                            self.seekTo(Index.compose(@intCast(live_lowest), 0)) catch {};
+                            continue;
+                        }
+                    }
                     self.state = .awaiting_queue_file;
                     return null;
                 },
