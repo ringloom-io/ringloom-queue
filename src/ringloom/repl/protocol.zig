@@ -73,8 +73,8 @@ pub const FrameHeader = struct {
 
 /// HELLO body (sink → source). `roll_name` borrows the input buffer when decoded.
 pub const HelloFrame = struct {
-    sink_node_id: [16]u8 = [_]u8{0} ** 16,
-    queue_id: [16]u8 = [_]u8{0} ** 16,
+    sink_node_id: [16]u8 = @splat(0),
+    queue_id: [16]u8 = @splat(0),
     last_applied_index: i64 = -1,
     epoch_ms: u64 = 0,
     roll_length_secs: u32 = 0,
@@ -90,7 +90,7 @@ pub const HelloView = HelloFrame;
 
 /// HELLO_ACK body (source → sink).
 pub const HelloAckFrame = struct {
-    source_node_id: [16]u8 = [_]u8{0} ** 16,
+    source_node_id: [16]u8 = @splat(0),
     session_id: u64 = 0,
     source_first_available_index: u64 = 0,
     source_last_index: u64 = 0,
@@ -143,6 +143,6 @@ pub const CodecError = error{
 };
 
 test "frame type round-trips through its integer value" {
-    try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(FrameType.excerpt));
-    try std.testing.expectEqual(FrameType.hello, @as(FrameType, @enumFromInt(0x01)));
+    try std.testing.expectEqual(@as(u8, 0x10), @backingInt(FrameType.excerpt));
+    try std.testing.expectEqual(FrameType.hello, @as(FrameType, @fromBackingInt(0x01)));
 }

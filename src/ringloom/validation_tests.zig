@@ -215,7 +215,7 @@ test "validation: multiple pre-opened tailers poll the same queue concurrently" 
     }
     defer for (tailers) |tailer| tailer.deinit();
 
-    var counts = [_]u32{0} ** reader_count;
+    var counts: [reader_count]u32 = @splat(0);
     var threads: [reader_count]std.Thread = undefined;
     for (&threads, 0..) |*thread, thread_index| {
         thread.* = try std.Thread.spawn(.{}, struct {
@@ -271,11 +271,11 @@ test "validation: two C handles contend through shared appender lease and mainte
 
     var step: c_api.ringloom_step_result_t = .idle;
     try std.testing.expectEqual(cCode(.ok), c_api.ringloom_queue_maintenance_poll(q1, 1, &step));
-    try std.testing.expect(@intFromEnum(step) >= @intFromEnum(c_api.ringloom_step_result_t.idle));
+    try std.testing.expect(@backingInt(step) >= @backingInt(c_api.ringloom_step_result_t.idle));
 }
 
 test "validation: child process writer is readable after reopen" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -302,10 +302,10 @@ test "validation: child process writer is readable after reopen" {
         std.process.exit(0);
     }
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     const wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     if (linux.errno(wait_rc) != .SUCCESS) return error.WaitFailed;
-    try std.testing.expectEqual(@as(u32, 0), status);
+    try std.testing.expectEqual(@as(i32, 0), status);
 
     var queue = try api.Queue([]const u8).open(.{
         .dir = path,
@@ -347,7 +347,7 @@ test "property: codec header and index invariants over deterministic random data
         try std.testing.expectEqual(size, Header.dataLength(metadata_header));
     }
 
-    var entries: [16]u64 align(8) = [_]u64{0} ** 16;
+    var entries: [16]u64 align(8) = @splat(0);
     const region = IndexRegion{
         .entries = entries[0..].ptr,
         .count = entries.len,
@@ -435,9 +435,9 @@ fn expectEqualSlicesWithSeed(seed: u64, expected: []const u8, actual: []const u8
 }
 
 fn cCode(err: c_api.ringloom_error_t) c_int {
-    return @intFromEnum(err);
+    return @backingInt(err);
 }
 
 fn tmpQueuePath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    return allocator.print(".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
 }

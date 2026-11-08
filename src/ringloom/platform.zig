@@ -26,11 +26,11 @@ pub const Platform = struct {
     /// Detects capabilities that affect mmap, preallocation, and read-ahead strategy.
     pub fn detect() Platform {
         return .{
-            .supports_map_populate = builtin.os.tag == .linux,
-            .supports_madv_populate_write = builtin.os.tag == .linux,
-            .supports_huge_pages = builtin.os.tag == .linux,
-            .supports_preallocation = builtin.os.tag == .linux,
-            .supports_fadvise = builtin.os.tag == .linux,
+            .supports_map_populate = builtin.target.os.tag == .linux,
+            .supports_madv_populate_write = builtin.target.os.tag == .linux,
+            .supports_huge_pages = builtin.target.os.tag == .linux,
+            .supports_preallocation = builtin.target.os.tag == .linux,
+            .supports_fadvise = builtin.target.os.tag == .linux,
             .page_size = std.heap.pageSize(),
         };
     }
@@ -38,7 +38,7 @@ pub const Platform = struct {
     /// Reserves disk blocks for a file range when the current platform supports it.
     pub fn preallocate(self: Platform, fd: fd_t, offset: u64, len: u64) RingloomError!void {
         if (!self.supports_preallocation) return error.PlatformCapabilityUnavailable;
-        if (builtin.os.tag != .linux) return error.PlatformCapabilityUnavailable;
+        if (builtin.target.os.tag != .linux) return error.PlatformCapabilityUnavailable;
 
         const signed_offset = try toSignedOffset(offset, error.PreallocateFailed);
         const signed_len = try toSignedOffset(len, error.PreallocateFailed);
@@ -49,7 +49,7 @@ pub const Platform = struct {
     /// Hints that a file range will soon be read by a tailer.
     pub fn adviseReadAhead(self: Platform, fd: fd_t, offset: u64, len: u64) RingloomError!void {
         if (!self.supports_fadvise) return error.PlatformCapabilityUnavailable;
-        if (builtin.os.tag != .linux) return error.PlatformCapabilityUnavailable;
+        if (builtin.target.os.tag != .linux) return error.PlatformCapabilityUnavailable;
 
         const signed_offset = try toSignedOffset(offset, error.PrefetchFailed);
         const signed_len = try toSignedOffset(len, error.PrefetchFailed);
@@ -63,7 +63,7 @@ pub const Platform = struct {
     /// Hints that a file range is cold and can be dropped from cache.
     pub fn adviseDontNeed(self: Platform, fd: fd_t, offset: u64, len: u64) RingloomError!void {
         if (!self.supports_fadvise) return error.PlatformCapabilityUnavailable;
-        if (builtin.os.tag != .linux) return error.PlatformCapabilityUnavailable;
+        if (builtin.target.os.tag != .linux) return error.PlatformCapabilityUnavailable;
 
         const signed_offset = try toSignedOffset(offset, error.CleanerFailed);
         const signed_len = try toSignedOffset(len, error.CleanerFailed);
@@ -78,7 +78,7 @@ pub const Platform = struct {
     pub fn truncate(self: Platform, fd: fd_t, size: u64) RingloomError!void {
         _ = self;
         const signed_size = try toSignedOffset(size, error.PreallocateFailed);
-        if (builtin.os.tag == .linux) {
+        if (builtin.target.os.tag == .linux) {
             return checkedLinux(std.os.linux.ftruncate(fd, signed_size), .preallocate);
         }
         return error.PlatformCapabilityUnavailable;
@@ -117,7 +117,7 @@ fn checkedLinux(rc: usize, op: LinuxOp) RingloomError!void {
 test "platform detects basic capabilities" {
     const platform = Platform.detect();
     try std.testing.expect(platform.page_size >= std.heap.page_size_min);
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         try std.testing.expect(platform.supports_huge_pages);
         try std.testing.expect(platform.supports_preallocation);
         try std.testing.expect(platform.supports_fadvise);

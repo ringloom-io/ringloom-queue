@@ -202,7 +202,6 @@ pub fn ReplicationSource(comptime Outbound: type, comptime Inbound: type) type {
             return produced;
         }
 
-
         fn offerCycleRoll(self: *Self, s: *Session, from_cycle: u32, to_cycle: u32) !bool {
             const next_expected = Index.compose(to_cycle, 0);
             const len = try FrameCodec.encodeCycleRoll(s.send_buf, s.id, from_cycle, to_cycle, next_expected);
@@ -224,7 +223,7 @@ pub fn ReplicationSource(comptime Outbound: type, comptime Inbound: type) type {
                 }
                 return true;
             }
-            switch (@as(OfferResult, @enumFromInt(rc))) {
+            switch (@as(OfferResult, @fromBackingInt(@intCast(rc)))) {
                 .back_pressured => {
                     if (s.backpressure_since_ns == null) s.backpressure_since_ns = self.now();
                     self.checkBackpressureWatchdog(s);

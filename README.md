@@ -55,7 +55,7 @@ Core components:
 
 ### Requirements
 
-- Zig 0.16.x or a compatible development build
+- Zig 0.17.x
 - Linux or macOS
 - Optional for Java bindings:
   - Java 25+

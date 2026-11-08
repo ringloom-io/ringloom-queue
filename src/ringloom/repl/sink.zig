@@ -44,8 +44,8 @@ pub const SinkMetrics = struct {
 };
 
 pub const SinkConfig = struct {
-    node_id: [16]u8 = [_]u8{0} ** 16,
-    queue_id: [16]u8 = [_]u8{0} ** 16,
+    node_id: [16]u8 = @splat(0),
+    queue_id: [16]u8 = @splat(0),
     max_frame_bytes: usize = 2 * 1024 * 1024,
     ack_interval_ns: u64 = 50 * std.time.ns_per_ms,
     force_ack_interval_ns: u64 = 1 * std.time.ns_per_s,

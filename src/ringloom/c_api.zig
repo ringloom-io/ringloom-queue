@@ -346,8 +346,8 @@ pub const ringloom_inbound_channel = extern struct {
 pub const ringloom_repl_source_options = extern struct {
     size: u32 = @sizeOf(ringloom_repl_source_options),
     queue: ?*ringloom_queue_t = null,
-    queue_id: [16]u8 = [_]u8{0} ** 16,
-    node_id: [16]u8 = [_]u8{0} ** 16,
+    queue_id: [16]u8 = @splat(0),
+    node_id: [16]u8 = @splat(0),
     outbound: ringloom_outbound_channel,
     inbound: ringloom_inbound_channel,
     heartbeat_interval_ms: u64 = 100,
@@ -362,8 +362,8 @@ pub const ringloom_repl_source_options = extern struct {
 pub const ringloom_repl_sink_options = extern struct {
     size: u32 = @sizeOf(ringloom_repl_sink_options),
     queue: ?*ringloom_queue_t = null,
-    queue_id: [16]u8 = [_]u8{0} ** 16,
-    node_id: [16]u8 = [_]u8{0} ** 16,
+    queue_id: [16]u8 = @splat(0),
+    node_id: [16]u8 = @splat(0),
     outbound: ringloom_outbound_channel,
     inbound: ringloom_inbound_channel,
     ack_interval_ms: u64 = 100,
@@ -649,7 +649,7 @@ fn stepCode(step: @import("platform.zig").StepResult) ringloom_step_result_t {
 }
 
 fn code(err: ringloom_error_t) c_int {
-    return @intFromEnum(err);
+    return @backingInt(err);
 }
 
 fn errorCode(err: anyerror) c_int {
@@ -684,7 +684,7 @@ test "C ABI opens queue appends and polls raw view" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const path = try allocator.print(".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     defer allocator.free(path);
 
     const scheme = "TEST4_SECONDLY";
@@ -721,7 +721,7 @@ const CTestRing = struct {
     const cap = 512;
     const slot = 8192;
     bufs: [][slot]u8,
-    lens: [cap]usize = [_]usize{0} ** cap,
+    lens: [cap]usize = @splat(0),
     head: usize = 0,
     tail: usize = 0,
     count: usize = 0,
@@ -768,9 +768,9 @@ test "C ABI replication loopback replicates master to follower" {
     defer tmp_m.cleanup();
     var tmp_f = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_f.cleanup();
-    const master_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_m.sub_path[0..]});
+    const master_path = try allocator.print(".zig-cache/tmp/{s}", .{tmp_m.sub_path[0..]});
     defer allocator.free(master_path);
-    const follower_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_f.sub_path[0..]});
+    const follower_path = try allocator.print(".zig-cache/tmp/{s}", .{tmp_f.sub_path[0..]});
     defer allocator.free(follower_path);
 
     const scheme = "TEST4_SECONDLY";

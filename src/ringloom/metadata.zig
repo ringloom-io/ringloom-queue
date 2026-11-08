@@ -21,7 +21,7 @@ pub const SharedMetadata = extern struct {
     modcount: u64 align(8),
     write_position: u64 align(8),
     appender_lock: u64 align(8),
-    _reserved: [440]u8 = [_]u8{0} ** 440,
+    _reserved: [440]u8 = @splat(0),
 
     /// Creates a zeroed metadata record with the immutable roll configuration set.
     pub fn init(roll_length_secs: u32, index_spacing: u32, index_count: u32, epoch_ms: u64) SharedMetadata {
@@ -50,7 +50,7 @@ pub const QueueFileHeader = extern struct {
     _pad0: u32 = 0,
     epoch_ms: u64,
     created_cycle: u32,
-    _reserved: [28]u8 = [_]u8{0} ** 28,
+    _reserved: [28]u8 = @splat(0),
 
     /// Creates a queue-file header that mirrors the shared roll configuration.
     pub fn init(

@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/ringloom/bench_tests.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         .imports = &.{
             .{ .name = "ringloom_queue", .module = mod },
         },
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const run_bench_tests = b.addRunArtifact(bench_exe);
-    if (b.args) |args| run_bench_tests.addArgs(args);
+    run_bench_tests.addPassthruArgs();
     const bench_step = b.step("bench", "Run opt-in benchmarks");
     bench_step.dependOn(&run_bench_tests.step);
 }

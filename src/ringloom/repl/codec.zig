@@ -119,7 +119,7 @@ pub const FrameCodec = struct {
         if (r16(buf, 0) != p.MAGIC) return error.BadMagic;
         if (r8(buf, 2) != p.PROTOCOL_VERSION) return error.UnsupportedVersion;
         return .{
-            .frame_type = @enumFromInt(r8(buf, 3)),
+            .frame_type = @fromBackingInt(r8(buf, 3)),
             .flags = r32(buf, 4),
             .session_id = r64(buf, 8),
         };
@@ -163,7 +163,7 @@ pub const FrameCodec = struct {
         w64(buf, b + 20, a.session_id);
         w64(buf, b + 28, a.source_first_available_index);
         w64(buf, b + 36, a.source_last_index);
-        w8(buf, b + 44, @intFromEnum(a.mode));
+        w8(buf, b + 44, @backingInt(a.mode));
         return total;
     }
 
@@ -173,7 +173,7 @@ pub const FrameCodec = struct {
         if (message.len > std.math.maxInt(u16)) return error.BufferTooSmall;
         writeHeaderUnchecked(buf, .{ .frame_type = .hello_nack, .flags = 0, .session_id = 0 });
         const b = p.HEADER_SIZE;
-        w32(buf, b + 0, @intFromEnum(reason));
+        w32(buf, b + 0, @backingInt(reason));
         w16(buf, b + 4, @intCast(message.len));
         @memcpy(buf[b + 6 ..][0..message.len], message);
         return total;
@@ -226,7 +226,7 @@ pub const FrameCodec = struct {
         const total = p.HEADER_SIZE + 4;
         if (buf.len < total) return error.BufferTooSmall;
         writeHeaderUnchecked(buf, .{ .frame_type = .reset, .flags = 0, .session_id = session_id });
-        w32(buf, p.HEADER_SIZE + 0, @intFromEnum(reason));
+        w32(buf, p.HEADER_SIZE + 0, @backingInt(reason));
         return total;
     }
 
@@ -267,7 +267,7 @@ pub const FrameCodec = struct {
         a.session_id = r64(b, 20);
         a.source_first_available_index = r64(b, 28);
         a.source_last_index = r64(b, 36);
-        a.mode = @enumFromInt(r8(b, 44));
+        a.mode = @fromBackingInt(r8(b, 44));
         return a;
     }
 
@@ -277,7 +277,7 @@ pub const FrameCodec = struct {
         const msg_len = r16(b, 4);
         if (6 + @as(usize, msg_len) > b.len) return error.TruncatedFrame;
         return .{
-            .reason = @enumFromInt(r32(b, 0)),
+            .reason = @fromBackingInt(r32(b, 0)),
             .message = b[6 .. 6 + msg_len],
         };
     }
@@ -321,7 +321,7 @@ pub const FrameCodec = struct {
     pub fn decodeReset(frame: []const u8) CodecError!p.ResetFrame {
         const b = body(frame);
         if (b.len < 4) return error.TruncatedFrame;
-        return .{ .reason = @enumFromInt(r32(b, 0)) };
+        return .{ .reason = @fromBackingInt(r32(b, 0)) };
     }
 
     pub fn decodeClose(frame: []const u8) CodecError!p.CloseFrame {
@@ -334,7 +334,7 @@ pub const FrameCodec = struct {
 fn writeHeaderUnchecked(buf: []u8, h: p.FrameHeader) void {
     w16(buf, 0, p.MAGIC);
     w8(buf, 2, p.PROTOCOL_VERSION);
-    w8(buf, 3, @intFromEnum(h.frame_type));
+    w8(buf, 3, @backingInt(h.frame_type));
     w32(buf, 4, h.flags);
     w64(buf, 8, h.session_id);
 }
@@ -360,7 +360,7 @@ test "header round-trips" {
 }
 
 test "readHeader rejects bad magic and version" {
-    var buf: [16]u8 = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     try std.testing.expectError(error.BadMagic, FrameCodec.readHeader(&buf));
     std.mem.writeInt(u16, buf[0..2], p.MAGIC, .little);
     buf[2] = 99;
@@ -388,8 +388,8 @@ test "excerpt round-trips at min and max-ish sizes" {
 test "hello round-trips with roll name" {
     var buf: [256]u8 = undefined;
     const h_in: p.HelloFrame = .{
-        .sink_node_id = [_]u8{1} ** 16,
-        .queue_id = [_]u8{2} ** 16,
+        .sink_node_id = @splat(1),
+        .queue_id = @splat(2),
         .last_applied_index = -1,
         .epoch_ms = 12345,
         .roll_length_secs = 86400,

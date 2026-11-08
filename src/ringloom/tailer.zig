@@ -602,7 +602,7 @@ fn combineStepResults(a: StepResult, b: StepResult) StepResult {
 test "tailer states expose protocol descriptions" {
     try std.testing.expectEqualStrings("AWAITING_ENTRY", TailerState.awaiting_entry.description());
     try std.testing.expectEqualStrings("COLLECTED", TailerState.collected.description());
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ParseBlockState.reached_eof));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(ParseBlockState.reached_eof));
 }
 
 test "collected defaults" {
@@ -670,5 +670,5 @@ test "tailer seek uses inline index then scans to target" {
 }
 
 fn tmpQueuePath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    return allocator.print(".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
 }

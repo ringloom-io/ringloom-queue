@@ -153,7 +153,7 @@ pub fn getCycleFilename(
     const seconds: i64 = @intCast(cycle * seconds_per_cycle);
     var date_buf: [64]u8 = undefined;
     const date = try formatTimestamp(&date_buf, seconds, strftime_pattern);
-    return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ dirname, date, config.queue_file_extension });
+    return allocator.print("{s}/{s}{s}", .{ dirname, date, config.queue_file_extension });
 }
 
 /// Backwards-compatible alias for `getCycleFilename`.

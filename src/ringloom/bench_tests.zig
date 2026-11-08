@@ -88,8 +88,7 @@ pub fn main(init: std.process.Init) !void {
     const plan = try buildPlan(opts);
 
     const cwd = std.Io.Dir.cwd();
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         ".zig-cache/tmp/ringloom-bench-{d}",
         .{@as(i128, std.Io.Clock.awake.now(io).toNanoseconds())},
     );

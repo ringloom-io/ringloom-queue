@@ -441,7 +441,7 @@ pub const Queue = struct {
 
         var date_buf: [64]u8 = undefined;
         const date = try roll.formatTimestamp(&date_buf, timestamp_seconds, self.roll_strftime.?);
-        return std.fmt.allocPrint(self.allocator, "{s}/{s}{s}", .{
+        return self.allocator.print("{s}/{s}{s}", .{
             self.dirname,
             date,
             config.queue_file_extension,
@@ -996,5 +996,5 @@ test "cleaner retention deletes old cycle files" {
 }
 
 fn tmpQueuePath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    return allocator.print(".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
 }

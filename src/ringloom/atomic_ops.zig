@@ -46,7 +46,7 @@ pub fn casBackoff(attempt: u32) void {
 }
 
 fn sleepNs(ns: u64) void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         var req: linux.timespec = .{
             .sec = @intCast(ns / std.time.ns_per_s),

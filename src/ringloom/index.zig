@@ -107,7 +107,7 @@ test "index compose and decompose" {
 }
 
 test "index region slot lookup store and seek" {
-    var entries: [4]u64 align(8) = [_]u64{0} ** 4;
+    var entries: [4]u64 align(8) = @splat(0);
     const region: IndexRegion = .{
         .entries = entries[0..].ptr,
         .count = 4,

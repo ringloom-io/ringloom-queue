@@ -118,6 +118,6 @@ comptime {
 test "OfferResult.accepted classifies returns" {
     try std.testing.expect(OfferResult.accepted(0));
     try std.testing.expect(OfferResult.accepted(123));
-    try std.testing.expect(!OfferResult.accepted(@intFromEnum(OfferResult.back_pressured)));
+    try std.testing.expect(!OfferResult.accepted(@backingInt(OfferResult.back_pressured)));
     try std.testing.expect(!OfferResult.accepted(-2));
 }

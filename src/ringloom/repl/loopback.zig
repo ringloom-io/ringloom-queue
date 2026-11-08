@@ -46,15 +46,15 @@ pub const FrameRing = struct {
 
     /// Enqueue a frame copy. Returns the offer result (>=0 position, or negative).
     fn push(self: *FrameRing, frame: []const u8) i64 {
-        if (!self.connected) return @intFromEnum(transport.OfferResult.not_connected);
+        if (!self.connected) return @backingInt(transport.OfferResult.not_connected);
         if (self.drop_remaining > 0) {
             // A dropped frame surfaces as a disconnect, never a silent gap.
             self.drop_remaining -= 1;
             self.connected = false;
-            return @intFromEnum(transport.OfferResult.not_connected);
+            return @backingInt(transport.OfferResult.not_connected);
         }
-        if (self.count == self.capacity()) return @intFromEnum(transport.OfferResult.back_pressured);
-        if (frame.len > self.slots[self.head].len) return @intFromEnum(transport.OfferResult.max_position_exceeded);
+        if (self.count == self.capacity()) return @backingInt(transport.OfferResult.back_pressured);
+        if (frame.len > self.slots[self.head].len) return @backingInt(transport.OfferResult.max_position_exceeded);
         @memcpy(self.slots[self.head][0..frame.len], frame);
         self.lens[self.head] = frame.len;
         self.head = (self.head + 1) % self.capacity();
@@ -195,7 +195,7 @@ test "loopback applies backpressure when full" {
     try std.testing.expect(transport.OfferResult.accepted(out.offer("a")));
     try std.testing.expect(transport.OfferResult.accepted(out.offer("b")));
     try std.testing.expect(out.isBackPressured());
-    try std.testing.expectEqual(@as(i64, @intFromEnum(transport.OfferResult.back_pressured)), out.offer("c"));
+    try std.testing.expectEqual(@as(i64, @backingInt(transport.OfferResult.back_pressured)), out.offer("c"));
 }
 
 test "disconnect/reconnect toggles connection state" {
@@ -204,7 +204,7 @@ test "disconnect/reconnect toggles connection state" {
     defer pair.deinit();
     pair.disconnect();
     try std.testing.expect(!pair.sourceOutbound().isConnected());
-    try std.testing.expectEqual(@as(i64, @intFromEnum(transport.OfferResult.not_connected)), pair.sourceOutbound().offer("x"));
+    try std.testing.expectEqual(@as(i64, @backingInt(transport.OfferResult.not_connected)), pair.sourceOutbound().offer("x"));
     pair.reconnect();
     try std.testing.expect(pair.sourceOutbound().isConnected());
 }
