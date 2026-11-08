@@ -26,8 +26,8 @@ The queue is designed for workloads where predictable latency, stable file forma
 ## Architecture at a glance
 
 ```text
-┌──────────────┐      mmap writes      ┌──────────────────────┐
-│ Appender     │ ───────────────────▶ │ rolling cycle files  │
+┌──────────────┐      mmap writes     ┌──────────────────────┐
+│ Appender     │ ───────────────────▶│ rolling cycle files  │
 │ single owner │                      │ + metadata mmap      │
 └──────────────┘                      └──────────────────────┘
                                                 ▲
